@@ -7,6 +7,48 @@ from .common import *  # noqa: F401,F403
 
 
 class MotionIOMixin:
+    _SOMA77_TO_CORE27 = {
+        "Hips": "Hips",
+        "Spine": "Spine1",
+        "Spine1": "Spine1",
+        "Spine2": "Spine2",
+        "Spine3": "Chest",
+        "Neck": "Neck1",
+        "Head": "Head",
+        "RightShoulder": "RightShoulder",
+        "RightArm": "RightArm",
+        "RightForeArm": "RightForeArm",
+        "RightHand": "RightHand",
+        "RightHandEnd": "RightHandMiddleEnd",
+        "RightHandThumb1": "RightHandThumb1",
+        "LeftShoulder": "LeftShoulder",
+        "LeftArm": "LeftArm",
+        "LeftForeArm": "LeftForeArm",
+        "LeftHand": "LeftHand",
+        "LeftHandEnd": "LeftHandMiddleEnd",
+        "LeftHandThumb1": "LeftHandThumb1",
+        "RightUpLeg": "RightLeg",
+        "RightLeg": "RightShin",
+        "RightFoot": "RightFoot",
+        "RightToeBase": "RightToeBase",
+        "LeftUpLeg": "LeftLeg",
+        "LeftLeg": "LeftShin",
+        "LeftFoot": "LeftFoot",
+        "LeftToeBase": "LeftToeBase",
+    }
+
+    def _soma77_indices_for_skeleton(self, skeleton) -> list[int]:
+        full_bone_names = [x for x, _ in SOMASkeleton77.bone_order_names_with_parents]
+        skel_indices = []
+        for name in skeleton.bone_order_names:
+            source_name = name
+            if isinstance(skeleton, CoreSkeleton27):
+                source_name = self._SOMA77_TO_CORE27.get(name, name)
+            if source_name not in full_bone_names:
+                raise ValueError(f"Cannot map BVH/SOMA joint {source_name!r} to model joint {name!r}")
+            skel_indices.append(full_bone_names.index(source_name))
+        return skel_indices
+
     def _get_motion_cache_path(self, file_path: str, skeleton_name: str, fps: float) -> str:
         """Return a cache file path based on motion file identity, skeleton, and fps."""
         file_stat = os.stat(file_path)
@@ -77,14 +119,13 @@ class MotionIOMixin:
         if ext == ".bvh":
             from ardy.skeleton.bvh import parse_bvh_motion
 
-            bvh_fps = 120
             local_rot_mats, root_trans, parsed_fps = parse_bvh_motion(file_path)
-            # The demo assumes 120 fps BVH input; sanity-check the file matches
-            # (frame_time is a float, so compare rounded).
-            assert round(parsed_fps) == bvh_fps, f"Expected {bvh_fps} fps BVH, got {parsed_fps:.3f} fps: {file_path}"
-            step = round(bvh_fps / fps)
-            root_trans = root_trans[::step]
-            local_rot_mats = local_rot_mats[::step]
+            duration = len(root_trans) / parsed_fps
+            target_frames = max(1, round(duration * fps))
+            frame_idx = torch.round(torch.arange(target_frames) * (parsed_fps / fps)).long()
+            frame_idx = torch.clamp(frame_idx, max=len(root_trans) - 1)
+            root_trans = root_trans[frame_idx]
+            local_rot_mats = local_rot_mats[frame_idx]
 
             import ardy as _ardy_pkg
 
@@ -139,9 +180,7 @@ class MotionIOMixin:
 
             model_nbjoints = skeleton.nbjoints
             if local_rot_mats.shape[1] > model_nbjoints:
-                full_bone_names = [x for x, _ in SOMASkeleton77.bone_order_names_with_parents]
-                model_bone_names = skeleton.bone_order_names
-                skel_indices = [full_bone_names.index(name) for name in model_bone_names]
+                skel_indices = self._soma77_indices_for_skeleton(skeleton)
                 global_rot_mats_sub = global_rot_mats[:, skel_indices]
                 local_rot_mats = global_rots_to_local_rots(global_rot_mats_sub, skeleton)
 
@@ -451,27 +490,38 @@ class MotionIOMixin:
         # Sample keyframe indices (common for all constraint types except trajectory)
         def sample_keyframe_indices():
             if len(available_indices) <= max_keyframe_num:
-                return available_indices
+                sampled = list(available_indices)
             else:
                 print(f"Sampling {max_keyframe_num} keyframes from {len(available_indices)} available indices")
                 num_keyframes = np.random.randint(1, max_keyframe_num + 1)
-                sampled = np.random.choice(available_indices, size=num_keyframes, replace=False)
-                return sorted([int(idx) for idx in sampled])
+                sampled = [int(idx) for idx in np.random.choice(available_indices, size=num_keyframes, replace=False)]
+
+            final_idx = motion_len - 1
+            if final_idx in available_indices and final_idx not in sampled:
+                if len(sampled) < max_keyframe_num:
+                    sampled.append(final_idx)
+                else:
+                    sampled[-1] = final_idx
+            return sorted(set(sampled))
 
         # Sample constraints for each selected type
         total_constraints = 0
+        sampled_constraint_frames = []
+        sequence_end_frame = frame_offset + motion_len - 1
         for constraint_type in constraint_types:
             if constraint_type == "Full Body":
                 keyframe_indices = sample_keyframe_indices()
                 constraint = session.constraints["Full-Body"]
                 for seq_idx in keyframe_indices:
                     timeline_frame_idx = seq_idx + frame_offset
+                    sampled_constraint_frames.append(timeline_frame_idx)
                     constraint_id = f"fullbody_sampled_{timeline_frame_idx}"
                     constraint.add_keyframe(
                         keyframe_id=constraint_id,
                         frame_idx=timeline_frame_idx,
                         joints_pos=joints_pos[seq_idx],
                         joints_rot=joints_rot[seq_idx],
+                        exists_ok=True,
                     )
                     self.add_keyframe_to_timeline(client_id, "Full-Body", timeline_frame_idx, constraint_id)
                 total_constraints += len(keyframe_indices)
@@ -495,6 +545,7 @@ class MotionIOMixin:
 
                 for seq_idx in keyframe_indices:
                     timeline_frame_idx = seq_idx + frame_offset
+                    sampled_constraint_frames.append(timeline_frame_idx)
                     for joint, ee_type in ee_joints:
                         constraint_id = f"ee_{joint}_sampled_{timeline_frame_idx}"
                         joint_names = [
@@ -508,6 +559,7 @@ class MotionIOMixin:
                             joints_rot=joints_rot[seq_idx],
                             joint_names=joint_names,
                             end_effector_type=ee_type,
+                            exists_ok=True,
                         )
                         self.add_keyframe_to_timeline(
                             client_id,
@@ -524,6 +576,7 @@ class MotionIOMixin:
                 timeline_added = 0
                 for seq_idx in keyframe_indices:
                     timeline_frame_idx = seq_idx + frame_offset
+                    sampled_constraint_frames.append(timeline_frame_idx)
                     constraint_id = f"root2d_waypoint_sampled_{timeline_frame_idx}"
                     root_pos = joints_pos[seq_idx, 0, :].clone()
                     root_pos[1] = 0.0  # Set y to 0
@@ -533,6 +586,7 @@ class MotionIOMixin:
                         root_pos=root_pos,
                         viz_label=True,
                         update_path=False,
+                        exists_ok=True,
                     )
                     if self.add_keyframe_to_timeline(client_id, "2D Root", timeline_frame_idx, constraint_id):
                         timeline_added += 1
@@ -557,6 +611,7 @@ class MotionIOMixin:
                     start_idx + frame_offset,
                     end_idx + frame_offset,
                 )
+                sampled_constraint_frames.append(timeline_end_idx)
                 constraint_id = f"root2d_trajectory_{timeline_start_idx}_{timeline_end_idx}"
 
                 # Extract and add trajectory
@@ -577,6 +632,17 @@ class MotionIOMixin:
                     constraint_id,
                 )
                 total_constraints += 1
+
+        if sampled_constraint_frames:
+            session.task_end_frame_idx = sequence_end_frame
+            session.task_generation_pending = True
+            session.task_reached_reported = False
+            if not session.realtime_mode:
+                session.play_once = False
+                session.playing = False
+                session.gui_elements.gui_play_pause_button.label = "Play"
+                session.gui_elements.gui_enable_auto_replan_checkbox.value = False
+            print(f"[Load Sequence] Task end frame set to {session.task_end_frame_idx}")
 
         # Notify user about added constraints
         constraint_str = ", ".join(constraint_types)

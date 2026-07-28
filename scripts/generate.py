@@ -23,6 +23,12 @@ from ardy.model.loading import get_env_var
 from ardy.model.registry import resolve_model_name
 from ardy.motion_rep.tools import length_to_mask
 from ardy.postprocess import post_process_motion
+from ardy.retail_rack_route import (
+    RACK_ROUTE_WALKING_PROMPT,
+    create_rack_root2d_constraint,
+    normalize_rack_name,
+    rack_route_auto_frame_count,
+)
 from ardy.skeleton import SOMASkeleton30
 from ardy.tools import seed_everything, to_numpy
 
@@ -32,7 +38,9 @@ def parse_args():
     parser.add_argument(
         "prompt",
         type=str,
-        help="Text prompt describing the motion to generate.",
+        nargs="?",
+        default="",
+        help="Text prompt describing the motion to generate. Optional when --rack_target is set.",
     )
     parser.add_argument(
         "--model",
@@ -43,8 +51,8 @@ def parse_args():
     parser.add_argument(
         "--duration",
         type=float,
-        default=5.0,
-        help="Duration in seconds (default: 5.0)",
+        default=None,
+        help="Duration in seconds (default: 5.0; ignored for --rack_target, which is automatic)",
     )
     parser.add_argument(
         "--num_samples",
@@ -63,6 +71,13 @@ def parse_args():
         type=str,
         default=None,
         help="Saved constraint list",
+    )
+    parser.add_argument(
+        "--rack_target",
+        "--rack",
+        type=str,
+        default=None,
+        help="Generate an origin-to-rack route using the retail-store rack map (rack1/rack2/rack3/rack4).",
     )
     parser.add_argument(
         "--output",
@@ -187,9 +202,18 @@ def main():
     print(f"Loaded model: {resolved_model}")
 
     fps = model.motion_rep.fps
-    num_frames = int(args.duration * fps)
     text = args.prompt.strip()
-    print(f"Will generate '{text}' with {num_frames} frames ({args.duration}s at {fps} fps)")
+    rack_target = normalize_rack_name(args.rack_target) if args.rack_target else None
+    if not text and rack_target is None:
+        raise ValueError("A text prompt is required unless --rack_target is set.")
+    if rack_target:
+        text = RACK_ROUTE_WALKING_PROMPT
+        num_frames = rack_route_auto_frame_count(rack_target, fps=fps)
+        duration = num_frames / fps
+    else:
+        duration = float(args.duration) if args.duration is not None else 5.0
+        num_frames = int(duration * fps)
+    print(f"Will generate '{text}' with {num_frames} frames ({duration}s at {fps} fps)")
 
     # The diffusion schedule can only be subsampled: asking for more steps than
     # num_base_steps indexes past the timestep map (CUDA device-side assert).
@@ -213,21 +237,44 @@ def main():
     print(f"Using {history_frames} history frames per autoregressive step")
 
     # Load constraints
+    rack_route = None
     if args.constraints:
         constraint_lst = load_constraints_lst(args.constraints, model.skeleton)
     else:
         constraint_lst = []
 
+    if rack_target:
+        rack_constraint, rack_route = create_rack_root2d_constraint(
+            model.skeleton,
+            rack_target,
+            total_frames=num_frames,
+            fps=fps,
+            device=device,
+        )
+        constraint_lst.append(rack_constraint)
+
     if constraint_lst:
         print(f"Using {len(constraint_lst)} set of constraints")
         for constraint in constraint_lst:
-            print(f"    {type(constraint).__name__} on frames {constraint.frame_indices.tolist()}")
+            frame_indices = constraint.frame_indices.tolist()
+            if len(frame_indices) > 20:
+                frame_summary = f"{frame_indices[0]}..{frame_indices[-1]} ({len(frame_indices)} frames)"
+            else:
+                frame_summary = str(frame_indices)
+            print(f"    {type(constraint).__name__} on frames {frame_summary}")
         max_frame_idx = max(int(c.frame_indices.max()) for c in constraint_lst)
         if max_frame_idx >= num_frames:
             raise ValueError(
                 f"Constraint frame index {max_frame_idx} exceeds the motion length "
-                f"({num_frames} frames = {args.duration}s at {fps} fps); increase --duration."
+                f"({num_frames} frames = {duration}s at {fps} fps); increase --duration."
             )
+    if rack_route is not None:
+        print(
+            "Rack route: "
+            f"{rack_route.rack_name} target=({rack_route.approach_position[0]:.2f}, "
+            f"{rack_route.approach_position[2]:.2f}) heading={np.rad2deg(rack_route.final_heading):.1f} deg, "
+            f"speed={rack_route.walk_speed_m_s:.2f} m/s, turns={rack_route.turn_degrees}"
+        )
 
     if args.seed is not None:
         seed_everything(args.seed)

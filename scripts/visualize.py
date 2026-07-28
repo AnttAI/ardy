@@ -133,6 +133,8 @@ def main():
         wxyz=viser.transforms.SO3.from_x_radians(-np.pi / 2.0).wxyz,
         position=(0.0, 0.0001, 0.0),
         fade_distance=20.0,
+        cell_size=0.3,
+        section_size=0.6,
         infinite_grid=True,
     )
 

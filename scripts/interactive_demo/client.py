@@ -5,8 +5,10 @@
 
 import base64
 import functools
+import mimetypes
 
 from .common import *  # noqa: F401,F403
+from .environments import DEFAULT_ENVIRONMENT_LABEL, add_environment_to_scene
 from .gui.instructions import QUICK_START_MD
 
 _ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
@@ -14,10 +16,11 @@ _ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
 
 @functools.lru_cache(maxsize=None)
 def _titlebar_logo_data_uri(filename: str) -> str:
-    """Read a titlebar logo PNG from assets/ once and cache it as a base64 data URI."""
+    """Read a titlebar logo from assets/ once and cache it as a data URI."""
     with open(os.path.join(_ASSETS_DIR, filename), "rb") as f:
         encoded = base64.standard_b64encode(f.read()).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
+    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return f"data:{mime_type};base64,{encoded}"
 
 
 class ClientMixin:
@@ -166,6 +169,8 @@ class ClientMixin:
             position=(0.0, 0.0001, 0.0),
             fade_distance=self.floor_len,
             section_color=LIGHT_THEME["grid"],
+            cell_size=0.3,
+            section_size=0.6,
             infinite_grid=True,
         )
 
@@ -178,6 +183,31 @@ class ClientMixin:
         #     color1=(230, 230, 230),
         #     color2=(40, 40, 40),
         # )
+
+        self.set_client_environment(client, DEFAULT_ENVIRONMENT_LABEL, visible=True)
+
+    def set_client_environment(self, client: viser.ClientHandle, label: str, visible: bool = True) -> None:
+        """Replace the current per-client demo environment."""
+        if not hasattr(self, "environment_scene_handles"):
+            self.environment_scene_handles = {}
+        old_handles = self.environment_scene_handles.pop(client.client_id, [])
+        for handle in reversed(old_handles):
+            try:
+                client.scene.remove_by_name(handle.name)
+            except Exception:
+                pass
+
+        handles = add_environment_to_scene(client, label)
+        for handle in handles:
+            handle.visible = visible
+        self.environment_scene_handles[client.client_id] = handles
+
+    def set_client_environment_visible(self, client_id: int, visible: bool) -> None:
+        """Show or hide the current per-client demo environment."""
+        if not hasattr(self, "environment_scene_handles"):
+            return
+        for handle in self.environment_scene_handles.get(client_id, []):
+            handle.visible = visible
 
     def setup_transform_gizmo(self, client_id: int):
         """Setup a transform control gizmo for initial body pose configuration."""
@@ -445,7 +475,15 @@ class ClientMixin:
             if session.playback_thread is not None and session.playback_thread.is_alive():
                 session.playback_thread.join(timeout=1.0)
                 print(f"Stopped playback thread for client {client_id}")
+            if session.t3_soma_worker_process is not None and session.t3_soma_worker_process.poll() is None:
+                session.t3_soma_worker_process.terminate()
+                try:
+                    session.t3_soma_worker_process.wait(timeout=2.0)
+                except Exception:
+                    session.t3_soma_worker_process.kill()
             del self.client_sessions[client_id]
+        if hasattr(self, "environment_scene_handles"):
+            self.environment_scene_handles.pop(client_id, None)
 
     def client_active(self, client_id: int) -> bool:
         """Check if a client session is active."""
@@ -461,22 +499,13 @@ class ClientMixin:
         client.gui.set_panel_label("ARDY")
         titlebar_content = viser.theme.TitlebarConfig(
             buttons=(
-                viser.theme.TitlebarButton(
-                    text="Project Page",
-                    icon="Description",
-                    href="https://research.nvidia.com/labs/sil/projects/ardy/",
-                ),
-                viser.theme.TitlebarButton(
-                    text="GitHub",
-                    icon="GitHub",
-                    href="https://github.com/nv-tlabs/ardy",
-                ),
+               
             ),
             image=viser.theme.TitlebarImage(
-                image_url_light=_titlebar_logo_data_uri("nvidia_logo.png"),
-                image_url_dark=_titlebar_logo_data_uri("nvidia_logo_dark.png"),
-                image_alt="NVIDIA",
-                href="https://www.nvidia.com/",
+                image_url_light=_titlebar_logo_data_uri("antt_logo.svg"),
+                image_url_dark=_titlebar_logo_data_uri("antt_logo_dark.svg"),
+                image_alt="ANTT AI",
+                href="https://www.antt.ai/",
             ),
             title_text="ARDY",
         )

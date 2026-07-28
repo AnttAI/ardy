@@ -82,6 +82,25 @@ class CharactersMixin:
             session.target_velocity_arrow.clear()
             session.target_velocity_arrow = None
 
+        if session.t3_live_retargeter is not None:
+            session.t3_live_retargeter.clear()
+            session.t3_live_retargeter = None
+        if session.t3_csv_player is not None:
+            session.t3_csv_player.clear()
+            session.t3_csv_player = None
+        if session.soma_debug_character is not None:
+            session.soma_debug_character.clear()
+            session.soma_debug_character = None
+        session.soma_debug_joints_pos = None
+        session.soma_debug_joints_rot = None
+        session.soma_debug_skeleton = None
+        session.soma_debug_generation = -1
+        session.soma_live_mapper = None
+        session.t3_retarget_ready_generation = -1
+        session.t3_csv_player_generation = -1
+        session.t3_retarget_csv_path = None
+        self._set_soma_t3_status(client_id, "idle")
+
         # Clear hand gizmos
         self.clear_hand_gizmos(client_id)
 

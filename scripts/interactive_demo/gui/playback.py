@@ -20,7 +20,27 @@ class GuiPlaybackMixin:
             g.gui_current_time = client.gui.add_number("Current Time (s)", initial_value=0.0, step=0.01, disabled=True)
             g.gui_model_fps = client.gui.add_number("Native FPS", initial_value=30, disabled=True)
             g.gui_frame_idx_input = client.gui.add_number("Frame Index", initial_value=0, min=0, max=199, step=1)
+            g.gui_realtime_mode_checkbox = client.gui.add_checkbox(
+                "Realtime / Infinite Generation",
+                initial_value=True,
+                hint="When disabled, loaded constraint motions play once and stop at their task end frame.",
+            )
             g.gui_enable_auto_replan_checkbox = client.gui.add_checkbox("Enable Auto Replan", initial_value=True)
+
+            @g.gui_realtime_mode_checkbox.on_update
+            def _(_) -> None:
+                if not self.client_active(client_id):
+                    return
+                session = self.client_sessions[client_id]
+                session.realtime_mode = bool(g.gui_realtime_mode_checkbox.value)
+                if session.realtime_mode:
+                    g.gui_enable_auto_replan_checkbox.value = True
+                    g.gui_enable_auto_replan_checkbox.disabled = False
+                    session.play_once = False
+                else:
+                    g.gui_enable_auto_replan_checkbox.value = False
+                    g.gui_enable_auto_replan_checkbox.disabled = True
+                    session.play_once = session.playing
 
             @g.gui_frame_idx_input.on_update
             def _(_) -> None:
@@ -42,6 +62,7 @@ class GuiPlaybackMixin:
                     return
                 session = self.client_sessions[client_id]
                 session.playing = not session.playing
+                session.play_once = session.playing and not session.realtime_mode
                 g.gui_play_pause_button.label = "Pause" if session.playing else "Play"
                 g.gui_next_frame_button.disabled = session.playing
                 g.gui_prev_frame_button.disabled = session.playing

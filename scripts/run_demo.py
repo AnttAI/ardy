@@ -64,7 +64,7 @@ class InteractiveTimelineDemo(
         # on a background thread; the server must not wait on this.
         threading.Thread(
             target=self.text_encoder.prewarm,
-            args=([DEFAULT_PROMPT, *PRESET_PROMPTS],),
+            args=([DEFAULT_PROMPT, RACK_ROUTE_WALKING_PROMPT, RACK_PICK_CALM_PROMPT, *PRESET_PROMPTS],),
             daemon=True,
         ).start()
 

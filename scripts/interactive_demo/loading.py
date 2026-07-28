@@ -119,8 +119,8 @@ class ModelLoadingMixin:
             session.gui_elements.gui_load_seq_button.label = "Sample Constraints"
             session.gui_elements.gui_random_motion_button.disabled = False
         else:
-            session.gui_elements.gui_load_seq_button.disabled = True
-            session.gui_elements.gui_load_seq_button.label = "Sample Constraints (unavailable for Core)"
+            session.gui_elements.gui_load_seq_button.disabled = False
+            session.gui_elements.gui_load_seq_button.label = "Sample Constraints"
             session.gui_elements.gui_random_motion_button.disabled = True
 
         skeleton_infer = model.skeleton

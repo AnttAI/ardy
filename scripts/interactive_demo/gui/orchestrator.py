@@ -6,6 +6,7 @@
 from types import SimpleNamespace
 
 from ..common import *  # noqa: F401,F403
+from ..environments import DEFAULT_ENVIRONMENT_LABEL, ENVIRONMENT_OPTIONS
 from .instructions import INSTRUCTIONS_TAB_MD
 
 
@@ -113,7 +114,7 @@ class GuiMixin:
         }
 
         # Active prompt label
-        g.gui_active_prompt_label = client.gui.add_markdown("**Active Prompt:** A person is walking.")
+        g.gui_active_prompt_label = client.gui.add_markdown(f"**Active Prompt:** {default_prompt}")
 
         tab_group = client.gui.add_tab_group()
 
@@ -126,6 +127,26 @@ class GuiMixin:
         self._build_visualize_tab(client, client_id, tab_group, g, timeline, default_prompt)
         self._build_model_tab(client, client_id, tab_group, g, timeline, default_prompt)
         self._build_io_tab(client, client_id, tab_group, g, timeline, default_prompt)
+
+        with tab_group.add_tab("Environment", viser.Icon.SETTINGS):
+            environment_dropdown = client.gui.add_dropdown(
+                "Environment",
+                options=ENVIRONMENT_OPTIONS,
+                initial_value=DEFAULT_ENVIRONMENT_LABEL,
+            )
+            show_environment_checkbox = client.gui.add_checkbox("Show Environment", initial_value=True)
+
+            @environment_dropdown.on_update
+            def _(event: viser.GuiEvent) -> None:
+                self.set_client_environment(
+                    event.client,
+                    str(environment_dropdown.value),
+                    visible=bool(show_environment_checkbox.value),
+                )
+
+            @show_environment_checkbox.on_update
+            def _(_: viser.GuiEvent) -> None:
+                self.set_client_environment_visible(client_id, bool(show_environment_checkbox.value))
 
         #
         # Instructions tab

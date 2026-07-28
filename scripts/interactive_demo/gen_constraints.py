@@ -50,11 +50,15 @@ class GenConstraintsMixin:
             # For dense 2D root I think it is okay, maybe we could do this for sparse 2D roots?
             if track_name == "2D Root":
                 root_pos_2d = _to_device_tensor(constraint_info["root_pos"][valid_idx][:, [0, 2]], device)
+                global_root_heading = None
+                if "global_root_heading" in constraint_info:
+                    global_root_heading = _to_device_tensor(constraint_info["global_root_heading"][valid_idx], device)
                 model_constraints.append(
                     Root2DConstraintSet(
                         session.motion_rep.skeleton,
                         frame_indices,
                         root_pos_2d,
+                        global_root_heading=global_root_heading,
                     )
                 )
 

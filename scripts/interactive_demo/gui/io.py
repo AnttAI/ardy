@@ -20,6 +20,16 @@ class GuiIOMixin:
                 )
                 g.gui_export_session_button = client.gui.add_button("Export Session")
                 g.gui_load_session_button = client.gui.add_button("Load Session")
+                g.gui_t3_csv_file_path = client.gui.add_text(
+                    "T3 CSV File Path",
+                    initial_value=f".cache/export/t3_motion_{default_timestamp}.csv",
+                )
+                g.gui_export_t3_csv_button = client.gui.add_button("Export T3 CSV")
+                g.gui_soma_bvh_file_path = client.gui.add_text(
+                    "SOMA BVH File Path",
+                    initial_value=f".cache/export/soma_motion_{default_timestamp}.bvh",
+                )
+                g.gui_export_soma_bvh_button = client.gui.add_button("Export SOMA BVH")
 
             # Root Constraints Group
             with client.gui.add_folder("Root Constraints", expand_by_default=True):
@@ -127,6 +137,46 @@ class GuiIOMixin:
                         auto_close_seconds=2.0,
                         color="blue",
                     )
+
+            @g.gui_export_t3_csv_button.on_click
+            def _(event: viser.GuiEvent) -> None:
+                filepath = g.gui_t3_csv_file_path.value
+                success = self.export_t3_motion_csv(client_id, filepath)
+                if event.client:
+                    if success:
+                        event.client.add_notification(
+                            title="T3 CSV exported",
+                            body=f"Saved to {filepath}",
+                            auto_close_seconds=3.0,
+                            color="green",
+                        )
+                    else:
+                        event.client.add_notification(
+                            title="T3 export failed",
+                            body="Generate motion first, then check console for details.",
+                            auto_close_seconds=5.0,
+                            color="red",
+                        )
+
+            @g.gui_export_soma_bvh_button.on_click
+            def _(event: viser.GuiEvent) -> None:
+                filepath = g.gui_soma_bvh_file_path.value
+                success = self.export_soma_bvh(client_id, filepath)
+                if event.client:
+                    if success:
+                        event.client.add_notification(
+                            title="SOMA BVH exported",
+                            body=f"Saved to {filepath}",
+                            auto_close_seconds=3.0,
+                            color="green",
+                        )
+                    else:
+                        event.client.add_notification(
+                            title="BVH export failed",
+                            body="Generate Core motion first, then check console for details.",
+                            auto_close_seconds=5.0,
+                            color="red",
+                        )
 
             @g.gui_load_root_button.on_click
             def _(event: viser.GuiEvent) -> None:
@@ -288,6 +338,7 @@ class GuiIOMixin:
                 if not space_pressed[0]:
                     space_pressed[0] = True
                     session.playing = not session.playing
+                    session.play_once = session.playing and not session.realtime_mode
                     g.gui_play_pause_button.label = "Pause" if session.playing else "Play"
                     g.gui_next_frame_button.disabled = session.playing
                     g.gui_prev_frame_button.disabled = session.playing
@@ -403,7 +454,10 @@ class GuiIOMixin:
                     )
                     return
 
-                if not skeleton_supports_constraint_sampling(session.motion_rep.skeleton):
+                file_path = g.gui_motion_file_path.value.strip()
+                if not skeleton_supports_constraint_sampling(session.motion_rep.skeleton) and not file_path.lower().endswith(
+                    ".bvh"
+                ):
                     client.add_notification(
                         title="No dataset for this skeleton",
                         body=(
@@ -418,7 +472,6 @@ class GuiIOMixin:
 
                 t_start = time.time()
 
-                file_path = g.gui_motion_file_path.value.strip()
                 if not file_path or not os.path.exists(file_path):
                     client.add_notification(
                         title="Invalid file path",

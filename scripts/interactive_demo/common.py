@@ -39,6 +39,18 @@ from ardy.model.registry import (
 )
 from ardy.motion_rep import ArdyMotionRep
 from ardy.postprocess import post_process_motion
+from ardy.retail_rack_route import (
+    RACK_PICK_CALM_PROMPT,
+    RACK_ROUTE_WALKING_PROMPT,
+    plan_rack_pick,
+    plan_rack_return_route,
+    plan_rack_to_rack_route,
+    plan_rack_route,
+    rack_pick_auto_frame_count,
+    rack_return_auto_frame_count,
+    rack_to_rack_auto_frame_count,
+    rack_route_auto_frame_count,
+)
 from ardy.skeleton import (
     CoreSkeleton27,
     G1Skeleton34,
@@ -158,7 +170,7 @@ DEFAULT_HISTORY_CROP_LENGTH = 4
 # Default text prompt (initial GUI value) and the Prompt List preset buttons
 # (gui/text.py). Also used by run_demo.py to prewarm the text-embedding
 # cache at startup.
-DEFAULT_PROMPT = "A person is walking."
+DEFAULT_PROMPT = "A person is standing."
 PRESET_PROMPTS = [
     "A person is walking.",
     "A person jumps backwards.",
@@ -221,6 +233,7 @@ class GuiElements:
     gui_future_crop_length: viser.GuiInputHandle[int]
     gui_replan_buffer_size: viser.GuiInputHandle[int]
     gui_replan_trigger_thresh: viser.GuiInputHandle[int]
+    gui_realtime_mode_checkbox: viser.GuiInputHandle[bool]
     gui_enable_auto_replan_checkbox: viser.GuiInputHandle[bool]
     gui_cfg_text_weight: viser.GuiInputHandle[float]
     gui_cfg_constraint_weight: viser.GuiInputHandle[float]
@@ -233,11 +246,21 @@ class GuiElements:
     gui_restart_button: viser.GuiInputHandle
     gui_load_seq_button: viser.GuiInputHandle
     gui_random_motion_button: viser.GuiInputHandle
+    gui_source_rack_route_dropdown: viser.GuiInputHandle[str]
+    gui_rack_route_dropdown: viser.GuiInputHandle[str]
+    gui_apply_rack_route_button: viser.GuiInputHandle
+    gui_return_rack_route_button: viser.GuiInputHandle
+    gui_rack_to_rack_route_button: viser.GuiInputHandle
+    gui_rack_pick_shelf_dropdown: viser.GuiInputHandle[str]
+    gui_rack_pick_object_dropdown: viser.GuiInputHandle[str]
+    gui_rack_pick_button: viser.GuiInputHandle
     gui_waypoint_mode_checkbox: viser.GuiInputHandle[bool]
     gui_dense_root_checkbox: viser.GuiInputHandle[bool]
     gui_root_file_path: viser.GuiInputHandle[str]
     gui_load_root_button: viser.GuiInputHandle
     gui_save_root_button: viser.GuiInputHandle
+    gui_soma_bvh_file_path: viser.GuiInputHandle[str]
+    gui_export_soma_bvh_button: viser.GuiInputHandle
     gui_scene_file_path: viser.GuiInputHandle[str]
     gui_mesh_transform_dropdown: viser.GuiInputHandle[str]
     gui_load_mesh_button: viser.GuiInputHandle
@@ -256,6 +279,14 @@ class GuiElements:
     gui_viz_skeleton_checkbox: viser.GuiInputHandle[bool]
     gui_viz_foot_contacts_checkbox: viser.GuiInputHandle[bool]
     gui_viz_ref_motion_checkbox: viser.GuiInputHandle[bool]
+    gui_viz_soma_mesh_checkbox: viser.GuiInputHandle[bool]
+    gui_viz_soma_mesh_offset: viser.GuiInputHandle[tuple[float, float, float]]
+    gui_viz_t3_robot_checkbox: viser.GuiInputHandle[bool]
+    gui_viz_t3_soma_retarget_checkbox: viser.GuiInputHandle[bool]
+    gui_viz_t3_retarget_now_button: viser.GuiInputHandle
+    gui_viz_t3_retarget_status: viser.GuiInputHandle[str]
+    gui_viz_t3_offset: viser.GuiInputHandle[tuple[float, float, float]]
+    gui_viz_t3_yaw_offset: viser.GuiInputHandle[float]
     gui_viz_skinned_mesh_checkbox: viser.GuiInputHandle[bool]
     gui_viz_skinned_mesh_opacity_slider: viser.GuiInputHandle[float]
     gui_viz_hand_orientations_checkbox: viser.GuiInputHandle[bool]
@@ -299,7 +330,25 @@ class ClientSession:
     foot_contacts: Optional[torch.Tensor] = None
     root_velocities: Optional[torch.Tensor] = None  # [N, T, 3] root joint velocities (x, y, z)
     characters: dict = field(default_factory=dict)
+    soma_debug_character: Optional[object] = None
+    soma_debug_joints_pos: Optional[torch.Tensor] = None
+    soma_debug_joints_rot: Optional[torch.Tensor] = None
+    soma_debug_generation: int = -1
+    soma_debug_skeleton: Optional[object] = None
+    soma_live_mapper: Optional[object] = None
     target_velocity_arrow: Optional[object] = None  # VelocityArrowMesh for target velocity visualization
+    t3_live_retargeter: Optional[object] = None
+    t3_csv_player: Optional[object] = None
+    t3_retarget_thread: Optional[threading.Thread] = None
+    t3_retarget_lock: threading.Lock = field(default_factory=threading.Lock)
+    t3_retarget_generation: int = 0
+    t3_retarget_pending_after_current: bool = False
+    t3_retarget_ready_generation: int = -1
+    t3_csv_player_generation: int = -1
+    t3_retarget_status: str = "idle"
+    t3_retarget_csv_path: Optional[str] = None
+    t3_soma_worker_process: Optional[object] = None
+    t3_soma_worker_lock: threading.Lock = field(default_factory=threading.Lock)
 
     # Initial body transform (for generation)
     init_global_translation: Optional[np.ndarray] = None  # [3] initial body translation, float32
@@ -311,6 +360,11 @@ class ClientSession:
     frame_idx: int = -1
     max_frame_idx: int = -1
     playing: bool = False
+    play_once: bool = False
+    realtime_mode: bool = True
+    task_end_frame_idx: Optional[int] = None
+    task_generation_pending: bool = False
+    task_reached_reported: bool = False
     cur_time: float = -1.0
     playback_fps: int = 30
 

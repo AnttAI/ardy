@@ -399,9 +399,21 @@ class GenerationMixin:
 
             # Update timeline
             session.max_frame_idx = session.motion_tensor.shape[1] - 1
+            if (
+                session.task_generation_pending
+                and session.task_end_frame_idx is not None
+                and session.max_frame_idx >= session.task_end_frame_idx
+            ):
+                session.task_generation_pending = False
 
         # Update frame index input max value
         session.gui_elements.gui_frame_idx_input.max = session.max_frame_idx
+        if (
+            getattr(session.gui_elements, "gui_viz_t3_soma_retarget_checkbox", None) is not None
+            and session.gui_elements.gui_viz_t3_soma_retarget_checkbox.value
+            and session.gui_elements.gui_viz_t3_robot_checkbox.value
+        ):
+            self.request_soma_t3_retarget(client_id)
 
         end_time = time.time()
         print(f"Generate step time: {end_time - start_time} seconds")

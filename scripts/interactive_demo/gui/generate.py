@@ -163,7 +163,10 @@ class GuiGenerateMixin:
                             )
                         return
 
-                    if not skeleton_supports_constraint_sampling(session.motion_rep.skeleton):
+                    file_path = g.gui_motion_file_path.value.strip()
+                    if not skeleton_supports_constraint_sampling(session.motion_rep.skeleton) and not file_path.lower().endswith(
+                        ".bvh"
+                    ):
                         if event.client:
                             event.client.add_notification(
                                 title="No dataset for this skeleton",
@@ -178,7 +181,6 @@ class GuiGenerateMixin:
                         return
 
                     # Load motion from file path
-                    file_path = g.gui_motion_file_path.value.strip()
                     if not file_path:
                         if event.client:
                             event.client.add_notification(
@@ -260,6 +262,98 @@ class GuiGenerateMixin:
                         )
 
             # Waypoint controls
+            with client.gui.add_folder("Rack Route", expand_by_default=True):
+                g.gui_source_rack_route_dropdown = client.gui.add_dropdown(
+                    "Source Rack",
+                    options=("rack_1", "rack_2", "rack_3", "rack_4"),
+                    initial_value="rack_1",
+                    hint="Start rack for rack-to-rack motion",
+                )
+                g.gui_rack_route_dropdown = client.gui.add_dropdown(
+                    "Target Rack",
+                    options=("rack_1", "rack_2", "rack_3", "rack_4"),
+                    initial_value="rack_2",
+                    hint="Generate a constraints-only origin-to-rack route for the mesh human",
+                )
+                g.gui_apply_rack_route_button = client.gui.add_button(
+                    "Go To Rack",
+                    color="green",
+                )
+                g.gui_return_rack_route_button = client.gui.add_button(
+                    "Return To Origin",
+                    color="blue",
+                )
+                g.gui_rack_to_rack_route_button = client.gui.add_button(
+                    "Rack To Rack",
+                    color="orange",
+                )
+                g.gui_rack_pick_shelf_dropdown = client.gui.add_dropdown(
+                    "Pick Shelf",
+                    options=("1", "2", "3", "4", "5"),
+                    initial_value="4",
+                    hint="Shelf number on the target rack",
+                )
+                g.gui_rack_pick_object_dropdown = client.gui.add_dropdown(
+                    "Pick Object",
+                    options=("1", "2", "3"),
+                    initial_value="2",
+                    hint="Object slot on the selected shelf",
+                )
+                g.gui_rack_pick_button = client.gui.add_button(
+                    "Pick Item",
+                    color="blue",
+                )
+
+                @g.gui_apply_rack_route_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    threading.Thread(
+                        target=self.apply_rack_route,
+                        args=(
+                            client_id,
+                            str(g.gui_rack_route_dropdown.value),
+                        ),
+                        daemon=True,
+                    ).start()
+
+                @g.gui_return_rack_route_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    threading.Thread(
+                        target=self.apply_rack_route,
+                        args=(
+                            client_id,
+                            str(g.gui_rack_route_dropdown.value),
+                        ),
+                        kwargs={"return_to_origin": True},
+                        daemon=True,
+                    ).start()
+
+                @g.gui_rack_to_rack_route_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    threading.Thread(
+                        target=self.apply_rack_route,
+                        args=(
+                            client_id,
+                            str(g.gui_rack_route_dropdown.value),
+                        ),
+                        kwargs={
+                            "source_rack_name": str(g.gui_source_rack_route_dropdown.value),
+                        },
+                        daemon=True,
+                    ).start()
+
+                @g.gui_rack_pick_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    threading.Thread(
+                        target=self.apply_rack_pick,
+                        args=(
+                            client_id,
+                            str(g.gui_rack_route_dropdown.value),
+                            int(g.gui_rack_pick_shelf_dropdown.value),
+                            int(g.gui_rack_pick_object_dropdown.value),
+                        ),
+                        daemon=True,
+                    ).start()
+
             with client.gui.add_folder("Waypoint", expand_by_default=False):
                 g.gui_waypoint_mode_checkbox = client.gui.add_checkbox("Enable Waypoint Mode", initial_value=False)
                 g.gui_dense_root_checkbox = client.gui.add_checkbox("Use Dense Root", initial_value=False)

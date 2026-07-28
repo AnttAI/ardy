@@ -7,6 +7,318 @@ from .common import *  # noqa: F401,F403
 
 
 class SessionIOMixin:
+    def _compute_soma_debug_motion(self, local_rot_mats, root_positions, device):
+        from ardy.exports.bvh import core27_to_soma77_bvh_local_rotations
+        from ardy.skeleton import SOMASkeleton77, batch_rigid_transform
+
+        soma_skeleton = SOMASkeleton77().to(device)
+        bvh_local_np = core27_to_soma77_bvh_local_rotations(local_rot_mats)
+        local_rot_mats_t = torch.as_tensor(bvh_local_np, device=device, dtype=torch.float32)
+
+        # Match the BVH import path: exported BVH globals are post-multiplied by
+        # standard T-pose offsets before visualization/skinning.
+        neutral_joints = torch.ones(
+            (local_rot_mats_t.shape[0], soma_skeleton.nbjoints, 3),
+            device=device,
+            dtype=torch.float32,
+        )
+        _, global_rot_mats = batch_rigid_transform(
+            local_rot_mats_t,
+            neutral_joints,
+            soma_skeleton.joint_parents.to(device),
+            soma_skeleton.root_idx,
+        )
+        if hasattr(soma_skeleton, "global_rot_offsets"):
+            global_offsets = soma_skeleton.global_rot_offsets.to(device=device, dtype=torch.float32)
+            global_rot_mats = torch.einsum("T N m n, N o n -> T N m o", global_rot_mats, global_offsets)
+            parent_rots = global_rot_mats[:, soma_skeleton.joint_parents.to(device)]
+            parent_rots[:, soma_skeleton.root_idx] = torch.eye(3, device=device, dtype=torch.float32)
+            local_rot_mats_t = torch.einsum(
+                "T N m n, T N n o -> T N m o",
+                parent_rots.transpose(-2, -1),
+                global_rot_mats,
+            )
+
+        root_positions_t = torch.as_tensor(root_positions, device=device, dtype=torch.float32)
+        soma_global_rot, soma_joints_pos, _ = soma_skeleton.fk(local_rot_mats_t, root_positions_t)
+        return soma_skeleton.cpu(), soma_joints_pos.detach().cpu(), soma_global_rot.detach().cpu()
+
+    def _read_soma_worker_json(self, proc):
+        if proc.stdout is None:
+            raise RuntimeError("Soma T3 worker has no stdout pipe")
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                raise RuntimeError("Soma T3 worker exited without a JSON response")
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                print(f"[T3 Live] Soma worker log: {line.rstrip()}")
+
+    def _get_soma_t3_worker(self, client_id: int):
+        import subprocess
+        from pathlib import Path
+
+        if not self.client_active(client_id):
+            return None
+        session = self.client_sessions[client_id]
+        proc = session.t3_soma_worker_process
+        if proc is not None and proc.poll() is None:
+            return proc
+
+        conda_env = os.environ.get("SOMA_RETARGET_CONDA_ENV", "soma-retargeter")
+        worker = Path(REPO_ROOT) / "ardy" / "retarget_to_t3" / "soma_t3_worker.py"
+        cmd = ["conda", "run", "--no-capture-output", "-n", conda_env, "python", str(worker)]
+        proc = subprocess.Popen(
+            cmd,
+            cwd=REPO_ROOT,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            bufsize=1,
+        )
+        ready = self._read_soma_worker_json(proc)
+        if not ready.get("ok"):
+            raise RuntimeError(f"Soma T3 worker failed to start: {ready}")
+        session.t3_soma_worker_process = proc
+        return proc
+
+    def _export_core27_t3_with_soma_env(
+        self,
+        local_rot_mats,
+        root_positions,
+        fps: float,
+        output_csv,
+        *,
+        status_client_id: int | None = None,
+    ):
+        """Export Soma BVH locally, then retarget upper body in a warm Soma worker."""
+        from pathlib import Path
+
+        from ardy.exports.bvh import export_soma_bvh_from_arrays
+
+        output_csv = Path(output_csv).expanduser().resolve()
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        live_root = Path(REPO_ROOT) / ".cache" / "t3_live"
+        live_root.mkdir(parents=True, exist_ok=True)
+        bvh_path = (live_root / f"{output_csv.stem}.soma.bvh").resolve()
+        reference_bvh = Path(
+            "/home/jony/Downloads/soma-retargeter/assets/motions/bvh/Neutral_walk_forward_002__A057.bvh"
+        )
+        export_soma_bvh_from_arrays(
+            local_rot_mats=local_rot_mats,
+            root_positions=root_positions,
+            fps=fps,
+            reference_bvh=reference_bvh,
+            output_bvh=bvh_path,
+        )
+
+        if status_client_id is not None:
+            self._set_soma_t3_status(status_client_id, "Soma upper-body retarget worker")
+
+        proc = self._get_soma_t3_worker(status_client_id) if status_client_id is not None else None
+        if proc is None or proc.stdin is None or proc.stdout is None:
+            raise RuntimeError("Soma T3 worker is unavailable")
+        payload = {
+            "bvh_path": str(bvh_path),
+            "output_csv": str(output_csv),
+            "fps": float(fps),
+        }
+        session = self.client_sessions[status_client_id]
+        with session.t3_soma_worker_lock:
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
+            result = self._read_soma_worker_json(proc)
+        if not result.get("ok"):
+            raise RuntimeError(f"Soma T3 worker failed: {result.get('error')}\n{result.get('traceback', '')}")
+        return output_csv
+
+    def _set_soma_t3_status(self, client_id: int, status: str) -> None:
+        if not self.client_active(client_id):
+            return
+        session = self.client_sessions[client_id]
+        session.t3_retarget_status = status
+        status_handle = getattr(session.gui_elements, "gui_viz_t3_retarget_status", None)
+        if status_handle is not None:
+            status_handle.value = status
+
+    def request_soma_t3_retarget(self, client_id: int, force: bool = False) -> None:
+        """Start a background Soma/Newton retarget for the current generated motion."""
+        if not self.client_active(client_id):
+            return
+        session = self.client_sessions[client_id]
+        if session.motion_tensor is None or session.motion_rep is None:
+            self._set_soma_t3_status(client_id, "waiting for motion")
+            return
+
+        with session.t3_retarget_lock:
+            if (
+                session.t3_retarget_thread is not None
+                and session.t3_retarget_thread.is_alive()
+                and session.t3_retarget_thread is not threading.current_thread()
+            ):
+                session.t3_retarget_pending_after_current = True
+                session.t3_retarget_status = "retarget already running"
+                if getattr(session.gui_elements, "gui_viz_t3_retarget_status", None) is not None:
+                    session.gui_elements.gui_viz_t3_retarget_status.value = session.t3_retarget_status
+                return
+            session.t3_retarget_generation += 1
+            generation = session.t3_retarget_generation
+            session.t3_retarget_status = f"retargeting gen {generation}"
+            if getattr(session.gui_elements, "gui_viz_t3_retarget_status", None) is not None:
+                session.gui_elements.gui_viz_t3_retarget_status.value = session.t3_retarget_status
+
+            thread = threading.Thread(
+                target=self._run_soma_t3_retarget_worker,
+                args=(client_id, generation),
+                daemon=True,
+            )
+            session.t3_retarget_thread = thread
+            thread.start()
+
+    def _run_soma_t3_retarget_worker(self, client_id: int, generation: int) -> None:
+        if not self.client_active(client_id):
+            return
+        session = self.client_sessions[client_id]
+        try:
+            from pathlib import Path
+
+            with session.motion_tensor_lock:
+                motion_tensor = None if session.motion_tensor is None else session.motion_tensor.detach().clone()
+                motion_rep = session.motion_rep
+                fps = session.model_fps
+
+            if motion_tensor is None or motion_rep is None:
+                self._set_soma_t3_status(client_id, "waiting for motion")
+                return
+
+            with torch.no_grad():
+                tensor_unnorm = motion_rep.unnormalize(motion_tensor)
+                inverse_output = motion_rep.inverse(tensor_unnorm, is_normalized=False)
+                local_rot_mats = inverse_output["local_rot_mats"][0].detach().cpu().numpy()
+                root_positions = inverse_output["root_positions"][0].detach().cpu().numpy()
+                soma_skeleton, soma_joints_pos, soma_joints_rot = self._compute_soma_debug_motion(
+                    local_rot_mats,
+                    root_positions,
+                    self.device,
+                )
+
+            with session.t3_retarget_lock:
+                session.soma_debug_skeleton = soma_skeleton
+                session.soma_debug_joints_pos = soma_joints_pos
+                session.soma_debug_joints_rot = soma_joints_rot
+                session.soma_debug_generation = generation
+
+            output_csv = Path(".cache") / "t3_live" / f"client_{client_id}_gen_{generation}.csv"
+            self._export_core27_t3_with_soma_env(
+                local_rot_mats,
+                root_positions,
+                fps,
+                output_csv,
+                status_client_id=client_id,
+            )
+
+            if not self.client_active(client_id):
+                return
+            session = self.client_sessions[client_id]
+            with session.t3_retarget_lock:
+                if generation >= session.t3_retarget_ready_generation:
+                    session.t3_retarget_csv_path = str(output_csv)
+                    session.t3_retarget_ready_generation = generation
+                    session.t3_retarget_status = f"ready gen {generation}"
+                    if getattr(session.gui_elements, "gui_viz_t3_retarget_status", None) is not None:
+                        session.gui_elements.gui_viz_t3_retarget_status.value = session.t3_retarget_status
+                run_pending = session.t3_retarget_pending_after_current
+                session.t3_retarget_pending_after_current = False
+            print(f"[T3 Live] Soma retarget ready: {output_csv}")
+            self.set_frame(client_id, session.frame_idx)
+            if run_pending:
+                self.request_soma_t3_retarget(client_id, force=True)
+        except Exception as e:
+            print(f"[T3 Live] Soma retarget failed: {e}")
+            import traceback
+
+            traceback.print_exc()
+            self._set_soma_t3_status(client_id, "failed")
+            if self.client_active(client_id):
+                session = self.client_sessions[client_id]
+                with session.t3_retarget_lock:
+                    run_pending = session.t3_retarget_pending_after_current
+                    session.t3_retarget_pending_after_current = False
+                if run_pending:
+                    self.request_soma_t3_retarget(client_id, force=True)
+
+    def export_soma_bvh(self, client_id: int, filepath: str):
+        """Export the generated CoreSkeleton27 motion as a SOMA-style BVH."""
+        if not self.client_active(client_id):
+            return False
+        session = self.client_sessions[client_id]
+        if session.motion_tensor is None or session.motion_rep is None:
+            print("[BVH Export] No generated motion is available to export")
+            return False
+
+        try:
+            from pathlib import Path
+
+            from ardy.exports.bvh import export_soma_bvh_from_arrays
+
+            tensor_unnorm = session.motion_rep.unnormalize(session.motion_tensor)
+            inverse_output = session.motion_rep.inverse(tensor_unnorm, is_normalized=False)
+            local_rot_mats = inverse_output["local_rot_mats"][0].detach().cpu().numpy()
+            root_positions = inverse_output["root_positions"][0].detach().cpu().numpy()
+
+            reference_bvh = (
+                "/home/jony/Downloads/soma-retargeter/assets/motions/bvh/"
+                "Neutral_walk_forward_002__A057.bvh"
+            )
+            export_soma_bvh_from_arrays(
+                local_rot_mats=local_rot_mats,
+                root_positions=root_positions,
+                fps=session.model_fps,
+                reference_bvh=Path(reference_bvh),
+                output_bvh=Path(filepath),
+            )
+            print(f"[BVH Export] Saved SOMA BVH to {filepath}")
+            return True
+        except Exception as e:
+            print(f"[BVH Export] Error exporting SOMA BVH: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    def export_t3_motion_csv(self, client_id: int, filepath: str):
+        """Export the generated motion retargeted to T3 as a CSV."""
+        if not self.client_active(client_id):
+            return False
+        session = self.client_sessions[client_id]
+        if session.motion_tensor is None or session.motion_rep is None:
+            print("[T3 Export] No generated motion is available to export")
+            return False
+
+        try:
+            tensor_unnorm = session.motion_rep.unnormalize(session.motion_tensor)
+            inverse_output = session.motion_rep.inverse(tensor_unnorm, is_normalized=False)
+            local_rot_mats = inverse_output["local_rot_mats"][0].detach().cpu().numpy()
+            root_positions = inverse_output["root_positions"][0].detach().cpu().numpy()
+
+            path = self._export_core27_t3_with_soma_env(
+                local_rot_mats,
+                root_positions,
+                session.model_fps,
+                filepath,
+                status_client_id=client_id,
+            )
+            print(f"[T3 Export] Saved T3 CSV to {path}")
+            return True
+        except Exception as e:
+            print(f"[T3 Export] Error exporting T3 CSV: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
     def export_session(self, client_id: int, filepath: str):
         """Export generated motion, text prompts, and constraints to a file using pickle."""
         if not self.client_active(client_id):

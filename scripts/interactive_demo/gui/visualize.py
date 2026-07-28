@@ -25,6 +25,76 @@ class GuiVisualizeMixin:
                 initial_value=False,
                 hint="Show loaded reference motion as a red mesh character",
             )
+            g.gui_viz_soma_mesh_checkbox = client.gui.add_checkbox(
+                "Show SOMA Mesh",
+                initial_value=False,
+                hint="Show the generated motion after Core-to-SOMA mapping, before T3 retargeting",
+            )
+            g.gui_viz_soma_mesh_offset = client.gui.add_vector3(
+                "SOMA Offset",
+                initial_value=(0.8, 0.0, 0.0),
+                step=0.05,
+                hint="World-space offset for the SOMA debug mesh",
+            )
+            g.gui_viz_t3_robot_checkbox = client.gui.add_checkbox(
+                "Show Live T3",
+                initial_value=False,
+                hint="Retarget the generated motion to a T3 robot in this scene",
+            )
+            g.gui_viz_t3_soma_retarget_checkbox = client.gui.add_checkbox(
+                "Use Soma T3 Retarget",
+                initial_value=True,
+                hint="Run Soma/Newton in the background and play the corrected T3 CSV when ready",
+            )
+            g.gui_viz_t3_retarget_now_button = client.gui.add_button(
+                "Refresh Soma T3",
+                hint="Rebuild the corrected T3 CSV for the current generated motion",
+            )
+            g.gui_viz_t3_retarget_status = client.gui.add_text(
+                "Soma T3 Status",
+                initial_value="idle",
+                disabled=True,
+            )
+            g.gui_viz_t3_offset = client.gui.add_vector3(
+                "T3 Offset",
+                initial_value=(0.0, 0.0, 0.0),
+                step=0.05,
+                hint="World-space offset for the T3 robot",
+            )
+            g.gui_viz_t3_yaw_offset = client.gui.add_slider(
+                "T3 Yaw Offset",
+                min=-180.0,
+                max=180.0,
+                step=1.0,
+                initial_value=-90.0,
+                hint="URDF forward-axis correction for the fast preview; exact Soma CSV playback uses its saved yaw",
+            )
+
+            @g.gui_viz_t3_robot_checkbox.on_update
+            def _(_) -> None:
+                if not self.client_active(client_id):
+                    return
+                session = self.client_sessions[client_id]
+                if session.t3_live_retargeter is not None:
+                    session.t3_live_retargeter.set_visible(g.gui_viz_t3_robot_checkbox.value)
+                if session.t3_csv_player is not None:
+                    session.t3_csv_player.set_visible(g.gui_viz_t3_robot_checkbox.value)
+                if g.gui_viz_t3_robot_checkbox.value and g.gui_viz_t3_soma_retarget_checkbox.value:
+                    self.request_soma_t3_retarget(client_id)
+
+            @g.gui_viz_t3_soma_retarget_checkbox.on_update
+            def _(_) -> None:
+                if not self.client_active(client_id):
+                    return
+                session = self.client_sessions[client_id]
+                if g.gui_viz_t3_soma_retarget_checkbox.value:
+                    self.request_soma_t3_retarget(client_id)
+                elif session.t3_csv_player is not None:
+                    session.t3_csv_player.set_visible(False)
+
+            @g.gui_viz_t3_retarget_now_button.on_click
+            def _(_) -> None:
+                self.request_soma_t3_retarget(client_id, force=True)
 
             @g.gui_viz_ref_motion_checkbox.on_update
             def _(_) -> None:
@@ -39,6 +109,19 @@ class GuiVisualizeMixin:
                 elif show and session.ref_joints_pos is not None:
                     # Create reference character on first toggle
                     self._create_ref_character(client_id)
+
+            @g.gui_viz_soma_mesh_checkbox.on_update
+            def _(_) -> None:
+                if not self.client_active(client_id):
+                    return
+                session = self.client_sessions[client_id]
+                show = g.gui_viz_soma_mesh_checkbox.value
+                if session.soma_debug_character is not None:
+                    session.soma_debug_character.set_skinned_mesh_visibility(show)
+                    if session.soma_debug_character.skeleton_mesh is not None:
+                        session.soma_debug_character.skeleton_mesh.set_visibility(False)
+                if show and session.soma_debug_joints_pos is None:
+                    self.request_soma_t3_retarget(client_id)
 
             g.gui_viz_hand_orientations_checkbox = client.gui.add_checkbox(
                 "Show Hand+Foot Orientations",
