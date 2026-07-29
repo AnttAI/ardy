@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from ardy.retarget_to_t3 import export_t3_csv_from_core27_arrays, retarget_soma_bvh_to_t3_csv
+from ardy.retarget_to_t3.embedded_soma_t3 import VENDORED_REFERENCE_BVH
 
 
 def export_t3_csv(
@@ -42,7 +43,7 @@ def main() -> None:
     parser.add_argument("--bvh", type=Path, help="Retarget an already exported Soma BVH instead of an NPZ.")
     parser.add_argument(
         "--reference",
-        default="/home/jony/Downloads/soma-retargeter/assets/motions/bvh/Neutral_walk_forward_002__A057.bvh",
+        default=VENDORED_REFERENCE_BVH,
         type=Path,
     )
     parser.add_argument("--output", default="outputs/output_t3.csv", type=Path)

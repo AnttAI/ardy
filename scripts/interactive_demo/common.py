@@ -285,6 +285,7 @@ class GuiElements:
     gui_viz_t3_soma_retarget_checkbox: viser.GuiInputHandle[bool]
     gui_viz_t3_retarget_now_button: viser.GuiInputHandle
     gui_viz_t3_retarget_status: viser.GuiInputHandle[str]
+    gui_viz_t3_packet_size: viser.GuiInputHandle[int]
     gui_viz_t3_offset: viser.GuiInputHandle[tuple[float, float, float]]
     gui_viz_t3_yaw_offset: viser.GuiInputHandle[float]
     gui_viz_skinned_mesh_checkbox: viser.GuiInputHandle[bool]
@@ -336,6 +337,13 @@ class ClientSession:
     soma_debug_generation: int = -1
     soma_debug_skeleton: Optional[object] = None
     soma_live_mapper: Optional[object] = None
+    t3_live_soma77_local_rot_mats: Optional[np.ndarray] = None
+    t3_live_root_positions: Optional[np.ndarray] = None
+    t3_live_last_row_frame_idx: int = -1
+    t3_live_last_row: Optional[dict] = None
+    t3_live_soma_solver: Optional[object] = None
+    t3_live_solver_lock: threading.Lock = field(default_factory=threading.Lock)
+    t3_live_solver_warm_thread: Optional[threading.Thread] = None
     target_velocity_arrow: Optional[object] = None  # VelocityArrowMesh for target velocity visualization
     t3_live_retargeter: Optional[object] = None
     t3_csv_player: Optional[object] = None
@@ -345,8 +353,14 @@ class ClientSession:
     t3_retarget_pending_after_current: bool = False
     t3_retarget_ready_generation: int = -1
     t3_csv_player_generation: int = -1
+    t3_retarget_csv_start_frame: int = 0
+    t3_retarget_csv_end_frame: int = -1
+    t3_retarget_requested_end_frame: int = -1
+    t3_retarget_pending_start_frame: Optional[int] = None
     t3_retarget_status: str = "idle"
     t3_retarget_csv_path: Optional[str] = None
+    t3_stream_rows: list = field(default_factory=list)
+    t3_stream_packet_size: int = 10
     t3_soma_worker_process: Optional[object] = None
     t3_soma_worker_lock: threading.Lock = field(default_factory=threading.Lock)
 

@@ -413,7 +413,9 @@ class GenerationMixin:
             and session.gui_elements.gui_viz_t3_soma_retarget_checkbox.value
             and session.gui_elements.gui_viz_t3_robot_checkbox.value
         ):
-            self.request_soma_t3_retarget(client_id)
+            session.t3_live_soma77_local_rot_mats = None
+            session.t3_live_root_positions = None
+            self.request_soma_t3_retarget(client_id, start_frame=0)
 
         end_time = time.time()
         print(f"Generate step time: {end_time - start_time} seconds")

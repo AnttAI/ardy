@@ -96,9 +96,19 @@ class CharactersMixin:
         session.soma_debug_skeleton = None
         session.soma_debug_generation = -1
         session.soma_live_mapper = None
+        session.t3_live_soma77_local_rot_mats = None
+        session.t3_live_root_positions = None
+        session.t3_live_last_row_frame_idx = -1
+        session.t3_live_last_row = None
+        session.t3_live_soma_solver = None
         session.t3_retarget_ready_generation = -1
         session.t3_csv_player_generation = -1
+        session.t3_retarget_csv_start_frame = 0
+        session.t3_retarget_csv_end_frame = -1
+        session.t3_retarget_requested_end_frame = -1
+        session.t3_retarget_pending_start_frame = None
         session.t3_retarget_csv_path = None
+        session.t3_stream_rows = []
         self._set_soma_t3_status(client_id, "idle")
 
         # Clear hand gizmos

@@ -340,17 +340,35 @@ def load_standard_offsets(path: Path) -> Optional[np.ndarray]:
     return offsets.detach().cpu().numpy()
 
 
-def core27_to_soma77_bvh_local_rotations(
-    local_rot_mats: np.ndarray,
-    standard_offsets_path: Optional[Path] = None,
-) -> np.ndarray:
+def core27_to_soma77_standard_local_rotations(local_rot_mats: np.ndarray) -> np.ndarray:
+    """Map Core27 local rotations into SOMA77 local rotations in standard pose space.
+
+    Use this for direct in-memory consumers. BVH export needs
+    ``core27_to_soma77_bvh_local_rotations`` instead, because the BVH importer
+    later applies the standard-pose offset correction.
+    """
     core_global = local_to_global_rotations(local_rot_mats, CORE27_PARENTS)
     core_index = {name: idx for idx, name in enumerate(CSKEL27_JOINTS)}
     soma_index = {name: idx for idx, name in enumerate(SOMA77_JOINTS)}
 
-    soma_global_standard = np.tile(np.eye(3, dtype=local_rot_mats.dtype), (local_rot_mats.shape[0], len(SOMA77_JOINTS), 1, 1))
+    soma_global_standard = np.tile(
+        np.eye(3, dtype=local_rot_mats.dtype),
+        (local_rot_mats.shape[0], len(SOMA77_JOINTS), 1, 1),
+    )
     for target_name, source_name in TARGET_TO_SOURCE.items():
         soma_global_standard[:, soma_index[target_name]] = core_global[:, core_index[source_name]]
+
+    return global_to_local_rotations(soma_global_standard, SOMA77_PARENTS)
+
+
+def core27_to_soma77_bvh_local_rotations(
+    local_rot_mats: np.ndarray,
+    standard_offsets_path: Optional[Path] = None,
+) -> np.ndarray:
+    soma_global_standard = local_to_global_rotations(
+        core27_to_soma77_standard_local_rotations(local_rot_mats),
+        SOMA77_PARENTS,
+    )
 
     # ARDY's BVH loader post-multiplies parsed SOMA BVH globals by
     # global_rot_offsets.T to reach the standard T-pose frame. Export applies

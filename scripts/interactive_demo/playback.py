@@ -28,9 +28,30 @@ class PlaybackMixin:
 
             # Update frame if playing
             if session.playing:
+                accurate_soma_waiting = False
                 playback_end_frame = session.max_frame_idx
                 if not session.realtime_mode and session.task_end_frame_idx is not None:
                     playback_end_frame = min(playback_end_frame, session.task_end_frame_idx)
+
+                use_accurate_soma_t3 = (
+                    getattr(session.gui_elements, "gui_viz_t3_soma_retarget_checkbox", None) is not None
+                    and session.gui_elements.gui_viz_t3_soma_retarget_checkbox.value
+                    and session.gui_elements.gui_viz_t3_robot_checkbox.value
+                )
+                if use_accurate_soma_t3:
+                    next_frame = min(session.frame_idx + 1, playback_end_frame)
+                    csv_ready_until = (
+                        max(len(session.t3_stream_rows) - 1, int(session.t3_retarget_csv_end_frame))
+                        if hasattr(session, "t3_stream_rows")
+                        else int(session.t3_retarget_csv_end_frame)
+                    )
+                    if next_frame > csv_ready_until:
+                        self.request_soma_t3_retarget(client_id, start_frame=0)
+                        self._set_soma_t3_status(
+                            client_id,
+                            f"waiting for accurate Soma T3 frame {next_frame}; ready to {csv_ready_until}",
+                        )
+                        accurate_soma_waiting = True
 
                 waiting_for_task_generation = (
                     not session.realtime_mode
@@ -39,7 +60,9 @@ class PlaybackMixin:
                     and session.frame_idx >= session.max_frame_idx
                 )
 
-                if waiting_for_task_generation:
+                if accurate_soma_waiting:
+                    pass
+                elif waiting_for_task_generation:
                     if not session.replan_lock.locked():
                         threading.Thread(
                             target=self.on_replan_trigger,
@@ -140,6 +163,12 @@ class PlaybackMixin:
 
         # Check if approaching end of timeline
         thresh = session.gui_elements.gui_replan_trigger_thresh.value
+        if (
+            getattr(session.gui_elements, "gui_viz_t3_soma_retarget_checkbox", None) is not None
+            and session.gui_elements.gui_viz_t3_soma_retarget_checkbox.value
+            and session.gui_elements.gui_viz_t3_robot_checkbox.value
+        ):
+            thresh = max(int(thresh), int(session.gen_horizon_len))
         enable_auto_replan = session.gui_elements.gui_enable_auto_replan_checkbox.value
         if (
             session.realtime_mode
@@ -219,10 +248,21 @@ class PlaybackMixin:
                     if character_idx == 0 and root_pos_for_target is None:
                         root_pos_for_target = character.skeleton_mesh.cur_joints_pos[character.skeleton.root_idx]
 
+                    soma_joints_pos = None
+                    soma_joints_rot = None
                     if (
                         character_idx == 0
-                        and getattr(session.gui_elements, "gui_viz_soma_mesh_checkbox", None) is not None
-                        and session.gui_elements.gui_viz_soma_mesh_checkbox.value
+                        and (
+                            (
+                                getattr(session.gui_elements, "gui_viz_soma_mesh_checkbox", None) is not None
+                                and session.gui_elements.gui_viz_soma_mesh_checkbox.value
+                            )
+                            or (
+                                getattr(session.gui_elements, "gui_viz_t3_soma_retarget_checkbox", None) is not None
+                                and session.gui_elements.gui_viz_t3_soma_retarget_checkbox.value
+                                and session.gui_elements.gui_viz_t3_robot_checkbox.value
+                            )
+                        )
                     ):
                         try:
                             if session.soma_live_mapper is None:
@@ -233,7 +273,11 @@ class PlaybackMixin:
                                 session.joints_pos[character_idx, frame_idx],
                                 session.joints_rot[character_idx, frame_idx],
                             )
-                            if session.soma_debug_character is None:
+                            show_soma_mesh = (
+                                getattr(session.gui_elements, "gui_viz_soma_mesh_checkbox", None) is not None
+                                and session.gui_elements.gui_viz_soma_mesh_checkbox.value
+                            )
+                            if show_soma_mesh and session.soma_debug_character is None:
                                 session.soma_debug_character = Character(
                                     "soma_debug",
                                     session.client,
@@ -248,21 +292,23 @@ class PlaybackMixin:
                                 )
                                 if session.soma_debug_character.skinned_mesh is not None:
                                     session.soma_debug_character.skinned_mesh.color = (210, 245, 80)
-                            soma_offset = torch.as_tensor(
-                                session.gui_elements.gui_viz_soma_mesh_offset.value,
-                                dtype=soma_joints_pos.dtype,
-                            )
-                            session.soma_debug_character.set_pose(
-                                soma_joints_pos + soma_offset,
-                                soma_joints_rot,
-                            )
+                            if show_soma_mesh and session.soma_debug_character is not None:
+                                soma_offset = torch.as_tensor(
+                                    session.gui_elements.gui_viz_soma_mesh_offset.value,
+                                    dtype=soma_joints_pos.dtype,
+                                )
+                                session.soma_debug_character.set_pose(
+                                    soma_joints_pos + soma_offset,
+                                    soma_joints_rot,
+                                )
                         except Exception as e:
                             self._set_soma_t3_status(client_id, "SOMA live mesh failed")
                             print(f"[SOMA Debug] Failed to update live SOMA mesh: {e}")
                             import traceback
 
                             traceback.print_exc()
-                            session.gui_elements.gui_viz_soma_mesh_checkbox.value = False
+                            if getattr(session.gui_elements, "gui_viz_soma_mesh_checkbox", None) is not None:
+                                session.gui_elements.gui_viz_soma_mesh_checkbox.value = False
                             continue
 
                     if character_idx == 0 and session.gui_elements.gui_viz_t3_robot_checkbox.value:
@@ -270,42 +316,43 @@ class PlaybackMixin:
                             getattr(session.gui_elements, "gui_viz_t3_soma_retarget_checkbox", None) is not None
                             and session.gui_elements.gui_viz_t3_soma_retarget_checkbox.value
                         )
-                        if (
-                            use_soma_t3
-                            and session.t3_retarget_csv_path is not None
-                            and session.t3_retarget_ready_generation > session.t3_csv_player_generation
-                        ):
-                            try:
-                                from ardy.retarget_to_t3 import T3CsvPlaybackRobot
+                        if use_soma_t3:
+                            stream_row = (
+                                session.t3_stream_rows[frame_idx]
+                                if 0 <= frame_idx < len(session.t3_stream_rows) and session.t3_stream_rows[frame_idx]
+                                else None
+                            )
+                            if (
+                                stream_row is None
+                                and
+                                session.t3_retarget_csv_path is not None
+                                and session.t3_retarget_ready_generation > session.t3_csv_player_generation
+                            ):
+                                try:
+                                    from ardy.retarget_to_t3 import T3CsvPlaybackRobot
 
-                                if session.t3_csv_player is not None:
-                                    session.t3_csv_player.clear()
-                                session.t3_csv_player = T3CsvPlaybackRobot(
-                                    self.server,
-                                    session.t3_retarget_csv_path,
-                                    root_node_name=f"/t3_csv_client_{client_id}",
-                                )
-                                session.t3_csv_player_generation = session.t3_retarget_ready_generation
-                                if session.t3_live_retargeter is not None:
-                                    session.t3_live_retargeter.set_visible(False)
-                            except Exception as e:
-                                self._set_soma_t3_status(client_id, "csv load failed")
-                                print(f"[T3 Live] Failed to load Soma T3 CSV player: {e}")
-                                import traceback
+                                    if session.t3_csv_player is not None:
+                                        session.t3_csv_player.clear()
+                                    session.t3_csv_player = T3CsvPlaybackRobot(
+                                        self.server,
+                                        session.t3_retarget_csv_path,
+                                        root_node_name=f"/t3_csv_client_{client_id}",
+                                    )
+                                    session.t3_csv_player_generation = session.t3_retarget_ready_generation
+                                    session.t3_csv_player.set_visible(False)
+                                except Exception as e:
+                                    self._set_soma_t3_status(client_id, "csv load failed")
+                                    print(f"[T3 Live] Failed to load Soma T3 CSV player: {e}")
+                                    import traceback
 
-                                traceback.print_exc()
-                        csv_covers_frame = (
-                            session.t3_csv_player is not None
-                            and session.t3_csv_player.has_frame(frame_idx)
-                        )
-                        if (
-                            use_soma_t3
-                            and session.t3_csv_player is not None
-                            and frame_idx >= session.t3_csv_player.num_frames - max(2, int(session.model_fps))
-                        ):
-                            self.request_soma_t3_retarget(client_id)
-                        if use_soma_t3 and csv_covers_frame:
-                            self._set_soma_t3_status(client_id, f"Soma upper body + ARDY base frame {frame_idx}/{session.t3_csv_player.num_frames - 1}")
+                                    traceback.print_exc()
+                            csv_covers_frame = (
+                                stream_row is not None
+                                or session.t3_csv_player is not None
+                                and session.t3_csv_player.has_frame(frame_idx)
+                            )
+                            if not csv_covers_frame:
+                                self.request_soma_t3_retarget(client_id, start_frame=0)
                             if session.t3_csv_player is not None:
                                 session.t3_csv_player.set_visible(False)
                             if session.t3_live_retargeter is None:
@@ -324,78 +371,55 @@ class PlaybackMixin:
                                     traceback.print_exc()
                                     continue
                             session.t3_live_retargeter.set_visible(True)
-                            session.t3_live_retargeter.update_with_soma_upper_body_csv(
-                                session.joints_pos[character_idx, frame_idx],
-                                session.joints_rot[character_idx, frame_idx],
-                                session.t3_csv_player.rows[frame_idx],
-                                fps=session.model_fps,
-                                offset=session.gui_elements.gui_viz_t3_offset.value,
-                                yaw_offset_deg=session.gui_elements.gui_viz_t3_yaw_offset.value,
-                                root_velocity=root_velocity,
-                            )
-                        else:
-                            if use_soma_t3:
-                                if session.t3_csv_player is not None and not csv_covers_frame:
-                                    self._set_soma_t3_status(
-                                        client_id,
-                                        f"waiting for frame {frame_idx} (ready through {session.t3_csv_player.num_frames - 1})",
-                                    )
-                                elif session.t3_csv_player is None:
-                                    self._set_soma_t3_status(client_id, "waiting for exact Soma T3 CSV")
-                                self.request_soma_t3_retarget(client_id)
-                                if session.t3_csv_player is not None:
-                                    session.t3_csv_player.set_visible(False)
-                                if session.t3_live_retargeter is None:
-                                    try:
-                                        from ardy.retarget_to_t3 import T3LiveRetargeter
-
-                                        session.t3_live_retargeter = T3LiveRetargeter(
-                                            self.server,
-                                            character.skeleton,
-                                        )
-                                    except Exception as e:
-                                        session.gui_elements.gui_viz_t3_robot_checkbox.value = False
-                                        print(f"[T3 Live] Failed to create T3 robot: {e}")
-                                        import traceback
-
-                                        traceback.print_exc()
-                                        continue
-                                session.t3_live_retargeter.set_visible(True)
-                                session.t3_live_retargeter.update_base_lift_stiff_upper(
+                            if csv_covers_frame:
+                                self._set_soma_t3_status(client_id, f"accurate BVH Soma T3 frame {frame_idx}")
+                                t3_row = stream_row if stream_row is not None else session.t3_csv_player.rows[frame_idx]
+                                session.t3_live_retargeter.update_with_soma_upper_body_csv(
                                     session.joints_pos[character_idx, frame_idx],
                                     session.joints_rot[character_idx, frame_idx],
+                                    t3_row,
                                     fps=session.model_fps,
                                     offset=session.gui_elements.gui_viz_t3_offset.value,
                                     yaw_offset_deg=session.gui_elements.gui_viz_t3_yaw_offset.value,
                                     root_velocity=root_velocity,
                                 )
+                            else:
+                                ready_until = (
+                                    max(len(session.t3_stream_rows) - 1, session.t3_csv_player.num_frames - 1)
+                                    if session.t3_csv_player is not None
+                                    else len(session.t3_stream_rows) - 1
+                                )
+                                self._set_soma_t3_status(
+                                    client_id,
+                                    f"waiting for accurate Soma T3 frame {frame_idx}; ready to {ready_until}",
+                                )
+                            continue
+                        if session.t3_csv_player is not None:
+                            session.t3_csv_player.set_visible(False)
+                        if session.t3_live_retargeter is None:
+                            try:
+                                from ardy.retarget_to_t3 import T3LiveRetargeter
+
+                                session.t3_live_retargeter = T3LiveRetargeter(
+                                    self.server,
+                                    character.skeleton,
+                                )
+                            except Exception as e:
+                                session.gui_elements.gui_viz_t3_robot_checkbox.value = False
+                                print(f"[T3 Live] Failed to create T3 robot: {e}")
+                                import traceback
+
+                                traceback.print_exc()
                                 continue
-                            if session.t3_csv_player is not None:
-                                session.t3_csv_player.set_visible(False)
-                            if session.t3_live_retargeter is None:
-                                try:
-                                    from ardy.retarget_to_t3 import T3LiveRetargeter
-
-                                    session.t3_live_retargeter = T3LiveRetargeter(
-                                        self.server,
-                                        character.skeleton,
-                                    )
-                                except Exception as e:
-                                    session.gui_elements.gui_viz_t3_robot_checkbox.value = False
-                                    print(f"[T3 Live] Failed to create T3 robot: {e}")
-                                    import traceback
-
-                                    traceback.print_exc()
-                                    continue
-                            session.t3_live_retargeter.set_visible(True)
-                            session.t3_live_retargeter.update(
-                                session.joints_pos[character_idx, frame_idx],
-                                session.joints_rot[character_idx, frame_idx],
-                                fps=session.model_fps,
-                                offset=session.gui_elements.gui_viz_t3_offset.value,
-                                yaw_offset_deg=session.gui_elements.gui_viz_t3_yaw_offset.value,
-                                root_velocity=root_velocity,
-                            )
+                        session.t3_live_retargeter.set_visible(True)
+                        session.t3_live_retargeter.update(
+                            session.joints_pos[character_idx, frame_idx],
+                            session.joints_rot[character_idx, frame_idx],
+                            fps=session.model_fps,
+                            offset=session.gui_elements.gui_viz_t3_offset.value,
+                            yaw_offset_deg=session.gui_elements.gui_viz_t3_yaw_offset.value,
+                            root_velocity=root_velocity,
+                        )
 
         # Update reference motion character
         if (

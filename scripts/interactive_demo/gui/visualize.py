@@ -44,16 +44,24 @@ class GuiVisualizeMixin:
             g.gui_viz_t3_soma_retarget_checkbox = client.gui.add_checkbox(
                 "Use Soma T3 Retarget",
                 initial_value=True,
-                hint="Run Soma/Newton in the background and play the corrected T3 CSV when ready",
+                hint="Use embedded Soma BVH/Newton packet retargeting for T3 upper body",
             )
             g.gui_viz_t3_retarget_now_button = client.gui.add_button(
-                "Refresh Soma T3",
-                hint="Rebuild the corrected T3 CSV for the current generated motion",
+                "Reset Soma T3",
+                hint="Clear streamed Soma T3 rows and retarget again",
             )
             g.gui_viz_t3_retarget_status = client.gui.add_text(
                 "Soma T3 Status",
                 initial_value="idle",
                 disabled=True,
+            )
+            g.gui_viz_t3_packet_size = client.gui.add_number(
+                "Soma Packet Frames",
+                initial_value=10,
+                min=1,
+                max=200,
+                step=1,
+                hint="Number of generated frames to send per accurate SOMA/Newton retarget packet",
             )
             g.gui_viz_t3_offset = client.gui.add_vector3(
                 "T3 Offset",
@@ -80,7 +88,7 @@ class GuiVisualizeMixin:
                 if session.t3_csv_player is not None:
                     session.t3_csv_player.set_visible(g.gui_viz_t3_robot_checkbox.value)
                 if g.gui_viz_t3_robot_checkbox.value and g.gui_viz_t3_soma_retarget_checkbox.value:
-                    self.request_soma_t3_retarget(client_id)
+                    self.request_soma_t3_retarget(client_id, force=True, start_frame=0)
 
             @g.gui_viz_t3_soma_retarget_checkbox.on_update
             def _(_) -> None:
@@ -88,13 +96,36 @@ class GuiVisualizeMixin:
                     return
                 session = self.client_sessions[client_id]
                 if g.gui_viz_t3_soma_retarget_checkbox.value:
-                    self.request_soma_t3_retarget(client_id)
+                    self.request_soma_t3_retarget(client_id, force=True, start_frame=0)
                 elif session.t3_csv_player is not None:
                     session.t3_csv_player.set_visible(False)
 
             @g.gui_viz_t3_retarget_now_button.on_click
             def _(_) -> None:
-                self.request_soma_t3_retarget(client_id, force=True)
+                if not self.client_active(client_id):
+                    return
+                session = self.client_sessions[client_id]
+                with session.t3_retarget_lock:
+                    session.t3_stream_rows = []
+                    session.t3_retarget_csv_end_frame = -1
+                    session.t3_retarget_ready_generation = -1
+                self.request_soma_t3_retarget(client_id, force=True, start_frame=0)
+
+            @g.gui_viz_t3_packet_size.on_update
+            def _(_) -> None:
+                if not self.client_active(client_id):
+                    return
+                session = self.client_sessions[client_id]
+                packet_size = max(1, int(g.gui_viz_t3_packet_size.value))
+                session.t3_stream_packet_size = packet_size
+                with session.t3_retarget_lock:
+                    session.t3_stream_rows = []
+                    session.t3_retarget_csv_end_frame = -1
+                    session.t3_retarget_ready_generation = -1
+                    session.t3_retarget_pending_after_current = False
+                    session.t3_retarget_pending_start_frame = None
+                if g.gui_viz_t3_robot_checkbox.value and g.gui_viz_t3_soma_retarget_checkbox.value:
+                    self.request_soma_t3_retarget(client_id, force=True, start_frame=0)
 
             @g.gui_viz_ref_motion_checkbox.on_update
             def _(_) -> None:
@@ -120,8 +151,6 @@ class GuiVisualizeMixin:
                     session.soma_debug_character.set_skinned_mesh_visibility(show)
                     if session.soma_debug_character.skeleton_mesh is not None:
                         session.soma_debug_character.skeleton_mesh.set_visibility(False)
-                if show and session.soma_debug_joints_pos is None:
-                    self.request_soma_t3_retarget(client_id)
 
             g.gui_viz_hand_orientations_checkbox = client.gui.add_checkbox(
                 "Show Hand+Foot Orientations",

@@ -1,0 +1,15 @@
+{
+	"import_folder": "assets/motions/bvh",
+	"export_folder": "assets/motions/test-export",
+	"batch_size": 100,
+	"retargeter": "Newton",
+	"retarget_source": "soma",
+	"retarget_target": "t2",
+	"viewer_robot": "t2",
+	"retarget_source_facing_direction": "Mujoco",
+	"viewer_initial_camera": {
+		"position": [0.0, -6.0, 1.8],
+		"pitch": 0.0,
+		"yaw": 90.0
+	}
+}

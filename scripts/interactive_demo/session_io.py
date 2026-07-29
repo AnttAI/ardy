@@ -57,6 +57,7 @@ class SessionIOMixin:
 
     def _get_soma_t3_worker(self, client_id: int):
         import subprocess
+        import sys
         from pathlib import Path
 
         if not self.client_active(client_id):
@@ -66,9 +67,8 @@ class SessionIOMixin:
         if proc is not None and proc.poll() is None:
             return proc
 
-        conda_env = os.environ.get("SOMA_RETARGET_CONDA_ENV", "soma-retargeter")
         worker = Path(REPO_ROOT) / "ardy" / "retarget_to_t3" / "soma_t3_worker.py"
-        cmd = ["conda", "run", "--no-capture-output", "-n", conda_env, "python", str(worker)]
+        cmd = [sys.executable, str(worker)]
         proc = subprocess.Popen(
             cmd,
             cwd=REPO_ROOT,
@@ -97,20 +97,18 @@ class SessionIOMixin:
         from pathlib import Path
 
         from ardy.exports.bvh import export_soma_bvh_from_arrays
+        from ardy.retarget_to_t3.embedded_soma_t3 import VENDORED_REFERENCE_BVH
 
         output_csv = Path(output_csv).expanduser().resolve()
         output_csv.parent.mkdir(parents=True, exist_ok=True)
         live_root = Path(REPO_ROOT) / ".cache" / "t3_live"
         live_root.mkdir(parents=True, exist_ok=True)
         bvh_path = (live_root / f"{output_csv.stem}.soma.bvh").resolve()
-        reference_bvh = Path(
-            "/home/jony/Downloads/soma-retargeter/assets/motions/bvh/Neutral_walk_forward_002__A057.bvh"
-        )
         export_soma_bvh_from_arrays(
             local_rot_mats=local_rot_mats,
             root_positions=root_positions,
             fps=fps,
-            reference_bvh=reference_bvh,
+            reference_bvh=VENDORED_REFERENCE_BVH,
             output_bvh=bvh_path,
         )
 
@@ -134,6 +132,64 @@ class SessionIOMixin:
             raise RuntimeError(f"Soma T3 worker failed: {result.get('error')}\n{result.get('traceback', '')}")
         return output_csv
 
+    def _merge_t3_csv_chunk(self, existing_csv, chunk_csv, output_csv, start_frame: int):
+        """Merge a retargeted chunk into the accumulated frame-indexed T3 CSV."""
+        import csv
+        import shutil
+        from pathlib import Path
+
+        existing_csv = Path(existing_csv) if existing_csv is not None else None
+        chunk_csv = Path(chunk_csv)
+        output_csv = Path(output_csv)
+        start_frame = max(0, int(start_frame))
+
+        with chunk_csv.open(newline="", encoding="utf-8") as f:
+            chunk_reader = csv.DictReader(f)
+            if chunk_reader.fieldnames is None:
+                raise ValueError(f"{chunk_csv} has no header")
+            header = list(chunk_reader.fieldnames)
+            chunk_rows = list(chunk_reader)
+
+        if start_frame == 0 or existing_csv is None or not existing_csv.exists():
+            output_csv.parent.mkdir(parents=True, exist_ok=True)
+            if chunk_csv.resolve() != output_csv.resolve():
+                shutil.copyfile(chunk_csv, output_csv)
+            return output_csv, len(chunk_rows) - 1
+
+        with existing_csv.open(newline="", encoding="utf-8") as f:
+            existing_reader = csv.DictReader(f)
+            if existing_reader.fieldnames is None:
+                raise ValueError(f"{existing_csv} has no header")
+            existing_rows = list(existing_reader)
+            for column in existing_reader.fieldnames:
+                if column not in header:
+                    header.append(column)
+
+        merged_rows = existing_rows[:start_frame] + chunk_rows
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        with output_csv.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=header)
+            writer.writeheader()
+            for frame_idx, row in enumerate(merged_rows):
+                out = {column: row.get(column, "") for column in header}
+                out["Frame"] = frame_idx
+                writer.writerow(out)
+        return output_csv, len(merged_rows) - 1
+
+    def _read_t3_csv_rows(self, csv_path):
+        import csv
+        from pathlib import Path
+
+        csv_path = Path(csv_path)
+        with csv_path.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None:
+                raise ValueError(f"{csv_path} has no header")
+            return [
+                {key: float(value) if value not in {"", None} else 0.0 for key, value in row.items()}
+                for row in reader
+            ]
+
     def _set_soma_t3_status(self, client_id: int, status: str) -> None:
         if not self.client_active(client_id):
             return
@@ -143,45 +199,272 @@ class SessionIOMixin:
         if status_handle is not None:
             status_handle.value = status
 
-    def request_soma_t3_retarget(self, client_id: int, force: bool = False) -> None:
-        """Start a background Soma/Newton retarget for the current generated motion."""
+    def _ensure_live_soma_t3_motion_cache(self, client_id: int) -> bool:
+        """Cache the current generated motion through the exact SOMA BVH load path."""
+        if not self.client_active(client_id):
+            return False
+        session = self.client_sessions[client_id]
+        if session.motion_tensor is None or session.motion_rep is None:
+            return False
+        if (
+            session.t3_live_soma77_local_rot_mats is not None
+            and session.t3_live_root_positions is not None
+            and session.t3_live_soma77_local_rot_mats.shape[0] == session.max_frame_idx + 1
+        ):
+            return True
+
+        from pathlib import Path
+
+        from scipy.spatial.transform import Rotation
+
+        from ardy.exports.bvh import export_soma_bvh_from_arrays
+        from ardy.retarget_to_t3.embedded_soma_t3 import (
+            VENDORED_REFERENCE_BVH,
+            ensure_vendored_soma_importable,
+        )
+
+        with session.motion_tensor_lock:
+            motion_tensor = None if session.motion_tensor is None else session.motion_tensor.detach().clone()
+            motion_rep = session.motion_rep
+        if motion_tensor is None or motion_rep is None:
+            return False
+
+        with torch.no_grad():
+            tensor_unnorm = motion_rep.unnormalize(motion_tensor)
+            inverse_output = motion_rep.inverse(tensor_unnorm, is_normalized=False)
+            local_rot_mats = inverse_output["local_rot_mats"][0].detach().cpu().numpy()
+            root_positions = inverse_output["root_positions"][0].detach().cpu().numpy()
+        ensure_vendored_soma_importable()
+        import soma_retargeter.assets.bvh as bvh_utils
+
+        live_root = Path(REPO_ROOT) / ".cache" / "t3_live"
+        live_root.mkdir(parents=True, exist_ok=True)
+        bvh_path = live_root / f"client_{client_id}_live_soma.bvh"
+        export_soma_bvh_from_arrays(
+            local_rot_mats=local_rot_mats,
+            root_positions=root_positions,
+            fps=session.model_fps,
+            reference_bvh=VENDORED_REFERENCE_BVH,
+            output_bvh=bvh_path,
+        )
+        _soma_skeleton, soma_animation = bvh_utils.load_bvh(bvh_path)
+        soma77_local = np.empty((soma_animation.num_frames, 77, 3, 3), dtype=np.float32)
+        soma_root_positions = np.empty((soma_animation.num_frames, 3), dtype=np.float32)
+        for frame in range(soma_animation.num_frames):
+            local_transforms = soma_animation.get_local_transforms(frame)
+            if len(local_transforms) == 78:
+                # Exported SOMA BVHs contain a dummy BVH Root above Hips. The
+                # live Newton pipeline is built from the 77-joint SOMA skeleton,
+                # so feed Hips as the root and drop the loader-only parent.
+                local_transforms = local_transforms[1:]
+            elif len(local_transforms) != 77:
+                raise ValueError(f"Expected 77 or 78 SOMA BVH transforms, got {len(local_transforms)}")
+            soma_root_positions[frame] = np.asarray(local_transforms[0][0:3], dtype=np.float32)
+            soma77_local[frame] = np.stack(
+                [Rotation.from_quat(transform[3:7]).as_matrix() for transform in local_transforms],
+                axis=0,
+            ).astype(np.float32, copy=False)
+
+        session.t3_live_soma77_local_rot_mats = soma77_local.astype(np.float32, copy=False)
+        session.t3_live_root_positions = soma_root_positions.astype(np.float32, copy=False)
+        return True
+
+    def solve_live_soma_t3_frame(self, client_id: int, frame_idx: int) -> dict[str, float] | None:
+        """Retarget one live frame through the in-process embedded Soma/Newton solver."""
+        if not self.client_active(client_id):
+            return None
+        session = self.client_sessions[client_id]
+        frame_idx = int(frame_idx)
+        if session.t3_live_last_row_frame_idx == frame_idx and session.t3_live_last_row is not None:
+            return session.t3_live_last_row
+        if not self._ensure_live_soma_t3_motion_cache(client_id):
+            self._set_soma_t3_status(client_id, "waiting for motion")
+            return None
+        if session.t3_live_solver_warm_thread is not None and session.t3_live_solver_warm_thread.is_alive():
+            self._set_soma_t3_status(client_id, "warming live solver")
+            return None
+        if (
+            session.t3_live_soma77_local_rot_mats is None
+            or session.t3_live_root_positions is None
+            or frame_idx < 0
+            or frame_idx >= session.t3_live_soma77_local_rot_mats.shape[0]
+        ):
+            return None
+
+        with session.t3_live_solver_lock:
+            if session.t3_live_soma_solver is None:
+                self._set_soma_t3_status(client_id, "initializing in-process Soma solver")
+                from ardy.retarget_to_t3.embedded_soma_t3 import SomaT3LiveUpperBodySolver
+
+                session.t3_live_soma_solver = SomaT3LiveUpperBodySolver()
+
+            previous_frame = int(session.t3_live_last_row_frame_idx)
+            if previous_frame >= 0 and frame_idx == previous_frame + 1:
+                row = session.t3_live_soma_solver.solve_frame(
+                    session.t3_live_root_positions[frame_idx],
+                    session.t3_live_soma77_local_rot_mats[frame_idx],
+                )
+                expected_status = f"live frame {frame_idx}"
+            else:
+                if previous_frame >= 0 and frame_idx > previous_frame + 1:
+                    solve_start = previous_frame + 1
+                else:
+                    session.t3_live_soma_solver.reset()
+                    solve_start = 0
+                solve_start = max(0, min(solve_start, frame_idx))
+                self._set_soma_t3_status(client_id, f"catching up {solve_start}-{frame_idx}")
+                row = session.t3_live_soma_solver.solve_frames(
+                    session.t3_live_root_positions[solve_start : frame_idx + 1],
+                    session.t3_live_soma77_local_rot_mats[solve_start : frame_idx + 1],
+                )
+                expected_status = f"live frame {frame_idx} after catch-up {solve_start}-{frame_idx}"
+        session.t3_live_last_row_frame_idx = frame_idx
+        session.t3_live_last_row = row
+        self._set_soma_t3_status(client_id, expected_status)
+        return row
+
+    def solve_live_soma_mesh_t3_frame(self, client_id: int, frame_idx: int, soma_joints_pos, soma_joints_rot, soma_skeleton) -> dict[str, float] | None:
+        """Retarget the current live SOMA mesh pose through the embedded Soma/Newton solver."""
+        if not self.client_active(client_id):
+            return None
+        session = self.client_sessions[client_id]
+        if session.t3_live_solver_warm_thread is not None and session.t3_live_solver_warm_thread.is_alive():
+            self._set_soma_t3_status(client_id, "warming live solver")
+            return None
+        with session.t3_live_solver_lock:
+            if session.t3_live_soma_solver is None:
+                self._set_soma_t3_status(client_id, "initializing in-process Soma solver")
+                from ardy.retarget_to_t3.embedded_soma_t3 import SomaT3LiveUpperBodySolver
+
+                session.t3_live_soma_solver = SomaT3LiveUpperBodySolver()
+
+            if int(session.t3_live_last_row_frame_idx) >= 0 and int(frame_idx) < int(session.t3_live_last_row_frame_idx):
+                session.t3_live_soma_solver.reset()
+            row = session.t3_live_soma_solver.solve_soma_global_frame(
+                soma_joints_pos,
+                soma_joints_rot,
+                soma_skeleton.bone_order_names,
+            )
+        session.t3_live_last_row_frame_idx = int(frame_idx)
+        session.t3_live_last_row = row
+        self._set_soma_t3_status(client_id, f"SOMA mesh Newton frame {frame_idx}")
+        return row
+
+    def reset_live_soma_t3_solver(self, client_id: int) -> None:
+        """Reset the persistent in-process Soma/Newton solver state."""
+        if not self.client_active(client_id):
+            return
+        session = self.client_sessions[client_id]
+        session.t3_live_last_row_frame_idx = -1
+        session.t3_live_last_row = None
+        with session.t3_live_solver_lock:
+            if session.t3_live_soma_solver is not None:
+                session.t3_live_soma_solver.reset()
+        self._set_soma_t3_status(client_id, "live solver reset")
+
+    def warm_live_soma_t3_solver(self, client_id: int) -> None:
+        """Initialize the in-process Soma/Newton solver without blocking playback."""
+        if not self.client_active(client_id):
+            return
+        session = self.client_sessions[client_id]
+        if session.t3_live_soma_solver is not None:
+            self._set_soma_t3_status(client_id, "live solver ready")
+            return
+        if session.t3_retarget_thread is not None and session.t3_retarget_thread.is_alive():
+            return
+        if session.t3_live_solver_warm_thread is not None and session.t3_live_solver_warm_thread.is_alive():
+            return
+
+        def _warm() -> None:
+            if not self.client_active(client_id):
+                return
+            try:
+                session = self.client_sessions[client_id]
+                from ardy.retarget_to_t3.embedded_soma_t3 import SomaT3LiveUpperBodySolver
+
+                with session.t3_live_solver_lock:
+                    if session.t3_live_soma_solver is None:
+                        session.t3_live_soma_solver = SomaT3LiveUpperBodySolver()
+                self._set_soma_t3_status(client_id, "live solver ready")
+            except Exception as e:
+                print(f"[T3 Live] In-process Soma live solver warmup failed: {e}")
+                import traceback
+
+                traceback.print_exc()
+                self._set_soma_t3_status(client_id, "live solver failed")
+
+        thread = threading.Thread(target=_warm, daemon=True)
+        session.t3_live_solver_warm_thread = thread
+        self._set_soma_t3_status(client_id, "warming live solver")
+        thread.start()
+
+    def request_soma_t3_retarget(self, client_id: int, force: bool = False, start_frame: int | None = None) -> None:
+        """Start a background Soma/Newton retarget near the current live frame."""
         if not self.client_active(client_id):
             return
         session = self.client_sessions[client_id]
         if session.motion_tensor is None or session.motion_rep is None:
             self._set_soma_t3_status(client_id, "waiting for motion")
             return
+        requested_start = int(session.frame_idx if start_frame is None else start_frame)
+        requested_start = max(0, requested_start)
+        requested_end = int(session.max_frame_idx)
+        if requested_end < 0:
+            self._set_soma_t3_status(client_id, "waiting for motion")
+            return
 
         with session.t3_retarget_lock:
+            ready_covers_request = (
+                session.t3_retarget_csv_path is not None
+                and session.t3_retarget_csv_start_frame <= 0
+                and session.t3_retarget_csv_end_frame >= requested_end
+            )
+            if ready_covers_request and not force:
+                return
             if (
                 session.t3_retarget_thread is not None
                 and session.t3_retarget_thread.is_alive()
                 and session.t3_retarget_thread is not threading.current_thread()
             ):
+                if session.t3_retarget_requested_end_frame >= requested_end and not force:
+                    return
                 session.t3_retarget_pending_after_current = True
+                session.t3_retarget_requested_end_frame = max(
+                    session.t3_retarget_requested_end_frame,
+                    requested_end,
+                )
+                if session.t3_retarget_pending_start_frame is None:
+                    session.t3_retarget_pending_start_frame = requested_start
+                else:
+                    session.t3_retarget_pending_start_frame = min(
+                        session.t3_retarget_pending_start_frame,
+                        requested_start,
+                    )
                 session.t3_retarget_status = "retarget already running"
                 if getattr(session.gui_elements, "gui_viz_t3_retarget_status", None) is not None:
                     session.gui_elements.gui_viz_t3_retarget_status.value = session.t3_retarget_status
                 return
             session.t3_retarget_generation += 1
             generation = session.t3_retarget_generation
-            session.t3_retarget_status = f"retargeting gen {generation}"
+            session.t3_retarget_requested_end_frame = requested_end
+            session.t3_retarget_status = f"retargeting gen {generation}: frames 0-{requested_end}"
             if getattr(session.gui_elements, "gui_viz_t3_retarget_status", None) is not None:
                 session.gui_elements.gui_viz_t3_retarget_status.value = session.t3_retarget_status
 
             thread = threading.Thread(
                 target=self._run_soma_t3_retarget_worker,
-                args=(client_id, generation),
+                args=(client_id, generation, requested_start),
                 daemon=True,
             )
             session.t3_retarget_thread = thread
             thread.start()
 
-    def _run_soma_t3_retarget_worker(self, client_id: int, generation: int) -> None:
+    def _run_soma_t3_retarget_worker(self, client_id: int, generation: int, requested_start_frame: int) -> None:
         if not self.client_active(client_id):
             return
         session = self.client_sessions[client_id]
         try:
+            retarget_start_time = time.time()
             from pathlib import Path
 
             with session.motion_tensor_lock:
@@ -210,31 +493,120 @@ class SessionIOMixin:
                 session.soma_debug_joints_rot = soma_joints_rot
                 session.soma_debug_generation = generation
 
-            output_csv = Path(".cache") / "t3_live" / f"client_{client_id}_gen_{generation}.csv"
-            self._export_core27_t3_with_soma_env(
-                local_rot_mats,
-                root_positions,
-                fps,
-                output_csv,
-                status_client_id=client_id,
+            total_frames = int(local_rot_mats.shape[0])
+            if total_frames <= 0:
+                self._set_soma_t3_status(client_id, "waiting for motion")
+                return
+            with session.t3_retarget_lock:
+                previous_ready_end = int(session.t3_retarget_csv_end_frame)
+
+            stream_start = previous_ready_end + 1
+            if stream_start < 0:
+                stream_start = 0
+            if stream_start >= total_frames:
+                return
+
+            # Packet size controls how quickly newly retargeted rows can be
+            # appended to the live T3 buffer. Smaller packets reduce the first
+            # playable slice size, but pay the SOMA/Newton per-call overhead
+            # more often.
+            env_packet_size = os.environ.get("T3_SOMA_PACKET_SIZE")
+            configured_packet_size = (
+                int(env_packet_size)
+                if env_packet_size not in {None, ""}
+                else int(getattr(session, "t3_stream_packet_size", 10))
             )
+            packet_size = max(1, configured_packet_size)
+            context_frames = max(15, int(round(float(fps) * 0.75)))
+            live_root = Path(".cache") / "t3_live"
+            if stream_start == 0:
+                with session.t3_retarget_lock:
+                    session.t3_stream_rows = []
+
+            merged_end_frame = previous_ready_end
+            for packet_start in range(stream_start, total_frames, packet_size):
+                if not self.client_active(client_id):
+                    return
+                packet_end = min(packet_start + packet_size, total_frames)
+                packet_start_time = time.time()
+                context_start = max(0, packet_start - context_frames)
+                packet_csv = live_root / (
+                    f"client_{client_id}_gen_{generation}_packet_{packet_start}_{packet_end - 1}"
+                    f"_ctx_{context_start}.csv"
+                )
+                self._export_core27_t3_with_soma_env(
+                    local_rot_mats[context_start:packet_end],
+                    root_positions[context_start:packet_end],
+                    fps,
+                    packet_csv,
+                    status_client_id=client_id,
+                )
+                packet_rows_all = self._read_t3_csv_rows(packet_csv)
+                row_offset = packet_start - context_start
+                rows = packet_rows_all[row_offset : row_offset + (packet_end - packet_start)]
+                if len(rows) != packet_end - packet_start:
+                    raise RuntimeError(
+                        f"Expected {packet_end - packet_start} packet rows from {packet_csv}, got {len(rows)}"
+                    )
+                with session.t3_retarget_lock:
+                    if len(session.t3_stream_rows) < packet_start:
+                        session.t3_stream_rows.extend({} for _ in range(packet_start - len(session.t3_stream_rows)))
+                    for offset, row in enumerate(rows):
+                        frame_number = packet_start + offset
+                        row = dict(row)
+                        row["Frame"] = frame_number
+                        if frame_number < len(session.t3_stream_rows):
+                            session.t3_stream_rows[frame_number] = row
+                        else:
+                            session.t3_stream_rows.append(row)
+                    merged_end_frame = len(session.t3_stream_rows) - 1
+                    session.t3_retarget_csv_start_frame = 0
+                    session.t3_retarget_csv_end_frame = merged_end_frame
+                    session.t3_retarget_ready_generation = generation
+                    session.t3_retarget_status = (
+                        f"stream ready {packet_start}-{packet_end - 1} "
+                        f"({packet_end - packet_start} frames in {time.time() - packet_start_time:.2f}s)"
+                    )
+                    if getattr(session.gui_elements, "gui_viz_t3_retarget_status", None) is not None:
+                        session.gui_elements.gui_viz_t3_retarget_status.value = session.t3_retarget_status
+                print(
+                    f"[T3 Live] Soma stream ready: frames {packet_start}-{packet_end - 1} "
+                    f"({(packet_end - packet_start) / float(fps):.2f}s motion) "
+                    f"in {time.time() - packet_start_time:.2f}s"
+                )
+                self.set_frame(client_id, session.frame_idx)
 
             if not self.client_active(client_id):
                 return
             session = self.client_sessions[client_id]
             with session.t3_retarget_lock:
                 if generation >= session.t3_retarget_ready_generation:
-                    session.t3_retarget_csv_path = str(output_csv)
                     session.t3_retarget_ready_generation = generation
-                    session.t3_retarget_status = f"ready gen {generation}"
+                    session.t3_retarget_csv_start_frame = 0
+                    session.t3_retarget_csv_end_frame = merged_end_frame
+                    elapsed_s = time.time() - retarget_start_time
+                    session.t3_retarget_status = (
+                        f"stream gen {generation}: frames 0-{merged_end_frame} in {elapsed_s:.2f}s"
+                    )
                     if getattr(session.gui_elements, "gui_viz_t3_retarget_status", None) is not None:
                         session.gui_elements.gui_viz_t3_retarget_status.value = session.t3_retarget_status
                 run_pending = session.t3_retarget_pending_after_current
+                pending_start_frame = session.t3_retarget_pending_start_frame
                 session.t3_retarget_pending_after_current = False
-            print(f"[T3 Live] Soma retarget ready: {output_csv}")
+                session.t3_retarget_pending_start_frame = None
+            print(
+                f"[T3 Live] Soma stream generation {generation} ready: "
+                f"frames 0-{merged_end_frame} in {time.time() - retarget_start_time:.2f}s"
+            )
             self.set_frame(client_id, session.frame_idx)
             if run_pending:
-                self.request_soma_t3_retarget(client_id, force=True)
+                current_end = int(session.max_frame_idx)
+                if current_end > merged_end_frame:
+                    self.request_soma_t3_retarget(
+                        client_id,
+                        force=True,
+                        start_frame=pending_start_frame if pending_start_frame is not None else session.frame_idx,
+                    )
         except Exception as e:
             print(f"[T3 Live] Soma retarget failed: {e}")
             import traceback
@@ -245,9 +617,17 @@ class SessionIOMixin:
                 session = self.client_sessions[client_id]
                 with session.t3_retarget_lock:
                     run_pending = session.t3_retarget_pending_after_current
+                    pending_start_frame = session.t3_retarget_pending_start_frame
                     session.t3_retarget_pending_after_current = False
+                    session.t3_retarget_pending_start_frame = None
                 if run_pending:
-                    self.request_soma_t3_retarget(client_id, force=True)
+                    current_end = int(session.max_frame_idx)
+                    if current_end > int(session.t3_retarget_csv_end_frame):
+                        self.request_soma_t3_retarget(
+                            client_id,
+                            force=True,
+                            start_frame=pending_start_frame if pending_start_frame is not None else session.frame_idx,
+                        )
 
     def export_soma_bvh(self, client_id: int, filepath: str):
         """Export the generated CoreSkeleton27 motion as a SOMA-style BVH."""
@@ -262,21 +642,18 @@ class SessionIOMixin:
             from pathlib import Path
 
             from ardy.exports.bvh import export_soma_bvh_from_arrays
+            from ardy.retarget_to_t3.embedded_soma_t3 import VENDORED_REFERENCE_BVH
 
             tensor_unnorm = session.motion_rep.unnormalize(session.motion_tensor)
             inverse_output = session.motion_rep.inverse(tensor_unnorm, is_normalized=False)
             local_rot_mats = inverse_output["local_rot_mats"][0].detach().cpu().numpy()
             root_positions = inverse_output["root_positions"][0].detach().cpu().numpy()
 
-            reference_bvh = (
-                "/home/jony/Downloads/soma-retargeter/assets/motions/bvh/"
-                "Neutral_walk_forward_002__A057.bvh"
-            )
             export_soma_bvh_from_arrays(
                 local_rot_mats=local_rot_mats,
                 root_positions=root_positions,
                 fps=session.model_fps,
-                reference_bvh=Path(reference_bvh),
+                reference_bvh=VENDORED_REFERENCE_BVH,
                 output_bvh=Path(filepath),
             )
             print(f"[BVH Export] Saved SOMA BVH to {filepath}")

@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from pathlib import Path
+
+DEFAULT_T3_URDF_PATH = Path(__file__).resolve().parent / "assets" / "t3_robot" / "T3.urdf"
+
+T3_LIFT_JOINT = "telescopic_lift_joint"
+T3_LIFT_MIN_M = 0.0
+T3_LIFT_MAX_M = 0.55
+T3_WAIST_HEIGHT_NO_LIFT_M = 0.795
+T3_SHOULDER_HEIGHT_NO_LIFT_M = 1.15289
+T3_LIFT_HEIGHT_OFFSET_M = -0.03
+
+WHEEL_RADIUS_M = 0.10
+WHEEL_SEPARATION_M = 0.38
+MAX_FORWARD_SPEED_M_S = 3.0
+MAX_YAW_RATE_RAD_S = 12.0
+STANDING_MOTION_THRESHOLD_M = 0.25
+STANDING_BASE_RADIUS_M = 0.04
+STANDING_YAW_OFFSET_RAD = 0.0
