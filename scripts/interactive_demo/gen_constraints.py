@@ -86,34 +86,36 @@ class GenConstraintsMixin:
                 constraint_joints_pos = _to_device_tensor(constraint_info["joints_pos"][valid_idx], device)
                 constraint_joints_rot = _to_device_tensor(constraint_info["joints_rot"][valid_idx], device)
 
-                end_effector_type_set_lst = [
-                    end_effector_type_set
-                    for i, end_effector_type_set in enumerate(constraint_info["end_effector_type"])
+                joint_names_lst = [
+                    joint_names
+                    for i, joint_names in enumerate(constraint_info["joint_names"])
+                    if i in valid_idx
+                ]
+                constrain_root_lst = [
+                    constrain_root
+                    for i, constrain_root in enumerate(constraint_info.get("constrain_root", []))
                     if i in valid_idx
                 ]
 
-                # regroup the end effector data by type
-                cls_idx = defaultdict(list)
-                for idx, end_effector_type_set in enumerate(end_effector_type_set_lst):
-                    for end_effector_type in end_effector_type_set:
-                        cls_idx[TYPE_TO_CLASS[end_effector_type]].append(idx)
-
-                for cls, lst_idx in cls_idx.items():
-                    frame_indices_cls = frame_indices[lst_idx]
+                for idx, joint_names in enumerate(joint_names_lst):
+                    frame_indices_el = frame_indices[idx : idx + 1]
                     root_pos_2d = None
                     if dense_root_pos_2d is not None:
-                        root_pos_2d = dense_root_pos_2d[frame_indices_cls]
-
-                    constraint_joints_pos_el = constraint_joints_pos[lst_idx]
-                    constraint_joints_rot_el = constraint_joints_rot[lst_idx]
+                        root_pos_2d = dense_root_pos_2d[frame_indices_el]
 
                     model_constraints.append(
-                        cls(
+                        EndEffectorConstraintSet(
                             session.motion_rep.skeleton,
-                            frame_indices_cls,
-                            constraint_joints_pos_el,
-                            constraint_joints_rot_el,
+                            frame_indices_el,
+                            constraint_joints_pos[idx : idx + 1],
+                            constraint_joints_rot[idx : idx + 1],
                             root_2d=root_pos_2d,
+                            joint_names=joint_names,
+                            constrain_root=(
+                                constrain_root_lst[idx]
+                                if idx < len(constrain_root_lst)
+                                else ("Hips" in joint_names)
+                            ),
                         )
                     )
             else:

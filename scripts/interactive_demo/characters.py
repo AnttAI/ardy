@@ -108,6 +108,8 @@ class CharactersMixin:
         session.t3_retarget_requested_end_frame = -1
         session.t3_retarget_pending_start_frame = None
         session.t3_retarget_csv_path = None
+        session.t3_retarget_packet_ranges = []
+        session.t3_retarget_packet_end_frames = []
         session.t3_stream_rows = []
         self._set_soma_t3_status(client_id, "idle")
 

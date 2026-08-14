@@ -8,7 +8,238 @@ from .window_budget import compute_window_num_frames
 
 
 class GenerationMixin:
-    def restart(self, client_id: int):
+    def _project_rotations_to_so3(self, rot_mats: torch.Tensor) -> torch.Tensor:
+        """Project averaged 3x3 matrices back to valid rotations."""
+        u, _, vh = torch.linalg.svd(rot_mats)
+        projected = u @ vh
+        det = torch.linalg.det(projected)
+        if (det < 0).any():
+            u = u.clone()
+            u[det < 0, :, -1] *= -1.0
+            projected = u @ vh
+        return projected
+
+    def _smooth_rotation_sequence(self, rotations: torch.Tensor, window: int = 5) -> torch.Tensor:
+        """Smooth a [B, T, J, 3, 3] rotation sequence with a centered moving average."""
+        if rotations.shape[1] < 3 or window <= 1:
+            return rotations
+        window = min(int(window), int(rotations.shape[1]))
+        if window % 2 == 0:
+            window -= 1
+        if window <= 1:
+            return rotations
+
+        half = window // 2
+        first = rotations[:, :1].expand(-1, half, -1, -1, -1)
+        last = rotations[:, -1:].expand(-1, half, -1, -1, -1)
+        padded = torch.cat([first, rotations, last], dim=1)
+        smoothed = torch.empty_like(rotations)
+        for frame_idx in range(rotations.shape[1]):
+            avg = padded[:, frame_idx : frame_idx + window].mean(dim=1)
+            smoothed[:, frame_idx] = self._project_rotations_to_so3(avg.reshape(-1, 3, 3)).reshape_as(avg)
+        return smoothed
+
+    def _straighten_rack_route_arrival_pose(self, session: ClientSession) -> bool:
+        """Make the rack-route end pose upright while keeping the generated stop point."""
+        if (
+            session.motion_rep is None
+            or session.joints_pos is None
+            or session.joints_rot is None
+            or session.task_end_frame_idx is None
+            or session.t3_base_route_positions is None
+            or session.t3_base_route_headings is None
+        ):
+            return False
+
+        end_idx = int(session.task_end_frame_idx)
+        if end_idx < 0 or end_idx >= int(session.joints_pos.shape[1]):
+            return False
+
+        skeleton = session.motion_rep.skeleton
+        root_idx = skeleton.root_idx
+        fps = max(float(session.model_fps), 1.0)
+        blend_frames = max(4, int(round(0.45 * fps)))
+        start_idx = max(0, end_idx - blend_frames + 1)
+
+        with session.motion_tensor_lock:
+            joints_pos = session.joints_pos.clone()
+            joints_rot = session.joints_rot.clone()
+            num_samples = int(joints_pos.shape[0])
+            seq_len = int(joints_pos.shape[1])
+
+            route_headings = np.asarray(session.t3_base_route_headings, dtype=np.float32)
+            target_heading = float(route_headings[-1]) if len(route_headings) > 0 else 0.0
+
+            for sample_idx in range(num_samples):
+                straight_positions_np, straight_rotations_np = self._straight_back_pose_from_motion(
+                    skeleton,
+                    joints_pos[sample_idx, end_idx].detach().cpu().numpy(),
+                    joints_rot[sample_idx, end_idx].detach().cpu().numpy(),
+                    target_heading,
+                )
+                straight_positions = torch.as_tensor(
+                    straight_positions_np,
+                    device=joints_pos.device,
+                    dtype=joints_pos.dtype,
+                )
+                straight_rotations = torch.as_tensor(
+                    straight_rotations_np,
+                    device=joints_rot.device,
+                    dtype=joints_rot.dtype,
+                )
+
+                for frame_idx in range(start_idx, end_idx + 1):
+                    alpha = (frame_idx - start_idx) / max(float(end_idx - start_idx), 1.0)
+                    alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+                    joints_pos[sample_idx, frame_idx] = (
+                        (1.0 - alpha) * joints_pos[sample_idx, frame_idx]
+                        + alpha * straight_positions
+                    )
+                    blended_rot = (
+                        (1.0 - alpha) * joints_rot[sample_idx, frame_idx]
+                        + alpha * straight_rotations
+                    )
+                    joints_rot[sample_idx, frame_idx] = self._project_rotations_to_so3(
+                        blended_rot.reshape(-1, 3, 3)
+                    ).reshape_as(blended_rot)
+
+                joints_pos[sample_idx, end_idx] = straight_positions
+                joints_rot[sample_idx, end_idx] = straight_rotations
+
+            local_rot_mats = skeleton.global_rots_to_local_rots(joints_rot.reshape(-1, skeleton.nbjoints, 3, 3))
+            local_rot_mats = local_rot_mats.reshape(num_samples, seq_len, skeleton.nbjoints, 3, 3)
+            root_positions = joints_pos[:, :, root_idx]
+            joints_pos, root_positions = ground_motion_to_floor(
+                skeleton,
+                joints_pos,
+                root_positions,
+            )
+            joints_rot, joints_pos, _ = skeleton.fk(local_rot_mats, root_positions)
+            joints_pos, root_positions = ground_motion_to_floor(
+                skeleton,
+                joints_pos,
+                root_positions,
+            )
+            motion_tensor_unnormalized = session.motion_rep(
+                local_joint_rots=local_rot_mats,
+                root_positions=root_positions,
+                to_normalize=False,
+            )
+            session.joints_pos = joints_pos
+            session.joints_rot = joints_rot
+            session.motion_tensor = session.motion_rep.normalize(motion_tensor_unnormalized)
+            if session.foot_contacts is not None:
+                session.foot_contacts = motion_tensor_unnormalized[:, :, session.motion_rep.slice_dict["foot_contacts"]]
+            if session.root_velocities is not None:
+                velocities = motion_tensor_unnormalized[:, :, session.motion_rep.slice_dict["velocities"]]
+                session.root_velocities = velocities.reshape(
+                    num_samples,
+                    seq_len,
+                    skeleton.nbjoints,
+                    3,
+                )[:, :, root_idx, :]
+                session.root_velocities[:, start_idx : end_idx + 1] = 0.0
+
+        return True
+
+    def _hand_only_active_joint_indices(self, session: ClientSession) -> list[int]:
+        skeleton = session.motion_rep.skeleton
+        ee_constraint = session.constraints.get("End-Effectors") if session.constraints else None
+        if ee_constraint is None or not ee_constraint.keyframes:
+            return []
+
+        active_sides = set()
+        for keyframe in ee_constraint.keyframes.values():
+            for joint_name in keyframe.get("joint_names", []):
+                joint_name = str(joint_name)
+                is_arm_joint = any(part in joint_name for part in ("Shoulder", "Arm", "ForeArm", "Hand"))
+                if not is_arm_joint:
+                    continue
+                if joint_name.startswith("Left"):
+                    active_sides.add("Left")
+                elif joint_name.startswith("Right"):
+                    active_sides.add("Right")
+
+        moving_names = []
+        for side in sorted(active_sides):
+            moving_names.extend(
+                [
+                    f"{side}Shoulder",
+                    f"{side}Arm",
+                    f"{side}ForeArm",
+                    f"{side}Hand",
+                ]
+            )
+            moving_names.extend(
+                skeleton.left_hand_joint_names if side == "Left" else skeleton.right_hand_joint_names
+            )
+
+        return sorted({skeleton.bone_index[name] for name in moving_names if name in skeleton.bone_index})
+
+    def _apply_hand_only_motion_filter(
+        self,
+        session: ClientSession,
+        samples: torch.Tensor,
+        samples_unnormalized: torch.Tensor,
+        joints_pos: torch.Tensor,
+        joints_rot: torch.Tensor,
+        foot_contacts: torch.Tensor | None,
+        local_rot_mats: torch.Tensor,
+        root_positions: torch.Tensor,
+        history_length: int,
+    ):
+        """Freeze root/body and smooth moving arm chains for hand-only pick motions."""
+        enabled = (
+            getattr(session.gui_elements, "gui_constraint_hand_only_motion_checkbox", None) is not None
+            and session.gui_elements.gui_constraint_hand_only_motion_checkbox.value
+        )
+        if not enabled:
+            return samples, samples_unnormalized, joints_pos, joints_rot, foot_contacts, local_rot_mats, root_positions
+
+        moving_indices = self._hand_only_active_joint_indices(session)
+        if not moving_indices:
+            return samples, samples_unnormalized, joints_pos, joints_rot, foot_contacts, local_rot_mats, root_positions
+
+        start = int(history_length)
+        if start >= local_rot_mats.shape[1]:
+            return samples, samples_unnormalized, joints_pos, joints_rot, foot_contacts, local_rot_mats, root_positions
+
+        anchor_idx = max(0, start - 1)
+        filtered_local = local_rot_mats.clone()
+        filtered_root = root_positions.clone()
+
+        all_indices = set(range(session.motion_rep.skeleton.nbjoints))
+        frozen_indices = sorted(all_indices - set(moving_indices))
+        if frozen_indices:
+            filtered_local[:, start:, frozen_indices] = filtered_local[:, anchor_idx : anchor_idx + 1, frozen_indices]
+        filtered_root[:, start:] = filtered_root[:, anchor_idx : anchor_idx + 1]
+
+        arm_rots = filtered_local[:, start:, moving_indices]
+        filtered_local[:, start:, moving_indices] = self._smooth_rotation_sequence(arm_rots, window=7)
+
+        filtered_global_rot, filtered_pos, _ = session.motion_rep.skeleton.fk(filtered_local, filtered_root)
+        filtered_unnorm = session.motion_rep(
+            local_joint_rots=filtered_local,
+            root_positions=filtered_root,
+            to_normalize=False,
+        )
+        filtered_norm = session.motion_rep.normalize(filtered_unnorm)
+        filtered_contacts = (
+            filtered_unnorm[:, :, session.motion_rep.slice_dict["foot_contacts"]]
+            if foot_contacts is not None
+            else foot_contacts
+        )
+        return (
+            filtered_norm,
+            filtered_unnorm,
+            filtered_pos,
+            filtered_global_rot,
+            filtered_contacts,
+            filtered_local,
+            filtered_root,
+        )
+
+    def restart(self, client_id: int, *, preserve_t3_base_route: bool = False):
         """Restart the demo for a client."""
         if not self.client_active(client_id):
             return
@@ -16,6 +247,9 @@ class GenerationMixin:
 
         playing = session.playing
         session.playing = False
+        if not preserve_t3_base_route:
+            session.t3_base_route_positions = None
+            session.t3_base_route_headings = None
         self.clear_motions(client_id)
         session.max_frame_idx = -1
         session.frame_idx = 0
@@ -205,9 +439,14 @@ class GenerationMixin:
         constraint_idx_list = [c.get_constraint_info()["frame_idx"] for c in session.constraints.values()]
         # merge all constraint indices into a single list
         all_constraint_indices = [idx for sublist in constraint_idx_list for idx in sublist]
-        has_valid_timeline_constraints = (
-            len(all_constraint_indices) > 0 and max(all_constraint_indices) > history_end_idx
-        )
+        max_task_idx = session.task_end_frame_idx if not session.realtime_mode else None
+        max_required_idx = None
+        if all_constraint_indices:
+            max_required_idx = max(all_constraint_indices)
+        if max_task_idx is not None:
+            max_required_idx = max(max_required_idx, max_task_idx) if max_required_idx is not None else max_task_idx
+
+        has_valid_timeline_constraints = max_required_idx is not None and max_required_idx > history_end_idx
 
         # number of frames of the visible sequence to the model
         num_frames = compute_window_num_frames(
@@ -216,8 +455,12 @@ class GenerationMixin:
             num_frames_per_token=session.num_frames_per_token,
             max_window_len=session.max_window_len,
             history_start_idx=history_start_idx,
-            max_constraint_idx=(max(all_constraint_indices) if has_valid_timeline_constraints else None),
-            future_crop_length=session.gui_elements.gui_future_crop_length.value,
+            max_constraint_idx=(max_required_idx if has_valid_timeline_constraints else None),
+            future_crop_length=(
+                session.max_window_len
+                if max_task_idx is not None
+                else session.gui_elements.gui_future_crop_length.value
+            ),
         )
 
         # Process timeline constraints
@@ -287,6 +530,8 @@ class GenerationMixin:
         joints_pos = pred_joints_output["posed_joints"]
         joints_rot = pred_joints_output["global_rot_mats"]
         foot_contacts = pred_joints_output.get("foot_contacts")
+        local_rot_mats = pred_joints_output["local_rot_mats"]
+        root_positions = pred_joints_output["root_positions"]
 
         # Apply post-processing if enabled
         if session.gui_elements.gui_enable_postprocess_checkbox.value:
@@ -302,9 +547,6 @@ class GenerationMixin:
             #  check if the model_constraints is not empty
             if len(model_constraints) > 0:
                 # Get local rotations and root positions from pred_joints_output
-                local_rot_mats = pred_joints_output["local_rot_mats"]  # [B, T, J, 3, 3]
-                root_positions = pred_joints_output["root_positions"]  # [B, T, 3]
-
                 # subtract history_end_idx from the model_constraints frame indices
                 for constraint in model_constraints:
                     constraint.frame_indices = constraint.frame_indices - history_start_idx - history_length
@@ -323,6 +565,8 @@ class GenerationMixin:
                 # calculate corrected motion_tensor, joints_pos, joints_rot, foot_contacts
                 joints_pos[:, history_length:] = corrected_output["posed_joints"]
                 joints_rot[:, history_length:] = corrected_output["global_rot_mats"]
+                local_rot_mats[:, history_length:] = corrected_output["local_rot_mats"]
+                root_positions[:, history_length:] = corrected_output["root_positions"]
                 corrected_tensor_unnormalized = session.motion_rep(
                     local_joint_rots=corrected_output["local_rot_mats"],
                     root_positions=corrected_output["root_positions"],
@@ -340,11 +584,47 @@ class GenerationMixin:
                 f"[PostProcess] Motion correction applied in {postprocess_end_time - postprocess_start_time:.4f} seconds"
             )
 
+        (
+            samples,
+            samples_unnormalized,
+            joints_pos,
+            joints_rot,
+            foot_contacts,
+            local_rot_mats,
+            root_positions,
+        ) = self._apply_hand_only_motion_filter(
+            session,
+            samples,
+            samples_unnormalized,
+            joints_pos,
+            joints_rot,
+            foot_contacts,
+            local_rot_mats,
+            root_positions,
+            history_length,
+        )
+
+        joints_pos, root_positions = ground_motion_to_floor(
+            session.motion_rep.skeleton,
+            joints_pos,
+            root_positions,
+        )
+        grounded_tensor_unnormalized = session.motion_rep(
+            local_joint_rots=local_rot_mats,
+            root_positions=root_positions,
+            to_normalize=False,
+        )
+        samples_unnormalized = grounded_tensor_unnormalized
+        samples = session.motion_rep.normalize(grounded_tensor_unnormalized)
+        if foot_contacts is not None:
+            foot_contacts = grounded_tensor_unnormalized[:, :, session.motion_rep.slice_dict["foot_contacts"]]
+
         # Extract root velocities from motion representation
         joint_velocities = samples_unnormalized[:, :, session.motion_rep.slice_dict["velocities"]]
+        sequence_len = samples_unnormalized.shape[1]
         joint_velocities = joint_velocities.reshape(
             num_samples,
-            history_length + session.gen_horizon_len,
+            sequence_len,
             session.motion_rep.skeleton.nbjoints,
             3,
         )
@@ -405,6 +685,9 @@ class GenerationMixin:
                 and session.max_frame_idx >= session.task_end_frame_idx
             ):
                 session.task_generation_pending = False
+
+        if self._straighten_rack_route_arrival_pose(session):
+            print(f"[Rack Route] Straightened arrival pose at frame {session.task_end_frame_idx}")
 
         # Update frame index input max value
         session.gui_elements.gui_frame_idx_input.max = session.max_frame_idx

@@ -1,0 +1,57 @@
+{
+  "rack_route": {
+    "rack": "rack_2",
+    "fps": 30.0,
+    "total_frames": 268,
+    "duration_seconds": 8.933333333333334,
+    "approach_position": [
+      -1.0099999999999998,
+      0.0,
+      -2.4
+    ],
+    "final_heading_radians": -1.5707963267948966,
+    "waypoint_indices": [
+      0,
+      45,
+      46,
+      165,
+      166,
+      187,
+      188,
+      237,
+      238,
+      267
+    ],
+    "turn_degrees": [
+      180,
+      90
+    ]
+  },
+  "confirmation": {
+    "required": true,
+    "message": "After the rack route finishes, confirm visually that the character stopped at the rack."
+  },
+  "pick_motion": {
+    "rack": "rack_2",
+    "shelf_number": 4,
+    "object_index": 2,
+    "hand_side": "right",
+    "motion_file_path": "/home/jony/Downloads/soma-retargeter/assets/motions/bvh/generated/kimodo_0eaccddc7f.bvh",
+    "motion_frames": 196,
+    "motion_fps": 30.0,
+    "constraint_frames_text": "0,20,38,52,64,84,end",
+    "constraint_frames_json": "/home/jony/Downloads/ardy/rack_pick_constraints_program/generated/pick_constraints.json",
+    "gui_state": {
+      "full_body": false,
+      "hands": true,
+      "forearm_orientation": false,
+      "hand_only_motion": true,
+      "feet": false,
+      "hands_and_feet": false,
+      "root_2d_waypoints": false,
+      "root_2d_trajectory": false,
+      "continue_from_current_frame": false,
+      "max_keyframes": null
+    }
+  }
+}

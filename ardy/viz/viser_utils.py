@@ -1892,6 +1892,12 @@ class EEJointsKeyframeSet(ConstraintSet):
                 constrained_bone_idx.extend(
                     [self.skeleton.bone_order_names_index[joint] - 1 for joint in expanded_joint_names[1:]]
                 )
+            elif joint_name in self.skeleton.bone_order_names_index:
+                joint_idx = self.skeleton.bone_order_names_index[joint_name]
+                ee_joint_indices.append(joint_idx)
+                ee_gizmo_indices.append(joint_idx)
+                if joint_idx > 0:
+                    constrained_bone_idx.append(joint_idx - 1)
             else:
                 raise ValueError(f"Invalid joint name: {joint_name}")
 
@@ -1953,6 +1959,7 @@ class EEJointsKeyframeSet(ConstraintSet):
         joints_rot: torch.Tensor | np.ndarray,
         joint_names: List[str],
         end_effector_type: str,
+        constrain_root: bool = True,
         viz_label: bool = True,
         exists_ok: bool = False,
     ):
@@ -1978,6 +1985,7 @@ class EEJointsKeyframeSet(ConstraintSet):
                 joint_names = set(joint_names)
                 joint_names.update(set(self.keyframes[frame_idx]["joint_names"]))
                 joint_names = list(joint_names)
+                constrain_root = bool(constrain_root or self.keyframes[frame_idx].get("constrain_root", True))
                 end_effector_type.update(self.keyframes[frame_idx]["end_effector_type"])
                 # need to re-create viz elements
                 self.clear(frame_idx)
@@ -2007,6 +2015,8 @@ class EEJointsKeyframeSet(ConstraintSet):
                                 ee_gizmo_indices.extend(
                                     [self.skeleton.bone_order_names_index[joint] for joint in expanded_joint_names[:-1]]
                                 )
+                        elif joint_name in self.skeleton.bone_order_names_index:
+                            ee_gizmo_indices.append(self.skeleton.bone_order_names_index[joint_name])
                         else:
                             raise ValueError(f"Invalid joint name: {joint_name}")
                     ee_gizmo_indices = list(dict.fromkeys(ee_gizmo_indices))
@@ -2030,6 +2040,7 @@ class EEJointsKeyframeSet(ConstraintSet):
             "joints_rot": to_numpy(joints_rot),
             "joint_names": joint_names,
             "end_effector_type": end_effector_type,
+            "constrain_root": bool(constrain_root),
         }
 
         if frame_idx not in self.frame2keyid:
@@ -2136,6 +2147,7 @@ class EEJointsKeyframeSet(ConstraintSet):
         all_joints_rot = []
         all_joints_names = []
         all_end_effector_type = []
+        all_constrain_root = []
         for v in self.keyframes.values():
             joints_pos = to_torch(v["joints_pos"], device=device)
             joints_rot = to_torch(v["joints_rot"], device=device)
@@ -2149,6 +2161,7 @@ class EEJointsKeyframeSet(ConstraintSet):
                 all_joints_rot.append(joints_rot)
             all_joints_names.append(v["joint_names"])
             all_end_effector_type.append(v["end_effector_type"])
+            all_constrain_root.append(v.get("constrain_root", True))
 
         all_joints_pos = torch.cat(all_joints_pos, dim=0) if len(all_joints_pos) > 0 else None
         all_joints_rot = torch.cat(all_joints_rot, dim=0) if len(all_joints_rot) > 0 else None
@@ -2159,6 +2172,7 @@ class EEJointsKeyframeSet(ConstraintSet):
             "joints_rot": all_joints_rot,
             "joint_names": all_joints_names,
             "end_effector_type": all_end_effector_type,
+            "constrain_root": all_constrain_root,
         }
 
     def set_keyframe_visibility(self, keyframe_idx: int, visible: bool, show_rotation_axes: bool = True):

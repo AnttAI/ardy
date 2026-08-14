@@ -16,6 +16,28 @@ from .constants import (
 )
 
 
+T3_LIFT_DISPLAY_BASE_CM = 60.0
+T3_LIFT_HARDWARE_BASE_CM = 69.0
+
+
+def lift_extension_m_to_display_cm(extension_m: float) -> float:
+    """Convert lift extension in meters to the CSV display height in centimeters."""
+    return float(T3_LIFT_DISPLAY_BASE_CM + 100.0 * float(extension_m))
+
+
+def lift_extension_m_to_hardware_cm(extension_m: float) -> float:
+    """Convert lift extension in meters to the physical lift command height in centimeters."""
+    return float(T3_LIFT_HARDWARE_BASE_CM + 100.0 * float(extension_m))
+
+
+def lift_csv_value_to_extension_m(value: float) -> float:
+    """Accept old meter CSVs or new 60+cm CSVs and return extension in meters."""
+    value = float(value)
+    if value <= T3_LIFT_MAX_M:
+        return float(np.clip(value, T3_LIFT_MIN_M, T3_LIFT_MAX_M))
+    return float(np.clip((value - T3_LIFT_DISPLAY_BASE_CM) / 100.0, T3_LIFT_MIN_M, T3_LIFT_MAX_M))
+
+
 def _available_indices(skeleton, names: tuple[str, ...]) -> list[int]:
     return [skeleton.bone_order_names_index[name] for name in names if name in skeleton.bone_order_names_index]
 

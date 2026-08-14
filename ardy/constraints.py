@@ -235,11 +235,13 @@ class EndEffectorConstraintSet:
         root_2d: Optional[Tensor],
         *,
         joint_names: list[str],
+        constrain_root: bool | None = None,
         to_crop: bool = False,
     ) -> None:
         self.skeleton = skeleton
         self.frame_indices = frame_indices
         self.joint_names = joint_names
+        self.constrain_root = "Hips" in joint_names if constrain_root is None else bool(constrain_root)
 
         # joint_names are constant for all the frames
         rot_joint_names, pos_joint_names = self.skeleton.expand_joint_names(self.joint_names)
@@ -303,18 +305,18 @@ class EndEffectorConstraintSet:
         data_dict["global_joints_rots"].append(self.global_joints_rots[tuple(rot_indices_crop.T)])
         index_dict["global_joints_rots"].append(rot_indices_real)
 
-        # also constraint root 2d to get the same full body
-        # maybe keep storing the hips offset, if we smooth it ourselves
-        data_dict["root_2d"].append(self.root_2d)
-        index_dict["root_2d"].append(self.frame_indices)
+        if self.constrain_root:
+            # Only EE constraints that request root conditioning should pin
+            # the body. Hand-only BVH constraints still carry Hips for local
+            # coordinate math, but should not drag the root.
+            data_dict["root_2d"].append(self.root_2d)
+            index_dict["root_2d"].append(self.frame_indices)
 
-        # constraint the y pos of the root
-        data_dict["root_y_pos"].append(self.root_y_pos)
-        index_dict["root_y_pos"].append(self.frame_indices)
+            data_dict["root_y_pos"].append(self.root_y_pos)
+            index_dict["root_y_pos"].append(self.frame_indices)
 
-        # constraint the global heading
-        data_dict["global_root_heading"].append(self.global_root_heading)
-        index_dict["global_root_heading"].append(self.frame_indices)
+            data_dict["global_root_heading"].append(self.global_root_heading)
+            index_dict["global_root_heading"].append(self.frame_indices)
 
     def crop_move(self, start: int, end: int):
         mask = (self.frame_indices >= start) & (self.frame_indices < end)
@@ -323,6 +325,7 @@ class EndEffectorConstraintSet:
         kwargs = {}
         if not hasattr(cls, "joint_names"):
             kwargs["joint_names"] = self.joint_names
+        kwargs["constrain_root"] = self.constrain_root
 
         return cls(
             self.skeleton,
@@ -349,6 +352,7 @@ class EndEffectorConstraintSet:
             # save the joint_names for this base class
             # but not for children
             output["joint_names"] = self.joint_names
+        output["constrain_root"] = self.constrain_root
         return output
 
     @classmethod
@@ -368,6 +372,8 @@ class EndEffectorConstraintSet:
         kwargs = {}
         if not hasattr(cls, "joint_names"):
             kwargs["joint_names"] = dico["joint_names"]
+        if "constrain_root" in dico:
+            kwargs["constrain_root"] = dico["constrain_root"]
 
         return cls(
             skeleton,

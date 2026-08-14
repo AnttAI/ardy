@@ -17,6 +17,7 @@ from interactive_demo.constraints import ConstraintsMixin
 from interactive_demo.embedding_cache import CachedTextEncoder
 from interactive_demo.gen_constraints import GenConstraintsMixin
 from interactive_demo.generation import GenerationMixin
+from interactive_demo.hardware import T3HardwareMixin
 from interactive_demo.gui import (
     GuiGenerateMixin,
     GuiIOMixin,
@@ -41,6 +42,7 @@ class InteractiveTimelineDemo(
     SessionIOMixin,
     GenerationMixin,
     GenConstraintsMixin,
+    T3HardwareMixin,
     CameraMixin,
     GuiMixin,
     GuiPlaybackMixin,

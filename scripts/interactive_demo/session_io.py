@@ -522,6 +522,8 @@ class SessionIOMixin:
             if stream_start == 0:
                 with session.t3_retarget_lock:
                     session.t3_stream_rows = []
+                    session.t3_retarget_packet_ranges = []
+                    session.t3_retarget_packet_end_frames = []
 
             merged_end_frame = previous_ready_end
             for packet_start in range(stream_start, total_frames, packet_size):
@@ -562,6 +564,11 @@ class SessionIOMixin:
                     merged_end_frame = len(session.t3_stream_rows) - 1
                     session.t3_retarget_csv_start_frame = 0
                     session.t3_retarget_csv_end_frame = merged_end_frame
+                    packet_range = (int(packet_start), int(packet_end - 1))
+                    if packet_range not in session.t3_retarget_packet_ranges:
+                        session.t3_retarget_packet_ranges.append(packet_range)
+                    if merged_end_frame not in session.t3_retarget_packet_end_frames:
+                        session.t3_retarget_packet_end_frames.append(int(merged_end_frame))
                     session.t3_retarget_ready_generation = generation
                     session.t3_retarget_status = (
                         f"stream ready {packet_start}-{packet_end - 1} "

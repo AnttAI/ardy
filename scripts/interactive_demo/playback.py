@@ -28,6 +28,10 @@ class PlaybackMixin:
 
             # Update frame if playing
             if session.playing:
+                if getattr(session, "t3_hardware_clock_active", False):
+                    time.sleep(0.02)
+                    last_update_time = time.time()
+                    continue
                 accurate_soma_waiting = False
                 playback_end_frame = session.max_frame_idx
                 if not session.realtime_mode and session.task_end_frame_idx is not None:
@@ -85,6 +89,7 @@ class PlaybackMixin:
                             session.play_once = False
                             session.frame_idx = playback_end_frame
                             self.set_frame(client_id, session.frame_idx)
+                            self._pause_t3_hardware_motion(client_id)
                             session.gui_elements.gui_play_pause_button.label = "Play"
                             session.gui_elements.gui_next_frame_button.disabled = (
                                 session.frame_idx >= session.max_frame_idx
@@ -110,8 +115,11 @@ class PlaybackMixin:
                     session.frame_idx += 1
                     self.set_frame(client_id, session.frame_idx)
 
-            # Sleep to maintain target FPS (using model's native FPS)
-            time_remaining = max(0, 1.0 / session.model_fps - (time.time() - last_update_time))
+            # Sleep to maintain the shared playback clock. Slowing this clock
+            # keeps mesh, T3 preview, and hardware frame streaming synchronized.
+            playback_speed = max(float(getattr(session, "playback_speed", 1.0)), 0.05)
+            effective_fps = max(float(session.model_fps) * playback_speed, 1e-6)
+            time_remaining = max(0, 1.0 / effective_fps - (time.time() - last_update_time))
             time.sleep(time_remaining)
 
             # Track moving average of actual fps
@@ -156,7 +164,9 @@ class PlaybackMixin:
             except (AttributeError, Exception) as e:
                 print(f"Could not update timeline frame: {e}")
 
-        session.cur_time = frame_idx / session.model_fps
+        playback_speed = max(float(getattr(session, "playback_speed", 1.0)), 0.05)
+        effective_fps = max(float(session.model_fps) * playback_speed, 1e-6)
+        session.cur_time = frame_idx / effective_fps
         session.gui_elements.gui_current_time.value = session.cur_time
         session.gui_elements.gui_frame_idx_input.value = frame_idx
         self._check_task_target_reached(client_id)
@@ -231,6 +241,9 @@ class PlaybackMixin:
                     root_velocity = None
                     if session.root_velocities is not None:
                         root_velocity = session.root_velocities[character_idx, frame_idx]
+                    playback_speed = max(float(getattr(session, "playback_speed", 1.0)), 0.05)
+                    effective_fps = max(float(session.model_fps) * playback_speed, 1e-6)
+                    display_root_velocity = None if root_velocity is None else root_velocity * playback_speed
 
                     foot_contacts = (
                         session.foot_contacts[character_idx, frame_idx] > 0.5
@@ -241,7 +254,7 @@ class PlaybackMixin:
                         session.joints_pos[character_idx, frame_idx],
                         session.joints_rot[character_idx, frame_idx],
                         foot_contacts=foot_contacts,
-                        root_velocity=root_velocity,
+                        root_velocity=display_root_velocity,
                     )
 
                     # Store root position from first character for target velocity visualization
@@ -312,6 +325,21 @@ class PlaybackMixin:
                             continue
 
                     if character_idx == 0 and session.gui_elements.gui_viz_t3_robot_checkbox.value:
+                        if (
+                            getattr(session.gui_elements, "gui_viz_t3_soma_retarget_checkbox", None) is not None
+                            and not session.gui_elements.gui_viz_t3_soma_retarget_checkbox.value
+                            and session.t3_csv_player is not None
+                        ):
+                            if session.t3_live_retargeter is not None:
+                                session.t3_live_retargeter.set_visible(False)
+                            session.t3_csv_player.set_visible(True)
+                            if session.t3_csv_player.has_frame(frame_idx):
+                                session.t3_csv_player.update(
+                                    frame_idx,
+                                    offset=session.gui_elements.gui_viz_t3_offset.value,
+                                    yaw_offset_deg=session.gui_elements.gui_viz_t3_yaw_offset.value,
+                                )
+                            continue
                         use_soma_t3 = (
                             getattr(session.gui_elements, "gui_viz_t3_soma_retarget_checkbox", None) is not None
                             and session.gui_elements.gui_viz_t3_soma_retarget_checkbox.value
@@ -322,10 +350,14 @@ class PlaybackMixin:
                                 if 0 <= frame_idx < len(session.t3_stream_rows) and session.t3_stream_rows[frame_idx]
                                 else None
                             )
+                            retarget_csv_player_ready = (
+                                session.t3_csv_player is not None
+                                and session.t3_retarget_ready_generation >= 0
+                                and session.t3_csv_player_generation == session.t3_retarget_ready_generation
+                            )
                             if (
                                 stream_row is None
-                                and
-                                session.t3_retarget_csv_path is not None
+                                and session.t3_retarget_csv_path is not None
                                 and session.t3_retarget_ready_generation > session.t3_csv_player_generation
                             ):
                                 try:
@@ -340,6 +372,7 @@ class PlaybackMixin:
                                     )
                                     session.t3_csv_player_generation = session.t3_retarget_ready_generation
                                     session.t3_csv_player.set_visible(False)
+                                    retarget_csv_player_ready = True
                                 except Exception as e:
                                     self._set_soma_t3_status(client_id, "csv load failed")
                                     print(f"[T3 Live] Failed to load Soma T3 CSV player: {e}")
@@ -348,7 +381,8 @@ class PlaybackMixin:
                                     traceback.print_exc()
                             csv_covers_frame = (
                                 stream_row is not None
-                                or session.t3_csv_player is not None
+                                or retarget_csv_player_ready
+                                and session.t3_csv_player is not None
                                 and session.t3_csv_player.has_frame(frame_idx)
                             )
                             if not csv_covers_frame:
@@ -372,26 +406,47 @@ class PlaybackMixin:
                                     continue
                             session.t3_live_retargeter.set_visible(True)
                             if csv_covers_frame:
-                                self._set_soma_t3_status(client_id, f"accurate BVH Soma T3 frame {frame_idx}")
+                                self._set_soma_t3_status(client_id, f"accurate Soma T3 frame {frame_idx}")
                                 t3_row = stream_row if stream_row is not None else session.t3_csv_player.rows[frame_idx]
                                 session.t3_live_retargeter.update_with_soma_upper_body_csv(
                                     session.joints_pos[character_idx, frame_idx],
                                     session.joints_rot[character_idx, frame_idx],
                                     t3_row,
-                                    fps=session.model_fps,
+                                    fps=effective_fps,
                                     offset=session.gui_elements.gui_viz_t3_offset.value,
                                     yaw_offset_deg=session.gui_elements.gui_viz_t3_yaw_offset.value,
-                                    root_velocity=root_velocity,
+                                    root_velocity=display_root_velocity,
                                 )
                             else:
                                 ready_until = (
-                                    max(len(session.t3_stream_rows) - 1, session.t3_csv_player.num_frames - 1)
-                                    if session.t3_csv_player is not None
-                                    else len(session.t3_stream_rows) - 1
+                                    max(len(session.t3_stream_rows) - 1, int(session.t3_retarget_csv_end_frame))
+                                    if hasattr(session, "t3_stream_rows")
+                                    else int(session.t3_retarget_csv_end_frame)
                                 )
+                                if soma_joints_pos is not None and soma_joints_rot is not None:
+                                    session.t3_live_retargeter.update_with_soma_mesh_ik(
+                                        session.joints_pos[character_idx, frame_idx],
+                                        session.joints_rot[character_idx, frame_idx],
+                                        soma_joints_pos,
+                                        soma_joints_rot,
+                                        session.soma_live_mapper.soma_skeleton,
+                                        fps=effective_fps,
+                                        offset=session.gui_elements.gui_viz_t3_offset.value,
+                                        yaw_offset_deg=session.gui_elements.gui_viz_t3_yaw_offset.value,
+                                        root_velocity=display_root_velocity,
+                                    )
+                                else:
+                                    session.t3_live_retargeter.update(
+                                        session.joints_pos[character_idx, frame_idx],
+                                        session.joints_rot[character_idx, frame_idx],
+                                        fps=effective_fps,
+                                        offset=session.gui_elements.gui_viz_t3_offset.value,
+                                        yaw_offset_deg=session.gui_elements.gui_viz_t3_yaw_offset.value,
+                                        root_velocity=display_root_velocity,
+                                    )
                                 self._set_soma_t3_status(
                                     client_id,
-                                    f"waiting for accurate Soma T3 frame {frame_idx}; ready to {ready_until}",
+                                    f"previewing mesh IK for frame {frame_idx}; accurate ready to {ready_until}",
                                 )
                             continue
                         if session.t3_csv_player is not None:
@@ -415,10 +470,10 @@ class PlaybackMixin:
                         session.t3_live_retargeter.update(
                             session.joints_pos[character_idx, frame_idx],
                             session.joints_rot[character_idx, frame_idx],
-                            fps=session.model_fps,
+                            fps=effective_fps,
                             offset=session.gui_elements.gui_viz_t3_offset.value,
                             yaw_offset_deg=session.gui_elements.gui_viz_t3_yaw_offset.value,
-                            root_velocity=root_velocity,
+                            root_velocity=display_root_velocity,
                         )
 
         # Update reference motion character
@@ -469,6 +524,9 @@ class PlaybackMixin:
         # Update camera
         if session.gui_elements.gui_viz_auto_camera_checkbox.value:
             self.update_camera_follow(client_id, frame_idx)
+
+        if hasattr(self, "_sync_t3_hardware_frame"):
+            self._sync_t3_hardware_frame(client_id, frame_idx)
 
     def _check_task_target_reached(self, client_id: int):
         """Report once when the generated root reaches the loaded BVH task target."""

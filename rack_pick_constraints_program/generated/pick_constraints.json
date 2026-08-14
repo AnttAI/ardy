@@ -1,0 +1,38 @@
+{
+  "type": "kimodo_pick_constraints",
+  "motion_file_path": "/home/jony/Downloads/soma-retargeter/assets/motions/bvh/generated/kimodo_0eaccddc7f.bvh",
+  "constraint_frames": [
+    0,
+    20,
+    38,
+    52,
+    64,
+    84,
+    195
+  ],
+  "keyframes": {
+    "start": 0,
+    "reach": 20,
+    "pregrasp": 38,
+    "grasp": 52,
+    "lift": 64,
+    "chest_hold": 84,
+    "end": 195
+  },
+  "gui_state": {
+    "full_body": false,
+    "hands": true,
+    "forearm_orientation": false,
+    "hand_only_motion": true,
+    "feet": false,
+    "hands_and_feet": false,
+    "root_2d_waypoints": false,
+    "root_2d_trajectory": false,
+    "continue_from_current_frame": false,
+    "max_keyframes": null
+  },
+  "notes": [
+    "Use this JSON path in the demo's Constraint Frames field.",
+    "The demo parser reads the keyframes object and samples these deterministic BVH frames."
+  ]
+}

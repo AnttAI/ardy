@@ -14,6 +14,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .constants import DEFAULT_T3_URDF_PATH
+from .lift import lift_csv_value_to_extension_m
 
 WHEEL_Z_UP_TO_SCENE_Y_UP = Rotation.from_euler("x", -90.0, degrees=True)
 T3_LINEAR_JOINTS = {"telescopic_lift_joint"}
@@ -62,7 +63,18 @@ class T3CsvPlaybackRobot:
                 raise ValueError(f"{path} has no CSV header")
             rows = []
             for row in reader:
-                rows.append({key: float(value) if value not in {"", None} else 0.0 for key, value in row.items()})
+                parsed_row = {}
+                for key, value in row.items():
+                    if isinstance(value, str):
+                        value = value.strip()
+                    if value in {"", None}:
+                        parsed_row[key] = 0.0
+                        continue
+                    try:
+                        parsed_row[key] = float(value)
+                    except (TypeError, ValueError):
+                        parsed_row[key] = value
+                rows.append(parsed_row)
         return rows, list(reader.fieldnames)
 
     def _read_joint_limits(self) -> dict[str, tuple[float, float]]:
@@ -126,7 +138,12 @@ class T3CsvPlaybackRobot:
             if not column.endswith("_dof"):
                 continue
             joint_name = column[:-4]
-            joint_value = value if joint_name in T3_LINEAR_JOINTS else math.radians(value)
+            if joint_name == "telescopic_lift_joint":
+                joint_value = lift_csv_value_to_extension_m(value)
+            elif joint_name in T3_LINEAR_JOINTS:
+                joint_value = value
+            else:
+                joint_value = math.radians(value)
             self._set_joint(joint_name, joint_value)
         self._set_joint("left_wheel_joint", float(self.left_wheel_angles[idx]))
         self._set_joint("right_wheel_joint", float(self.right_wheel_angles[idx]))

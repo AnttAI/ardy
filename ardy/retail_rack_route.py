@@ -177,19 +177,28 @@ def plan_rack_pick(
     if hand_side == "left":
         lateral = -lateral
 
-    pregrasp = object_position + outward * 0.16 + np.array([0.0, 0.03, 0.0], dtype=np.float64)
-    grasp = object_position + outward * 0.02
-    lift = object_position + outward * 0.03 + np.array([0.0, 0.08, 0.0], dtype=np.float64)
+    grasp_clearance = 0.02
+    pregrasp_clearance = 0.14
+    diagonal_clearance = 0.07
+    lateral_clearance = 0.12
+    grasp = object_position + grasp_clearance * outward + np.array([0.0, -0.01, 0.0], dtype=np.float64)
+    pregrasp = (
+        object_position
+        + pregrasp_clearance * outward
+        + lateral_clearance * lateral
+        + np.array([0.0, 0.05, 0.0], dtype=np.float64)
+    )
+    lift = grasp + np.array([0.0, 0.07, 0.0], dtype=np.float64)
     chest_hold = np.asarray(approach, dtype=np.float64) + facing * 0.18 + lateral * 0.10
     chest_hold[1] = min(max(float(object_position[1]), 0.82), 1.12)
 
     last = total_frames - 1
     frame_indices = (
         0,
-        min(max(1, int(round(last * 0.30))), last),
-        min(max(2, int(round(last * 0.48))), last),
-        min(max(3, int(round(last * 0.62))), last),
-        min(max(4, int(round(last * 0.78))), last),
+        min(max(1, int(round(last * 0.38))), last),
+        min(max(2, int(round(last * 0.52))), last),
+        min(max(3, int(round(last * 0.64))), last),
+        min(max(4, int(round(last * 0.84))), last),
     )
     return RackPickPlan(
         rack_name=rack_name,

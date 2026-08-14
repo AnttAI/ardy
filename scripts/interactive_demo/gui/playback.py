@@ -19,6 +19,14 @@ class GuiPlaybackMixin:
             g.gui_actual_fps = client.gui.add_number("Actual FPS", initial_value=30.0, step=0.0001, disabled=True)
             g.gui_current_time = client.gui.add_number("Current Time (s)", initial_value=0.0, step=0.01, disabled=True)
             g.gui_model_fps = client.gui.add_number("Native FPS", initial_value=30, disabled=True)
+            g.gui_playback_speed = client.gui.add_slider(
+                "Playback Speed",
+                min=0.05,
+                max=1.0,
+                step=0.01,
+                initial_value=1.0,
+                hint="Slows the mesh, T3 preview, hardware frame clock, and base RPM together.",
+            )
             g.gui_frame_idx_input = client.gui.add_number("Frame Index", initial_value=0, min=0, max=199, step=1)
             g.gui_realtime_mode_checkbox = client.gui.add_checkbox(
                 "Realtime / Infinite Generation",
@@ -61,11 +69,21 @@ class GuiPlaybackMixin:
                 if not self.client_active(client_id):
                     return
                 session = self.client_sessions[client_id]
+                if not session.playing:
+                    playback_end_frame = session.max_frame_idx
+                    if not session.realtime_mode and session.task_end_frame_idx is not None:
+                        playback_end_frame = min(playback_end_frame, session.task_end_frame_idx)
+                    if playback_end_frame < 0:
+                        return
+                    if session.frame_idx >= playback_end_frame:
+                        self.set_frame(client_id, 0)
                 session.playing = not session.playing
                 session.play_once = session.playing and not session.realtime_mode
                 g.gui_play_pause_button.label = "Pause" if session.playing else "Play"
                 g.gui_next_frame_button.disabled = session.playing
                 g.gui_prev_frame_button.disabled = session.playing
+                if not session.playing and hasattr(self, "_pause_t3_hardware_motion"):
+                    self._pause_t3_hardware_motion(client_id)
 
             @g.gui_next_frame_button.on_click
             def _(_) -> None:
@@ -90,6 +108,13 @@ class GuiPlaybackMixin:
                     g.gui_next_frame_button.disabled = False
                     if new_frame == 0:
                         g.gui_prev_frame_button.disabled = True
+
+            @g.gui_playback_speed.on_update
+            def _(_) -> None:
+                if not self.client_active(client_id):
+                    return
+                session = self.client_sessions[client_id]
+                session.playback_speed = max(0.05, min(float(g.gui_playback_speed.value), 1.0))
 
         #
         # Text tab

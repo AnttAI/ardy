@@ -77,17 +77,202 @@ class GuiVisualizeMixin:
                 initial_value=-90.0,
                 hint="URDF forward-axis correction for the fast preview; exact Soma CSV playback uses its saved yaw",
             )
+            with client.gui.add_folder("Send T3 to Real Hardware", expand_by_default=True):
+                g.gui_t3_hardware_payload_md = client.gui.add_markdown(
+                    "Generate motion, enable Soma T3 retargeting, then inspect the outgoing frame here."
+                )
+                g.gui_t3_hardware_enable_checkbox = client.gui.add_checkbox(
+                    "Enable Real T3 Hardware",
+                    initial_value=False,
+                    hint="Off means the stream process runs in dry-run mode.",
+                )
+                g.gui_t3_hardware_send_checkbox = client.gui.add_checkbox(
+                    "Send to connected stream",
+                    initial_value=False,
+                    hint="Off only previews the exact payload. Turn on to publish through the hardware bridge.",
+                )
+                g.gui_t3_hardware_rpm_scale = client.gui.add_number(
+                    "Base RPM Scale",
+                    initial_value=float(os.environ.get("ARDY_T3_RPM_SCALE", "1.0")),
+                    min=0.01,
+                    max=10.0,
+                    step=0.05,
+                )
+                g.gui_t3_hardware_max_abs_rpm = client.gui.add_number(
+                    "Base Command Max RPM",
+                    initial_value=float(os.environ.get("ARDY_T3_MAX_ABS_RPM", "90.0")),
+                    min=1.0,
+                    max=300.0,
+                    step=1.0,
+                    hint="Pair-preserving limit applied before publishing /base/cmd_wheel_rpm.",
+                )
+                g.gui_t3_hardware_linear_scale = client.gui.add_number(
+                    "Base Linear Scale",
+                    initial_value=float(os.environ.get("ARDY_T3_LINEAR_SCALE", "1.0")),
+                    min=0.01,
+                    max=3.0,
+                    step=0.01,
+                    hint="Multiply straight/base forward velocity before converting to wheel RPM.",
+                )
+                g.gui_t3_hardware_backward_scale = client.gui.add_number(
+                    "Base Backward Scale",
+                    initial_value=float(os.environ.get("ARDY_T3_BACKWARD_SCALE", "1.0")),
+                    min=0.01,
+                    max=3.0,
+                    step=0.01,
+                    hint="Extra multiplier applied only when commanded base forward velocity is negative.",
+                )
+                g.gui_t3_hardware_yaw_scale = client.gui.add_number(
+                    "Base Yaw Scale",
+                    initial_value=float(os.environ.get("ARDY_T3_YAW_SCALE", "1.14")),
+                    min=0.01,
+                    max=3.0,
+                    step=0.01,
+                    hint="Multiply turning/yaw rate before converting to wheel RPM.",
+                )
+                g.gui_t3_hardware_rack_yaw_scale = client.gui.add_number(
+                    "Rack Yaw Scale",
+                    initial_value=float(os.environ.get("ARDY_T3_RACK_YAW_SCALE", "0.95")),
+                    min=0.01,
+                    max=3.0,
+                    step=0.01,
+                    hint="Extra yaw multiplier only for planned rack-route base commands.",
+                )
+                g.gui_t3_hardware_base_lead_frames = client.gui.add_number(
+                    "Base Lead Frames",
+                    initial_value=int(os.environ.get("ARDY_T3_BASE_LEAD_FRAMES", "0")),
+                    min=0,
+                    max=30,
+                    step=1,
+                    hint="Send base RPM from a future frame while upper body stays on the current frame.",
+                )
+                g.gui_t3_hardware_lift_step_frames = client.gui.add_number(
+                    "CSV Lift Step Frames",
+                    initial_value=int(os.environ.get("ARDY_T3_LIFT_STEP_FRAMES", "10")),
+                    min=1,
+                    max=300,
+                    step=1,
+                    hint="For CSV playback only: publish lift height on row 0, N, 2N, ...",
+                )
+                base_mapping_options = (
+                    "Direct ROS [left, right]",
+                    "Kimodo/Tara [right, -left]",
+                    "Swap only [right, left]",
+                    "Invert both [-left, -right]",
+                )
+                base_mapping_initial = os.environ.get("ARDY_T3_BASE_MAPPING_LABEL", base_mapping_options[0])
+                if base_mapping_initial not in base_mapping_options:
+                    base_mapping_initial = base_mapping_options[0]
+                g.gui_t3_hardware_base_mapping = client.gui.add_dropdown(
+                    "Base ROS Mapping",
+                    options=base_mapping_options,
+                    initial_value=base_mapping_initial,
+                    hint="Choose how simulation wheel RPM is mapped before publishing /base/cmd_wheel_rpm.",
+                )
+                g.gui_t3_hardware_csv_path = client.gui.add_text(
+                    "T3 CSV Path",
+                    initial_value=os.environ.get("ARDY_T3_CSV_PATH", ""),
+                    hint="CSV with T3 base, lift, and upper-body columns to stream directly to hardware.",
+                )
+                g.gui_t3_hardware_csv_segment = client.gui.add_number(
+                    "T3 CSV Segment",
+                    initial_value=int(os.environ.get("ARDY_T3_CSV_SEGMENT", "0")),
+                    min=0,
+                    max=100,
+                    step=1,
+                    hint="Which continuous motion segment to play when one CSV contains multiple recorded runs.",
+                )
+                g.gui_t3_hardware_csv_fps = client.gui.add_number(
+                    "T3 CSV FPS",
+                    initial_value=float(os.environ.get("ARDY_T3_CSV_FPS", "0.0")),
+                    min=0.0,
+                    max=200.0,
+                    step=0.1,
+                    hint="0 uses effective_send_fps/playback_speed from the CSV.",
+                )
+                g.gui_t3_hardware_base_button = client.gui.add_button("Play Base", color="blue")
+                g.gui_t3_hardware_robot_button = client.gui.add_button("Play Robot", color="green")
+                g.gui_t3_hardware_both_button = client.gui.add_button("Play Both", color="green")
+                g.gui_t3_hardware_lift_button = client.gui.add_button("Play Lift", color="blue")
+                g.gui_t3_hardware_base_lift_button = client.gui.add_button("Play Base + Lift", color="blue")
+                g.gui_t3_hardware_robot_lift_button = client.gui.add_button("Play Robot + Lift", color="green")
+                g.gui_t3_hardware_full_button = client.gui.add_button("Play Full T3", color="green")
+                g.gui_t3_hardware_csv_robot_button = client.gui.add_button("Play CSV Robot", color="green")
+                g.gui_t3_hardware_csv_full_button = client.gui.add_button("Play CSV Full T3", color="blue")
+                g.gui_t3_hardware_stop_base_button = client.gui.add_button("Stop Base", color="orange")
+                g.gui_t3_hardware_stop_robot_button = client.gui.add_button("Stop Robot", color="orange")
+                g.gui_t3_hardware_stop_lift_button = client.gui.add_button("Stop Lift", color="orange")
+                g.gui_t3_hardware_stop_both_button = client.gui.add_button("Stop Both", color="red")
+                g.gui_t3_hardware_disconnect_button = client.gui.add_button("Disconnect T3 Stream", color="red")
+
+                @g.gui_t3_hardware_base_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    self._start_t3_hardware_stream(event, client_id, base=True, robot=False, lift=False)
+
+                @g.gui_t3_hardware_robot_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    self._start_t3_hardware_stream(event, client_id, base=False, robot=True, lift=False)
+
+                @g.gui_t3_hardware_both_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    self._start_t3_hardware_stream(event, client_id, base=True, robot=True, lift=False)
+
+                @g.gui_t3_hardware_lift_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    self._start_t3_hardware_stream(event, client_id, base=False, robot=False, lift=True)
+
+                @g.gui_t3_hardware_base_lift_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    self._start_t3_hardware_stream(event, client_id, base=True, robot=False, lift=True)
+
+                @g.gui_t3_hardware_robot_lift_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    self._start_t3_hardware_stream(event, client_id, base=False, robot=True, lift=True)
+
+                @g.gui_t3_hardware_full_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    self._start_t3_hardware_stream(event, client_id, base=True, robot=True, lift=True)
+
+                @g.gui_t3_hardware_csv_robot_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    self._start_t3_hardware_csv_stream(event, client_id, mode="robot")
+
+                @g.gui_t3_hardware_csv_full_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    self._start_t3_hardware_csv_stream(event, client_id, mode="full")
+
+                @g.gui_t3_hardware_stop_base_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    self._stop_t3_hardware_stream(event, client_id, base=True, robot=False, lift=False)
+
+                @g.gui_t3_hardware_stop_robot_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    self._stop_t3_hardware_stream(event, client_id, base=False, robot=True, lift=False)
+
+                @g.gui_t3_hardware_stop_lift_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    self._stop_t3_hardware_stream(event, client_id, base=False, robot=False, lift=True)
+
+                @g.gui_t3_hardware_stop_both_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    self._stop_t3_hardware_stream(event, client_id, base=True, robot=True, lift=True)
+
+                @g.gui_t3_hardware_disconnect_button.on_click
+                def _(_: viser.GuiEvent) -> None:
+                    self._disconnect_t3_hardware(client_id)
 
             @g.gui_viz_t3_robot_checkbox.on_update
             def _(_) -> None:
                 if not self.client_active(client_id):
                     return
                 session = self.client_sessions[client_id]
+                use_soma_t3 = bool(g.gui_viz_t3_soma_retarget_checkbox.value)
+                show_csv_player = session.t3_csv_player is not None and not use_soma_t3
                 if session.t3_live_retargeter is not None:
-                    session.t3_live_retargeter.set_visible(g.gui_viz_t3_robot_checkbox.value)
+                    session.t3_live_retargeter.set_visible(g.gui_viz_t3_robot_checkbox.value and not show_csv_player)
                 if session.t3_csv_player is not None:
-                    session.t3_csv_player.set_visible(g.gui_viz_t3_robot_checkbox.value)
-                if g.gui_viz_t3_robot_checkbox.value and g.gui_viz_t3_soma_retarget_checkbox.value:
+                    session.t3_csv_player.set_visible(g.gui_viz_t3_robot_checkbox.value and show_csv_player)
+                if g.gui_viz_t3_robot_checkbox.value and use_soma_t3:
                     self.request_soma_t3_retarget(client_id, force=True, start_frame=0)
 
             @g.gui_viz_t3_soma_retarget_checkbox.on_update
@@ -95,18 +280,31 @@ class GuiVisualizeMixin:
                 if not self.client_active(client_id):
                     return
                 session = self.client_sessions[client_id]
+                if session.t3_csv_player is not None:
+                    session.t3_csv_player.set_visible(False)
+                    if g.gui_viz_t3_soma_retarget_checkbox.value:
+                        session.t3_csv_player.clear()
+                        session.t3_csv_player = None
+                        session.t3_csv_player_generation = -1
                 if g.gui_viz_t3_soma_retarget_checkbox.value:
                     self.request_soma_t3_retarget(client_id, force=True, start_frame=0)
-                elif session.t3_csv_player is not None:
-                    session.t3_csv_player.set_visible(False)
 
             @g.gui_viz_t3_retarget_now_button.on_click
             def _(_) -> None:
                 if not self.client_active(client_id):
                     return
                 session = self.client_sessions[client_id]
+                if session.t3_live_retargeter is not None:
+                    session.t3_live_retargeter.clear()
+                    session.t3_live_retargeter = None
+                if session.t3_csv_player is not None:
+                    session.t3_csv_player.clear()
+                    session.t3_csv_player = None
+                session.t3_csv_player_generation = -1
                 with session.t3_retarget_lock:
                     session.t3_stream_rows = []
+                    session.t3_retarget_packet_ranges = []
+                    session.t3_retarget_packet_end_frames = []
                     session.t3_retarget_csv_end_frame = -1
                     session.t3_retarget_ready_generation = -1
                 self.request_soma_t3_retarget(client_id, force=True, start_frame=0)
@@ -120,6 +318,8 @@ class GuiVisualizeMixin:
                 session.t3_stream_packet_size = packet_size
                 with session.t3_retarget_lock:
                     session.t3_stream_rows = []
+                    session.t3_retarget_packet_ranges = []
+                    session.t3_retarget_packet_end_frames = []
                     session.t3_retarget_csv_end_frame = -1
                     session.t3_retarget_ready_generation = -1
                     session.t3_retarget_pending_after_current = False

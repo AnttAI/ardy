@@ -384,10 +384,6 @@ class ArdyMotionRep(MotionRepBase):
         root_positions = global_joints_positions[hips_mask][value_indices].clone()
         root_positions_y = root_positions[:, 1].clone()
 
-        root_test = motion_mask[time_indices, self.slice_dict["root_pos"]]
-        if not root_test[:, [0, 2]].all():
-            raise ValueError("For constraining global positions, root 2D should also be constrained.")
-
         ground_offset = torch.zeros_like(root_positions)
         ground_offset[:, 1] = root_positions_y
         local_joints_positions = global_joints_positions - root_positions + ground_offset

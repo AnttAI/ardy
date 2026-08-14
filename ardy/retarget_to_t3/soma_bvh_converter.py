@@ -16,6 +16,7 @@ from scipy.spatial.transform import Rotation
 from ardy.exports.bvh import export_soma_bvh_from_arrays
 
 from .embedded_soma_t3 import VENDORED_REFERENCE_BVH, ensure_vendored_soma_importable
+from .lift import lift_extension_m_to_display_cm
 from .constants import (
     T3_LIFT_HEIGHT_OFFSET_M,
     T3_LIFT_MAX_M,
@@ -178,7 +179,8 @@ def _append_lift_column_to_t3_csv(t3_csv: Path, lift_extensions_m: np.ndarray) -
         writer.writeheader()
         for row_idx, row in enumerate(rows):
             out = {column: row.get(column, "") for column in original_header}
-            out[T3_LIFT_COLUMN] = float(lift_extensions_m[min(row_idx, len(lift_extensions_m) - 1)])
+            lift_m = float(lift_extensions_m[min(row_idx, len(lift_extensions_m) - 1)])
+            out[T3_LIFT_COLUMN] = lift_extension_m_to_display_cm(lift_m)
             writer.writerow(out)
 
 

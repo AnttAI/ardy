@@ -324,6 +324,300 @@ class ConstraintsMixin:
 
         threading.Thread(target=self.on_replan_trigger, args=(client_id,), daemon=True).start()
 
+    def apply_root_distance_constraint(
+        self,
+        client_id: int,
+        distance_m: float = 1.0,
+        duration_s: float = 4.0,
+        *,
+        backward: bool = False,
+    ):
+        """Constrain the generated root to travel a fixed distance forward."""
+        if not self.client_active(client_id):
+            return
+        session = self.client_sessions[client_id]
+        client = session.client
+
+        if "2D Root" not in session.constraints:
+            client.add_notification(
+                title="No 2D Root Track",
+                body="The active model does not provide root path constraints.",
+                color="red",
+                auto_close_seconds=4.0,
+            )
+            return
+
+        progress = client.add_notification(
+            title="Root Distance Constraint",
+            body="Installing dense straight root path...",
+            loading=True,
+            with_close_button=False,
+        )
+        client.flush()
+
+        try:
+            distance_m = max(0.01, float(distance_m))
+            duration_s = max(0.5, float(duration_s))
+            total_frames = max(2, int(round(duration_s * float(session.model_fps))) + 1)
+            end_frame = total_frames - 1
+
+            start = (
+                np.asarray(session.init_global_translation, dtype=np.float32).copy()
+                if session.init_global_translation is not None
+                else np.zeros(3, dtype=np.float32)
+            )
+            start[1] = 0.0
+            heading = float(session.init_first_heading_angle or 0.0)
+            forward = np.array([math.sin(heading), 0.0, math.cos(heading)], dtype=np.float32)
+            direction = -1.0 if backward else 1.0
+            end = start + forward * distance_m * direction
+            end[1] = 0.0
+
+            session.playing = False
+            session.play_once = False
+            session.realtime_mode = False
+            session.gui_elements.gui_play_pause_button.label = "Play"
+            session.gui_elements.gui_realtime_mode_checkbox.value = False
+            session.gui_elements.gui_next_frame_button.disabled = False
+            session.gui_elements.gui_prev_frame_button.disabled = True
+            session.gui_elements.gui_enable_auto_replan_checkbox.value = False
+            session.gui_elements.gui_enable_auto_replan_checkbox.disabled = True
+
+            session.init_global_translation = start.astype(np.float32)
+            session.init_first_heading_angle = heading
+            session.t3_base_route_positions = None
+            session.t3_base_route_headings = None
+            if session.transform_gizmo is not None:
+                session.transform_gizmo.position = tuple(session.init_global_translation.tolist())
+                session.transform_gizmo.wxyz = viser.transforms.SO3.from_y_radians(heading).wxyz
+            self._update_start_direction_marker(client_id)
+
+            with session.timeline_data["keyframe_update_lock"]:
+                for constraint in list(session.constraints.values()):
+                    constraint.clear()
+                if hasattr(client, "timeline"):
+                    client.timeline.clear_keyframes()
+                    client.timeline.clear_intervals()
+                session.timeline_data["keyframes"].clear()
+                session.timeline_data["intervals"].clear()
+
+            root_constraint = session.constraints["2D Root"]
+            root_constraint.set_smooth_path(False)
+            root_constraint.set_dense_path(False)
+
+            waypoint_interval = max(1, int(round(float(session.model_fps) * 0.25)))
+            waypoint_indices = sorted(set([0, end_frame, *range(0, total_frames, waypoint_interval)]))
+            for frame_idx in waypoint_indices:
+                alpha = frame_idx / max(float(end_frame), 1.0)
+                position = start + (end - start) * alpha
+                root_constraint.add_keyframe(
+                    keyframe_id=(
+                        f"root_distance_{'back' if backward else 'forward'}_"
+                        f"{int(round(distance_m * 100.0))}cm_{frame_idx}"
+                    ),
+                    frame_idx=frame_idx,
+                    root_pos=torch.tensor(position, dtype=torch.float32),
+                    global_root_heading=heading,
+                    viz_label=frame_idx in {0, end_frame},
+                    exists_ok=True,
+                    update_path=False,
+                    add_annulus=frame_idx in {0, end_frame},
+                )
+
+            root_constraint.set_dense_path(True)
+            root_constraint.update_line_segments()
+            self.add_interval_to_timeline(client_id, "2D Root", 0, end_frame, f"root_distance_{end_frame}")
+
+            if hasattr(client, "timeline"):
+                client.timeline.set_frame_range(
+                    start_frame=0,
+                    end_frame=max(total_frames + TIMELINE_WINDOW_BEFORE, TIMELINE_WINDOW_AFTER),
+                )
+
+            session.task_end_frame_idx = end_frame
+            session.task_generation_pending = True
+            session.task_reached_reported = False
+            session.ref_joints_pos = None
+            session.ref_joints_rot = None
+            if session.ref_character is not None:
+                session.ref_character.clear()
+                session.ref_character = None
+
+            text_feat, _ = session.model.text_encoder([RACK_ROUTE_WALKING_PROMPT])
+            session.text_embedding = text_feat.to(self.device)
+            session.gui_elements.gui_prompt_text.value = RACK_ROUTE_WALKING_PROMPT
+            session.gui_elements.gui_active_prompt_label.content = (
+                f"**Active Prompt:** {RACK_ROUTE_WALKING_PROMPT} + "
+                f"{distance_m * 100.0:.0f} cm {'backward' if backward else 'forward'} root constraint"
+            )
+
+            progress.body = f"Generating {distance_m * 100.0:.0f} cm {'backward' if backward else 'forward'} root motion..."
+            client.flush()
+            self.restart(client_id)
+            self.set_frame(client_id, 0)
+
+            progress.title = "Root Distance Applied"
+            progress.body = (
+                f"Root constrained to {distance_m * 100.0:.0f} cm "
+                f"{'backward' if backward else 'forward'} over {total_frames / float(session.model_fps):.1f}s "
+                f"with {len(waypoint_indices)} dense waypoints."
+            )
+            progress.color = "green"
+        except Exception as e:
+            progress.title = "Root Distance Failed"
+            progress.body = str(e)
+            progress.color = "red"
+            raise
+        finally:
+            progress.loading = False
+            progress.with_close_button = True
+            progress.auto_close_seconds = 6.0
+
+    def apply_root_rotation_constraint(
+        self,
+        client_id: int,
+        degrees: float = 90.0,
+        duration_s: float = 2.0,
+        *,
+        clockwise: bool = False,
+    ):
+        """Constrain the generated root to rotate in place by a fixed angle."""
+        if not self.client_active(client_id):
+            return
+        session = self.client_sessions[client_id]
+        client = session.client
+
+        if "2D Root" not in session.constraints:
+            client.add_notification(
+                title="No 2D Root Track",
+                body="The active model does not provide root path constraints.",
+                color="red",
+                auto_close_seconds=4.0,
+            )
+            return
+
+        progress = client.add_notification(
+            title="Root Rotation Constraint",
+            body="Installing dense in-place turn...",
+            loading=True,
+            with_close_button=False,
+        )
+        client.flush()
+
+        try:
+            degrees = max(1.0, min(abs(float(degrees)), 360.0))
+            duration_s = max(0.5, float(duration_s))
+            total_frames = max(2, int(round(duration_s * float(session.model_fps))) + 1)
+            end_frame = total_frames - 1
+
+            start = (
+                np.asarray(session.init_global_translation, dtype=np.float32).copy()
+                if session.init_global_translation is not None
+                else np.zeros(3, dtype=np.float32)
+            )
+            start[1] = 0.0
+            start_heading = float(session.init_first_heading_angle or 0.0)
+            sign = -1.0 if clockwise else 1.0
+            end_heading = start_heading + math.radians(degrees) * sign
+
+            session.playing = False
+            session.play_once = False
+            session.realtime_mode = False
+            session.gui_elements.gui_play_pause_button.label = "Play"
+            session.gui_elements.gui_realtime_mode_checkbox.value = False
+            session.gui_elements.gui_next_frame_button.disabled = False
+            session.gui_elements.gui_prev_frame_button.disabled = True
+            session.gui_elements.gui_enable_auto_replan_checkbox.value = False
+            session.gui_elements.gui_enable_auto_replan_checkbox.disabled = True
+
+            session.init_global_translation = start.astype(np.float32)
+            session.init_first_heading_angle = start_heading
+            session.t3_base_route_positions = None
+            session.t3_base_route_headings = None
+            if session.transform_gizmo is not None:
+                session.transform_gizmo.position = tuple(session.init_global_translation.tolist())
+                session.transform_gizmo.wxyz = viser.transforms.SO3.from_y_radians(start_heading).wxyz
+            self._update_start_direction_marker(client_id)
+
+            with session.timeline_data["keyframe_update_lock"]:
+                for constraint in list(session.constraints.values()):
+                    constraint.clear()
+                if hasattr(client, "timeline"):
+                    client.timeline.clear_keyframes()
+                    client.timeline.clear_intervals()
+                session.timeline_data["keyframes"].clear()
+                session.timeline_data["intervals"].clear()
+
+            root_constraint = session.constraints["2D Root"]
+            root_constraint.set_smooth_path(False)
+            root_constraint.set_dense_path(False)
+
+            waypoint_interval = max(1, int(round(float(session.model_fps) * 0.15)))
+            waypoint_indices = sorted(set([0, end_frame, *range(0, total_frames, waypoint_interval)]))
+            for frame_idx in waypoint_indices:
+                alpha = frame_idx / max(float(end_frame), 1.0)
+                heading = start_heading + (end_heading - start_heading) * alpha
+                root_constraint.add_keyframe(
+                    keyframe_id=f"root_turn_{int(round(degrees))}deg_{'cw' if clockwise else 'ccw'}_{frame_idx}",
+                    frame_idx=frame_idx,
+                    root_pos=torch.tensor(start, dtype=torch.float32),
+                    global_root_heading=float(heading),
+                    viz_label=frame_idx in {0, end_frame},
+                    exists_ok=True,
+                    update_path=False,
+                    add_annulus=frame_idx in {0, end_frame},
+                )
+
+            root_constraint.set_dense_path(True)
+            root_constraint.update_line_segments()
+            self.add_interval_to_timeline(client_id, "2D Root", 0, end_frame, f"root_turn_{end_frame}")
+
+            if hasattr(client, "timeline"):
+                client.timeline.set_frame_range(
+                    start_frame=0,
+                    end_frame=max(total_frames + TIMELINE_WINDOW_BEFORE, TIMELINE_WINDOW_AFTER),
+                )
+
+            session.task_end_frame_idx = end_frame
+            session.task_generation_pending = True
+            session.task_reached_reported = False
+            session.ref_joints_pos = None
+            session.ref_joints_rot = None
+            if session.ref_character is not None:
+                session.ref_character.clear()
+                session.ref_character = None
+
+            prompt = "A person turns in place."
+            text_feat, _ = session.model.text_encoder([prompt])
+            session.text_embedding = text_feat.to(self.device)
+            session.gui_elements.gui_prompt_text.value = prompt
+            session.gui_elements.gui_active_prompt_label.content = (
+                f"**Active Prompt:** {prompt} + {degrees:.0f} deg "
+                f"{'clockwise' if clockwise else 'counterclockwise'} root constraint"
+            )
+
+            progress.body = f"Generating {degrees:.0f} deg in-place root turn..."
+            client.flush()
+            self.restart(client_id)
+            self.set_frame(client_id, 0)
+
+            progress.title = "Root Rotation Applied"
+            progress.body = (
+                f"Root constrained to turn {degrees:.0f} deg "
+                f"{'clockwise' if clockwise else 'counterclockwise'} over "
+                f"{total_frames / float(session.model_fps):.1f}s with {len(waypoint_indices)} dense heading waypoints."
+            )
+            progress.color = "green"
+        except Exception as e:
+            progress.title = "Root Rotation Failed"
+            progress.body = str(e)
+            progress.color = "red"
+            raise
+        finally:
+            progress.loading = False
+            progress.with_close_button = True
+            progress.auto_close_seconds = 6.0
+
     def apply_rack_route(
         self,
         client_id: int,
@@ -395,6 +689,8 @@ class ConstraintsMixin:
             # approach pose and heading, then turns in place before walking.
             session.init_global_translation = np.asarray(route.positions[0], dtype=np.float32)
             session.init_first_heading_angle = float(route.headings[0])
+            session.t3_base_route_positions = np.asarray(route.positions, dtype=np.float32)
+            session.t3_base_route_headings = np.asarray(route.headings, dtype=np.float32)
             if session.transform_gizmo is not None:
                 session.transform_gizmo.position = tuple(session.init_global_translation.tolist())
                 session.transform_gizmo.wxyz = viser.transforms.SO3.from_y_radians(
@@ -461,8 +757,8 @@ class ConstraintsMixin:
                 session.ref_character.clear()
                 session.ref_character = None
 
-            # Use the cached walking embedding for natural gait while the
-            # dense root/heading constraints decide the route and final facing.
+            # Use the cached walking embedding for natural gait while sparse
+            # root/heading waypoints decide the route and final facing.
             text_feat, _ = session.model.text_encoder([RACK_ROUTE_WALKING_PROMPT])
             session.text_embedding = text_feat.to(self.device)
             session.gui_elements.gui_prompt_text.value = RACK_ROUTE_WALKING_PROMPT
@@ -472,7 +768,7 @@ class ConstraintsMixin:
 
             progress.body = "Generating origin-to-rack motion..."
             client.flush()
-            self.restart(client_id)
+            self.restart(client_id, preserve_t3_base_route=True)
             self.set_frame(client_id, 0)
 
             progress.title = f"{route.rack_name.replace('_', ' ').title()} {route_label} applied"
@@ -480,7 +776,8 @@ class ConstraintsMixin:
                 f"Stop point X {route.positions[-1][0]:.2f}, Z {route.positions[-1][2]:.2f}; "
                 f"heading {np.rad2deg(route.final_heading):.1f} deg; "
                 f"{total_frames / fps:.1f}s auto duration; turns {route.turn_degrees}; "
-                f"{len(route.waypoint_indices)} visible Root2D waypoints; no planned backwalk over 0.20 m."
+                f"{len(route.waypoint_indices)} visible Root2D waypoints; "
+                "no planned backwalk over 0.20 m."
             )
             progress.color = "green"
         except Exception as e:
@@ -571,10 +868,61 @@ class ConstraintsMixin:
         root_xz: np.ndarray,
         heading: float,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Build a clean upright standing pose from the skeleton neutral pose."""
+        """Build a clean upright standing pose with relaxed arms by the sides."""
         neutral = skeleton.neutral_joints.detach().cpu().numpy().astype(np.float64).copy()
         neutral[:, 1] -= float(neutral[:, 1].min())
         root_idx = skeleton.root_idx
+
+        def chain_from_to(start_idx: int, end_idx: int) -> list[int]:
+            chain = [end_idx]
+            current = end_idx
+            while current != start_idx:
+                parent = int(skeleton.joint_parents[current].item())
+                if parent < 0:
+                    return []
+                chain.append(parent)
+                current = parent
+            return list(reversed(chain))
+
+        for side in ("left", "right"):
+            try:
+                shoulder_idx, _elbow_idx, wrist_idx, hand_indices = self._arm_chain_indices(skeleton, side)
+            except RuntimeError:
+                continue
+
+            chain = chain_from_to(shoulder_idx, wrist_idx)
+            if len(chain) < 2:
+                continue
+
+            segment_lengths = [
+                float(np.linalg.norm(neutral[b] - neutral[a]))
+                for a, b in zip(chain[:-1], chain[1:])
+            ]
+            chain_length = sum(segment_lengths)
+            if chain_length <= 1e-6:
+                continue
+
+            shoulder = neutral[shoulder_idx].copy()
+            lateral_sign = 1.0 if shoulder[0] >= neutral[root_idx, 0] else -1.0
+            cumulative = 0.0
+            for idx, segment_length in zip(chain[1:], segment_lengths):
+                cumulative += segment_length
+                ratio = cumulative / chain_length
+                neutral[idx] = shoulder + np.array(
+                    [
+                        lateral_sign * 0.10 * ratio,
+                        -0.92 * chain_length * ratio,
+                        0.06 * ratio + 0.04 * math.sin(math.pi * ratio),
+                    ],
+                    dtype=np.float64,
+                )
+
+            wrist_delta = neutral[wrist_idx] - (skeleton.neutral_joints[wrist_idx].detach().cpu().numpy())
+            for hand_idx in hand_indices:
+                if hand_idx != wrist_idx:
+                    neutral[hand_idx] = skeleton.neutral_joints[hand_idx].detach().cpu().numpy() + wrist_delta
+
+        neutral[:, 1] -= float(neutral[:, 1].min())
         root_local = neutral[root_idx].copy()
         root_world = root_local.copy()
         root_world[0] = float(root_xz[0])
@@ -596,6 +944,68 @@ class ConstraintsMixin:
         rotations = np.repeat(yaw_rot[None, :, :], skeleton.nbjoints, axis=0)
         return positions.astype(np.float32), rotations.astype(np.float32)
 
+    def _straight_back_pose_from_motion(
+        self,
+        skeleton,
+        positions: np.ndarray,
+        rotations: np.ndarray,
+        heading: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Straighten the torso/head while preserving generated limb poses."""
+        names = skeleton.bone_order_names
+        root_idx = skeleton.root_idx
+        cleaned_rotations = np.asarray(rotations, dtype=np.float64).copy()
+
+        yaw = float(heading)
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        yaw_rot = np.array(
+            [
+                [cos_yaw, 0.0, sin_yaw],
+                [0.0, 1.0, 0.0],
+                [-sin_yaw, 0.0, cos_yaw],
+            ],
+            dtype=np.float64,
+        )
+
+        back_names = {
+            "Hips",
+            "Spine",
+            "Spine1",
+            "Spine2",
+            "Spine3",
+            "Chest",
+            "Neck",
+            "Neck1",
+            "Neck2",
+            "Head",
+            "HeadEnd",
+        }
+        for name in back_names:
+            if name in names:
+                cleaned_rotations[names.index(name)] = yaw_rot
+
+        device = skeleton.neutral_joints.device
+        dtype = skeleton.neutral_joints.dtype
+        global_rot_tensor = torch.as_tensor(cleaned_rotations, device=device, dtype=dtype)
+        local_rot_tensor = skeleton.global_rots_to_local_rots(global_rot_tensor)
+        root_position = torch.as_tensor(
+            np.asarray(positions, dtype=np.float64)[root_idx],
+            device=device,
+            dtype=dtype,
+        )[None]
+        solved_global, solved_positions, _ = skeleton.fk(local_rot_tensor[None], root_position)
+        grounded_positions, grounded_root = ground_motion_to_floor(
+            skeleton,
+            solved_positions[None],
+            root_position[None],
+        )
+        solved_global, solved_positions, _ = skeleton.fk(local_rot_tensor[None], grounded_root[0])
+        return (
+            solved_positions[0].detach().cpu().numpy().astype(np.float32),
+            solved_global[0].detach().cpu().numpy().astype(np.float32),
+        )
+
     def _lock_pick_motion_to_standing_arm_only(
         self,
         session,
@@ -606,10 +1016,16 @@ class ConstraintsMixin:
         target_palm_normals: np.ndarray | None = None,
         palm_normal_local: np.ndarray | None = None,
         target_hand_rotations: np.ndarray | None = None,
-    ) -> None:
+        grasp_frame: int | None = None,
+        lift_frame: int | None = None,
+        chest_frame: int | None = None,
+        object_position: np.ndarray | None = None,
+        correction_start_frame: int | None = None,
+        correction_attempts: int = 2,
+    ) -> float | None:
         """Freeze the whole body and solve only the selected arm to the pick path."""
         if session.joints_pos is None or session.joints_rot is None:
-            return
+            return None
         skeleton = session.motion_rep.skeleton
         generated_frames = int(session.joints_pos.shape[1])
         if generated_frames > len(hand_path):
@@ -617,9 +1033,20 @@ class ConstraintsMixin:
             hand_path = np.concatenate([np.asarray(hand_path, dtype=np.float32), tail], axis=0)
         total_frames = min(generated_frames, int(len(hand_path)))
         if total_frames <= 0:
-            return
+            return None
 
         shoulder_idx, elbow_idx, wrist_idx, hand_indices = self._arm_chain_indices(skeleton, side)
+        hand_label = "Left" if side == "left" else "Right"
+        middle_name = (
+            f"{hand_label}HandMiddleEnd"
+            if f"{hand_label}HandMiddleEnd" in skeleton.bone_order_names
+            else (
+                skeleton.left_hand_joint_names[-1]
+                if side == "left"
+                else skeleton.right_hand_joint_names[-1]
+            )
+        )
+        middle_idx = skeleton.bone_order_names.index(middle_name) if middle_name in skeleton.bone_order_names else wrist_idx
         positions = np.repeat(np.asarray(base_positions, dtype=np.float64)[None, ...], total_frames, axis=0)
         global_rotations = np.repeat(np.asarray(base_rotations, dtype=np.float64)[None, ...], total_frames, axis=0)
         base_upper = positions[0, elbow_idx] - positions[0, shoulder_idx]
@@ -699,12 +1126,68 @@ class ConstraintsMixin:
             if session.root_velocities is not None:
                 session.root_velocities[:, :total_frames] = 0.0
 
+        final_error = None
+        if grasp_frame is not None and object_position is not None:
+            grasp_idx = max(0, min(int(grasp_frame), total_frames - 1))
+            correction_start = (
+                max(0, min(int(correction_start_frame), grasp_idx))
+                if correction_start_frame is not None
+                else 0
+            )
+            correction_lift = (
+                max(grasp_idx, min(int(lift_frame), total_frames - 1))
+                if lift_frame is not None
+                else grasp_idx
+            )
+            correction_chest = (
+                max(correction_lift + 1, min(int(chest_frame), total_frames - 1))
+                if chest_frame is not None
+                else min(total_frames - 1, correction_lift + max(1, grasp_idx - correction_start))
+            )
+            solved_np = solved_positions.detach().cpu().numpy()
+            palm_at_grasp = 0.35 * solved_np[grasp_idx, wrist_idx] + 0.65 * solved_np[grasp_idx, middle_idx]
+            target_object = np.asarray(object_position, dtype=np.float64)
+            palm_correction = target_object - palm_at_grasp
+            final_error = float(np.linalg.norm(palm_correction))
+            if correction_attempts > 0 and final_error > 0.005:
+                corrected_path = np.asarray(hand_path, dtype=np.float32).copy()
+                for frame in range(correction_start, total_frames):
+                    if frame <= grasp_idx:
+                        alpha = (frame - correction_start) / max(float(grasp_idx - correction_start), 1.0)
+                    elif frame <= correction_lift:
+                        alpha = 1.0
+                    elif frame < correction_chest:
+                        alpha = 1.0 - (frame - correction_lift) / max(float(correction_chest - correction_lift), 1.0)
+                    else:
+                        alpha = 0.0
+                    alpha = max(0.0, min(1.0, alpha))
+                    alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+                    corrected_path[frame] += (palm_correction * alpha).astype(np.float32)
+                return self._lock_pick_motion_to_standing_arm_only(
+                    session,
+                    base_positions,
+                    base_rotations,
+                    corrected_path,
+                    side,
+                    target_palm_normals=target_palm_normals,
+                    palm_normal_local=palm_normal_local,
+                    target_hand_rotations=target_hand_rotations,
+                    grasp_frame=grasp_frame,
+                    lift_frame=lift_frame,
+                    chest_frame=chest_frame,
+                    object_position=object_position,
+                    correction_start_frame=correction_start_frame,
+                    correction_attempts=correction_attempts - 1,
+                )
+        return final_error
+
     def apply_rack_pick(
         self,
         client_id: int,
         rack_name: str,
         shelf_number: int,
         object_index: int,
+        hand_side: str | None = None,
     ):
         """Apply a constraints-only rack item pick from the current rack pose."""
         if not self.client_active(client_id):
@@ -743,6 +1226,7 @@ class ConstraintsMixin:
                 object_index,
                 total_frames=total_frames,
                 fps=fps,
+                hand_side=hand_side,
             )
         except Exception as e:
             client.add_notification(
@@ -750,6 +1234,15 @@ class ConstraintsMixin:
                 body=str(e),
                 color="red",
                 auto_close_seconds=5.0,
+            )
+            return
+
+        if not session.rack_pick_lock.acquire(blocking=False):
+            client.add_notification(
+                title="Rack pick already running",
+                body="Wait for the current pick motion to finish before starting another one.",
+                color="yellow",
+                auto_close_seconds=3.0,
             )
             return
 
@@ -762,9 +1255,13 @@ class ConstraintsMixin:
         client.flush()
 
         try:
-            base_frame_idx = min(max(0, session.frame_idx), session.max_frame_idx)
-            if base_frame_idx < session.max_frame_idx:
-                base_frame_idx = session.max_frame_idx
+            motion_last_frame = int(session.joints_pos.shape[1] - 1)
+            route_end_frame = (
+                int(session.task_end_frame_idx)
+                if session.task_end_frame_idx is not None
+                else session.max_frame_idx
+            )
+            base_frame_idx = min(max(0, route_end_frame), motion_last_frame, session.max_frame_idx)
             generated_positions = session.joints_pos[0, base_frame_idx].detach().cpu().numpy().astype(np.float32).copy()
             generated_rotations = session.joints_rot[0, base_frame_idx].detach().cpu().numpy().astype(np.float32).copy()
             skeleton = session.motion_rep.skeleton
@@ -779,8 +1276,24 @@ class ConstraintsMixin:
                     f"The current human is {rack_distance:.2f} m from the selected rack approach pose. "
                     "Generate the rack route first or select the rack where the human is standing."
                 )
-            base_positions = generated_positions
-            base_rotations = generated_rotations
+            generated_heading = float(
+                math.atan2(generated_rotations[root_idx, 0, 2], generated_rotations[root_idx, 2, 2])
+            )
+            upright_positions, upright_rotations = self._straight_back_pose_from_motion(
+                skeleton,
+                generated_positions,
+                generated_rotations,
+                generated_heading,
+            )
+            base_positions_t = torch.as_tensor(upright_positions, dtype=torch.float32)[None, None]
+            grounded_base_positions, _ = ground_motion_to_floor(
+                skeleton,
+                base_positions_t,
+            )
+            base_positions = grounded_base_positions[0, 0].cpu().numpy().astype(np.float32)
+            base_rotations = upright_rotations.astype(np.float32)
+            session.t3_base_route_positions = None
+            session.t3_base_route_headings = None
 
             session.playing = False
             session.play_once = False
@@ -795,7 +1308,7 @@ class ConstraintsMixin:
             init_root = base_positions[root_idx].copy()
             init_root[1] = 0.0
             session.init_global_translation = init_root.astype(np.float32)
-            session.init_first_heading_angle = float(pick.rack_facing_heading)
+            session.init_first_heading_angle = generated_heading
             if session.transform_gizmo is not None:
                 session.transform_gizmo.position = tuple(session.init_global_translation.tolist())
                 session.transform_gizmo.wxyz = viser.transforms.SO3.from_y_radians(
@@ -854,38 +1367,112 @@ class ConstraintsMixin:
                 base_palm_normal_world = -base_palm_normal_world
 
             first_frame, pregrasp_frame, grasp_frame, lift_frame, chest_frame = pick.frame_indices
-            diagonal_frame = min(max(pregrasp_frame + 1, int(round((pregrasp_frame + grasp_frame) * 0.5))), grasp_frame - 1)
+            diagonal_approach_frame = min(
+                max(pregrasp_frame + 1, int(round((pregrasp_frame + grasp_frame) * 0.5))),
+                grasp_frame - 1,
+            )
             last_frame = total_frames - 1
-            pregrasp_target = np.asarray(pick.pregrasp_position, dtype=np.float32) - palm_from_wrist
-            grasp_target = np.asarray(pick.grasp_position, dtype=np.float32) - palm_from_wrist
-            diagonal_target = 0.55 * pregrasp_target + 0.45 * grasp_target
-            diagonal_target[1] += 0.03
+            outward_normal = np.asarray(rack_outward_normal(pick.rack_name), dtype=np.float32)
+            right_lateral = base_positions[names.index("RightShoulder")] - base_positions[names.index("LeftShoulder")]
+            right_lateral[1] = 0.0
+            right_lateral = right_lateral / max(float(np.linalg.norm(right_lateral)), 1e-9)
+            active_lateral = right_lateral if pick.hand_side == "right" else -right_lateral
+            object_position = np.asarray(pick.object_position, dtype=np.float32)
+
+            grasp_clearance = 0.02
+            pregrasp_clearance = 0.14
+            diagonal_clearance = 0.07
+            lateral_clearance = 0.12
+            grasp_palm_target = object_position + grasp_clearance * outward_normal + np.array(
+                [0.0, -0.01, 0.0],
+                dtype=np.float32,
+            )
+            pregrasp_palm_target = (
+                object_position
+                + pregrasp_clearance * outward_normal
+                + lateral_clearance * active_lateral
+                + np.array([0.0, 0.05, 0.0], dtype=np.float32)
+            )
+            diagonal_palm_target = (
+                object_position
+                + diagonal_clearance * outward_normal
+                + 0.5 * lateral_clearance * active_lateral
+                + np.array([0.0, 0.025, 0.0], dtype=np.float32)
+            )
+            lift_palm_target = grasp_palm_target + np.array([0.0, 0.07, 0.0], dtype=np.float32)
+            chest_joint_name = "Chest" if "Chest" in names else "Spine3" if "Spine3" in names else names[root_idx]
+            chest_base = base_positions[names.index(chest_joint_name)]
+            shoulder_mid = 0.5 * (
+                base_positions[names.index("RightShoulder")]
+                + base_positions[names.index("LeftShoulder")]
+            )
+            chest_hold_y = max(float(chest_base[1] - 0.06), float(shoulder_mid[1] - 0.22), 0.95)
+            chest_target = (
+                chest_base
+                - 0.24 * outward_normal
+                + 0.18 * active_lateral
+                + np.array([0.0, chest_hold_y - float(chest_base[1]), 0.0], dtype=np.float32)
+            )
+            pregrasp_target = pregrasp_palm_target
+            grasp_target = grasp_palm_target
+            diagonal_target = diagonal_palm_target
+            lift_target = lift_palm_target
+            chest_wrist_target = chest_target
+
+            rack_center = np.asarray(RACK_MAP_POSITIONS[pick.rack_name], dtype=np.float32)
+            minimum_front_clearance = float(RACK_WIDTH_M / 2.0 + 0.045)
+            min_grasp_clearance = float(RACK_WIDTH_M / 2.0 - 0.055)
+            path_adjustment_cm = 0.0
+            approach_waypoint_clearance = float(
+                min(
+                    np.dot(pregrasp_target - rack_center, outward_normal),
+                    np.dot(diagonal_target - rack_center, outward_normal),
+                )
+            )
+            if approach_waypoint_clearance < minimum_front_clearance:
+                outward_shift = minimum_front_clearance - approach_waypoint_clearance + 0.01
+                pregrasp_target = pregrasp_target + outward_shift * outward_normal
+                diagonal_target = diagonal_target + outward_shift * outward_normal
+                path_adjustment_cm = max(path_adjustment_cm, outward_shift * 100.0)
+
+            grasp_waypoint_clearance = float(
+                min(
+                    np.dot(grasp_target - rack_center, outward_normal),
+                    np.dot(lift_target - rack_center, outward_normal),
+                )
+            )
+            if grasp_waypoint_clearance < min_grasp_clearance:
+                outward_shift = min_grasp_clearance - grasp_waypoint_clearance + 0.005
+                grasp_target = grasp_target + outward_shift * outward_normal
+                lift_target = lift_target + outward_shift * outward_normal
+                path_adjustment_cm = max(path_adjustment_cm, outward_shift * 100.0)
+
             hand_path = self._smooth_pick_path(
                 total_frames,
                 [
                     (first_frame, wrist_start),
                     (pregrasp_frame, pregrasp_target),
-                    (diagonal_frame, diagonal_target),
+                    (diagonal_approach_frame, diagonal_target),
                     (grasp_frame, grasp_target),
-                    (lift_frame, np.asarray(pick.lift_position, dtype=np.float32) - palm_from_wrist),
-                    (chest_frame, np.asarray(pick.chest_hold_position, dtype=np.float32) - palm_from_wrist),
-                    (last_frame, np.asarray(pick.chest_hold_position, dtype=np.float32) - palm_from_wrist),
+                    (lift_frame, lift_target),
+                    (chest_frame, chest_wrist_target),
+                    (last_frame, chest_wrist_target),
                 ],
             )
-            # For this hand rig the computed palm normal points out of the back
-            # side of the hand, so aim it upward to make the visible palm face
-            # the ground.
-            desired_palm_normal_world = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            front_clearance = (hand_path - rack_center[None, :]) @ outward_normal
+            approach_clearance_value = float(front_clearance[pregrasp_frame : diagonal_approach_frame + 1].min())
+            actual_grasp_clearance = float(front_clearance[grasp_frame : lift_frame + 1].min())
+
             target_palm_normals = self._smooth_pick_path(
                 total_frames,
                 [
                     (first_frame, base_palm_normal_world.astype(np.float32)),
-                    (pregrasp_frame, desired_palm_normal_world),
-                    (diagonal_frame, desired_palm_normal_world),
-                    (grasp_frame, desired_palm_normal_world),
-                    (lift_frame, desired_palm_normal_world),
-                    (chest_frame, desired_palm_normal_world),
-                    (last_frame, desired_palm_normal_world),
+                    (pregrasp_frame, base_palm_normal_world.astype(np.float32)),
+                    (diagonal_approach_frame, base_palm_normal_world.astype(np.float32)),
+                    (grasp_frame, base_palm_normal_world.astype(np.float32)),
+                    (lift_frame, base_palm_normal_world.astype(np.float32)),
+                    (chest_frame, base_palm_normal_world.astype(np.float32)),
+                    (last_frame, base_palm_normal_world.astype(np.float32)),
                 ],
             )
             target_palm_normals = target_palm_normals / np.maximum(
@@ -913,7 +1500,7 @@ class ConstraintsMixin:
                 f"**Active Prompt:** {RACK_PICK_CALM_PROMPT} + procedural pick"
             )
 
-            progress.body = "Applying procedural pick from the previous rack frame..."
+            progress.body = f"Applying procedural pick from Go To Rack end frame {base_frame_idx}..."
             client.flush()
             with session.motion_tensor_lock:
                 device = session.joints_pos.device
@@ -954,7 +1541,7 @@ class ConstraintsMixin:
                 session.max_frame_idx = total_frames - 1
                 session.task_generation_pending = False
             session.gui_elements.gui_frame_idx_input.max = session.max_frame_idx
-            self._lock_pick_motion_to_standing_arm_only(
+            palm_error = self._lock_pick_motion_to_standing_arm_only(
                 session,
                 base_positions,
                 base_rotations,
@@ -962,26 +1549,48 @@ class ConstraintsMixin:
                 pick.hand_side,
                 target_palm_normals=target_palm_normals,
                 palm_normal_local=palm_normal_local,
+                grasp_frame=grasp_frame,
+                lift_frame=lift_frame,
+                chest_frame=chest_frame,
+                object_position=np.asarray(pick.object_position, dtype=np.float32),
+                correction_start_frame=pregrasp_frame,
             )
             self.set_frame(client_id, 0)
 
             progress.title = "Rack pick applied"
+            palm_error_text = (
+                f" Palm grasp error {palm_error * 100.0:.1f} cm."
+                if palm_error is not None
+                else ""
+            )
+            path_adjustment_text = (
+                f" Auto clearance adjusted {path_adjustment_cm:.1f} cm."
+                if path_adjustment_cm > 0.0
+                else ""
+            )
             progress.body = (
                 f"{pick.hand_side.title()} hand: shelf {pick.shelf_number}, object {pick.object_index}; "
-                f"pregrasp frame {pregrasp_frame}, diagonal {diagonal_frame}, grasp {grasp_frame}, lift {lift_frame}, "
+                f"started from Go To Rack end frame {base_frame_idx}; "
+                f"pregrasp frame {pregrasp_frame}, diagonal approach {diagonal_approach_frame}, "
+                f"grasp {grasp_frame}, lift {lift_frame}, "
                 f"hold from {chest_frame}; {total_frames / fps:.1f}s auto duration. "
-                "Body, hips, waist, head, and feet are locked to the standing rack pose."
+                "Path uses pregrasp 14 cm out, diagonal 7 cm out, grasp 2 cm out, lift 7 cm. "
+                f"Clearance: approach {approach_clearance_value:.3f} m, grasp {actual_grasp_clearance:.3f} m. "
+                "Body, hips, waist, head, and feet are locked to the standing rack pose. "
+                f"{path_adjustment_text}"
+                f"{palm_error_text}"
             )
             progress.color = "green"
         except Exception as e:
             progress.title = "Rack pick failed"
             progress.body = str(e)
             progress.color = "red"
-            raise
+            print(f"[Rack Pick] Failed: {e}")
         finally:
             progress.loading = False
             progress.with_close_button = True
             progress.auto_close_seconds = 7.0
+            session.rack_pick_lock.release()
 
     def load_root_constraints(self, client_id: int, filepath: str = "root_constraints.json"):
         """Load root constraints from a JSON file."""
@@ -1284,6 +1893,8 @@ class ConstraintsMixin:
         session.task_end_frame_idx = None
         session.task_generation_pending = False
         session.task_reached_reported = False
+        session.t3_base_route_positions = None
+        session.t3_base_route_headings = None
 
         client.add_notification(
             title="Constraints cleared",

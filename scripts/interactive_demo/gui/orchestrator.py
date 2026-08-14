@@ -138,11 +138,13 @@ class GuiMixin:
 
             @environment_dropdown.on_update
             def _(event: viser.GuiEvent) -> None:
+                environment_label = str(environment_dropdown.value)
                 self.set_client_environment(
                     event.client,
-                    str(environment_dropdown.value),
+                    environment_label,
                     visible=bool(show_environment_checkbox.value),
                 )
+                self._set_rack_route_visible(g, environment_label)
 
             @show_environment_checkbox.on_update
             def _(_: viser.GuiEvent) -> None:

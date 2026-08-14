@@ -24,9 +24,22 @@ def _titlebar_logo_data_uri(filename: str) -> str:
 
 
 class ClientMixin:
+    def _clear_t3_preview_nodes(self, session) -> None:
+        if session.t3_live_retargeter is not None:
+            session.t3_live_retargeter.clear()
+            session.t3_live_retargeter = None
+        if session.t3_csv_player is not None:
+            session.t3_csv_player.clear()
+            session.t3_csv_player = None
+        session.t3_csv_player_generation = -1
+        session.t3_retarget_ready_generation = -1
+
     def on_client_connect(self, client: viser.ClientHandle) -> None:
         """Initialize GUI and state for each new client."""
         print(f"Client {client.client_id} connected")
+
+        for existing_session in list(self.client_sessions.values()):
+            self._clear_t3_preview_nodes(existing_session)
 
         self.setup_scene(client)
 
@@ -471,16 +484,24 @@ class ClientMixin:
             session = self.client_sessions[client_id]
             # Signal playback thread to stop
             session.stop_playback = True
+            if session.t3_hardware_stop_event is not None:
+                session.t3_hardware_stop_event.set()
             # Wait for thread to finish (with timeout)
             if session.playback_thread is not None and session.playback_thread.is_alive():
                 session.playback_thread.join(timeout=1.0)
                 print(f"Stopped playback thread for client {client_id}")
+            if session.t3_hardware_clock_thread is not None and session.t3_hardware_clock_thread.is_alive():
+                session.t3_hardware_clock_thread.join(timeout=1.0)
+                print(f"Stopped T3 hardware clock thread for client {client_id}")
+            self._clear_t3_preview_nodes(session)
             if session.t3_soma_worker_process is not None and session.t3_soma_worker_process.poll() is None:
                 session.t3_soma_worker_process.terminate()
                 try:
                     session.t3_soma_worker_process.wait(timeout=2.0)
                 except Exception:
                     session.t3_soma_worker_process.kill()
+            if session.t3_hardware_bridge is not None:
+                session.t3_hardware_bridge.disconnect()
             del self.client_sessions[client_id]
         if hasattr(self, "environment_scene_handles"):
             self.environment_scene_handles.pop(client_id, None)

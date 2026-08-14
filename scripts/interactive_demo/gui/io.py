@@ -337,11 +337,25 @@ class GuiIOMixin:
             if event.key == " ":
                 if not space_pressed[0]:
                     space_pressed[0] = True
+                    if (
+                        getattr(g, "gui_kimodo_pick_enabled_checkbox", None) is not None
+                        and g.gui_kimodo_pick_enabled_checkbox.value
+                        and getattr(g, "gui_kimodo_pick_spacebar_checkbox", None) is not None
+                        and g.gui_kimodo_pick_spacebar_checkbox.value
+                    ):
+                        threading.Thread(
+                            target=self._run_kimodo_pick_command_workflow,
+                            args=(client_id,),
+                            daemon=True,
+                        ).start()
+                        return
                     session.playing = not session.playing
                     session.play_once = session.playing and not session.realtime_mode
                     g.gui_play_pause_button.label = "Pause" if session.playing else "Play"
                     g.gui_next_frame_button.disabled = session.playing
                     g.gui_prev_frame_button.disabled = session.playing
+                    if not session.playing and hasattr(self, "_pause_t3_hardware_motion"):
+                        self._pause_t3_hardware_motion(client_id)
                 return
 
             # Handle arrow keys for timeline visualization (not for navigation)

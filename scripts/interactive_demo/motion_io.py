@@ -3,6 +3,8 @@
 
 """Part of InteractiveTimelineDemo (split for readability)."""
 
+import re
+
 from .common import *  # noqa: F401,F403
 
 
@@ -325,6 +327,50 @@ class MotionIOMixin:
 
         return {"motion": motion, "text": text}
 
+    def _parse_constraint_frame_indices(self, raw_value: str, motion_len: int) -> list[int]:
+        """Parse deterministic constraint frames from text or a Kimodo pick JSON path."""
+        raw_value = (raw_value or "").strip()
+        if not raw_value:
+            return []
+
+        frames: list[int] = []
+        if os.path.exists(raw_value) and raw_value.lower().endswith(".json"):
+            with open(raw_value, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            keyframes = data.get("keyframes", {})
+            preferred_order = ("start", "pregrasp", "grasp", "lift", "chest_hold", "end")
+            for name in preferred_order:
+                if name in keyframes:
+                    frames.append(int(keyframes[name]))
+            for value in keyframes.values():
+                frame_idx = int(value)
+                if frame_idx not in frames:
+                    frames.append(frame_idx)
+        else:
+            for token in re.split(r"[\s,]+", raw_value):
+                token = token.strip()
+                if not token:
+                    continue
+                if "=" in token:
+                    token = token.split("=", 1)[1].strip()
+                elif ":" in token:
+                    token = token.split(":", 1)[1].strip()
+                try:
+                    if token.lower() == "end":
+                        frames.append(motion_len - 1)
+                    else:
+                        frames.append(int(token))
+                except ValueError as exc:
+                    raise ValueError(
+                        "Constraint Frames must be comma-separated frame numbers, "
+                        "`label=number` entries, `end`, or a Kimodo pick_constraints JSON path."
+                    ) from exc
+
+        clamped = sorted(set(max(0, min(int(frame), motion_len - 1)) for frame in frames))
+        if len(clamped) != len(frames):
+            print(f"[Load Sequence] Using deterministic constraint frames: {clamped}")
+        return clamped
+
     def load_sequence(
         self,
         client_id: int,
@@ -466,6 +512,12 @@ class MotionIOMixin:
 
         # Get max keyframes from GUI
         max_keyframe_num = session.gui_elements.gui_max_keyframe_num.value
+        deterministic_keyframe_indices = self._parse_constraint_frame_indices(
+            getattr(session.gui_elements, "gui_constraint_frame_indices", None).value
+            if getattr(session.gui_elements, "gui_constraint_frame_indices", None) is not None
+            else "",
+            motion_len,
+        )
 
         # Determine sampling range based on continuation mode.
         # In continuation mode, don't sample constraints within the first 2 seconds
@@ -489,6 +541,8 @@ class MotionIOMixin:
 
         # Sample keyframe indices (common for all constraint types except trajectory)
         def sample_keyframe_indices():
+            if deterministic_keyframe_indices:
+                return list(deterministic_keyframe_indices)
             if len(available_indices) <= max_keyframe_num:
                 sampled = list(available_indices)
             else:
@@ -508,6 +562,7 @@ class MotionIOMixin:
         total_constraints = 0
         sampled_constraint_frames = []
         sequence_end_frame = frame_offset + motion_len - 1
+        playback_stop_frame = sequence_end_frame + 1
         for constraint_type in constraint_types:
             if constraint_type == "Full Body":
                 keyframe_indices = sample_keyframe_indices()
@@ -526,10 +581,12 @@ class MotionIOMixin:
                     self.add_keyframe_to_timeline(client_id, "Full-Body", timeline_frame_idx, constraint_id)
                 total_constraints += len(keyframe_indices)
 
-            elif constraint_type in ["Hands", "Feet", "Hands and Feet"]:
+            elif constraint_type in ["Hands", "Right Hand", "Left Hand", "Feet", "Hands and Feet"]:
                 # Map constraint type to joint list
                 joint_map = {
                     "Hands": [("LeftHand", "left-hand"), ("RightHand", "right-hand")],
+                    "Right Hand": [("RightHand", "right-hand")],
+                    "Left Hand": [("LeftHand", "left-hand")],
                     "Feet": [("LeftFoot", "left-foot"), ("RightFoot", "right-foot")],
                     "Hands and Feet": [
                         ("LeftHand", "left-hand"),
@@ -548,10 +605,23 @@ class MotionIOMixin:
                     sampled_constraint_frames.append(timeline_frame_idx)
                     for joint, ee_type in ee_joints:
                         constraint_id = f"ee_{joint}_sampled_{timeline_frame_idx}"
-                        joint_names = [
-                            joint,
-                            "Hips",
-                        ]  # Always include Hips for smoothed root
+                        hand_only_motion = (
+                            joint in {"LeftHand", "RightHand"}
+                            and getattr(session.gui_elements, "gui_constraint_hand_only_motion_checkbox", None)
+                            is not None
+                            and session.gui_elements.gui_constraint_hand_only_motion_checkbox.value
+                        )
+                        joint_names = [joint, "Hips"]
+                        if (
+                            joint in {"LeftHand", "RightHand"}
+                            and getattr(session.gui_elements, "gui_constraint_forearm_orientation_checkbox", None)
+                            is not None
+                            and session.gui_elements.gui_constraint_forearm_orientation_checkbox.value
+                        ):
+                            side_prefix = "Left" if joint.startswith("Left") else "Right"
+                            forearm_name = f"{side_prefix}ForeArm"
+                            if forearm_name in session.motion_rep.skeleton.bone_index:
+                                joint_names.insert(0, forearm_name)
                         constraint.add_keyframe(
                             keyframe_id=constraint_id,
                             frame_idx=timeline_frame_idx,
@@ -559,6 +629,7 @@ class MotionIOMixin:
                             joints_rot=joints_rot[seq_idx],
                             joint_names=joint_names,
                             end_effector_type=ee_type,
+                            constrain_root=not hand_only_motion,
                             exists_ok=True,
                         )
                         self.add_keyframe_to_timeline(
@@ -597,7 +668,10 @@ class MotionIOMixin:
 
             elif constraint_type == "2D Root Trajectory":
                 # Sample trajectory range
-                if continue_from_current and motion_len < min_offset + 1:
+                if deterministic_keyframe_indices:
+                    start_idx = deterministic_keyframe_indices[0]
+                    end_idx = deterministic_keyframe_indices[-1]
+                elif continue_from_current and motion_len < min_offset + 1:
                     start_idx = end_idx = motion_len - 1  # Degenerate trajectory
                     print(f"Continuous mode: trajectory too short, using last frame only")
                 else:
@@ -634,14 +708,16 @@ class MotionIOMixin:
                 total_constraints += 1
 
         if sampled_constraint_frames:
-            session.task_end_frame_idx = sequence_end_frame
+            session.task_end_frame_idx = playback_stop_frame
             session.task_generation_pending = True
             session.task_reached_reported = False
-            if not session.realtime_mode:
-                session.play_once = False
-                session.playing = False
-                session.gui_elements.gui_play_pause_button.label = "Play"
-                session.gui_elements.gui_enable_auto_replan_checkbox.value = False
+            session.realtime_mode = False
+            session.play_once = False
+            session.playing = False
+            session.gui_elements.gui_realtime_mode_checkbox.value = False
+            session.gui_elements.gui_play_pause_button.label = "Play"
+            session.gui_elements.gui_enable_auto_replan_checkbox.value = False
+            session.gui_elements.gui_enable_auto_replan_checkbox.disabled = True
             print(f"[Load Sequence] Task end frame set to {session.task_end_frame_idx}")
 
         # Notify user about added constraints
