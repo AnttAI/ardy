@@ -10,13 +10,28 @@ Use the `ardy` conda environment:
 conda activate ardy
 ```
 
-Newton is bundled locally in:
+Install Newton with RTX support into that environment:
 
-```text
-deps/newton/
+```bash
+python -m pip install --upgrade pip
+python -m pip install "newton[rtx]" --extra-index-url https://pypi.nvidia.com
 ```
 
-The run commands below add this local Newton copy to `PYTHONPATH`. RTX viewer dependencies must also be installed in the same environment. If RTX import fails, install/sync Newton with RTX support in your environment before running the viewer.
+Check that Newton and the RTX viewer import correctly:
+
+```bash
+python -c "import newton; import newton.viewer; print(newton.__version__)"
+```
+
+If you want to install Newton from source instead of PyPI:
+
+```bash
+git clone https://github.com/newton-physics/newton.git
+cd newton
+python -m pip install -e ".[rtx]" --extra-index-url https://pypi.nvidia.com
+```
+
+The `deps/` folder is local-only and does not need to be pushed. After installing Newton into the conda environment, the viewer only needs this project folder on `PYTHONPATH`.
 
 ## Run RTX Websocket Viewer
 
@@ -25,8 +40,8 @@ Use this command when you want the RTX websocket viewer without the lobby backgr
 ```bash
 ARDY_REPO_ROOT=/home/jony/Downloads/ardy/newton_rtx_viewer \
 PYTHONUNBUFFERED=1 \
-PYTHONPATH=/home/jony/Downloads/ardy/newton_rtx_viewer/deps/newton:/home/jony/Downloads/ardy/newton_rtx_viewer \
-WARP_CACHE_PATH=/home/jony/Downloads/ardy/newton_rtx_viewer/deps/newton_cache/warp \
+PYTHONPATH=/home/jony/Downloads/ardy/newton_rtx_viewer \
+WARP_CACHE_PATH=/home/jony/Downloads/ardy/newton_rtx_viewer/.cache/warp \
 conda run --no-capture-output -n soma-retargeter python /home/jony/Downloads/ardy/newton_rtx_viewer/viewer_process.py \
   --viewer rtx \
   --websocket-server \
@@ -44,8 +59,8 @@ Use this command when you want the lobby background loaded:
 ```bash
 ARDY_REPO_ROOT=/home/jony/Downloads/ardy/newton_rtx_viewer \
 PYTHONUNBUFFERED=1 \
-PYTHONPATH=/home/jony/Downloads/ardy/newton_rtx_viewer/deps/newton:/home/jony/Downloads/ardy/newton_rtx_viewer \
-WARP_CACHE_PATH=/home/jony/Downloads/ardy/newton_rtx_viewer/deps/newton_cache/warp \
+PYTHONPATH=/home/jony/Downloads/ardy/newton_rtx_viewer \
+WARP_CACHE_PATH=/home/jony/Downloads/ardy/newton_rtx_viewer/.cache/warp \
 conda run --no-capture-output -n soma-retargeter python /home/jony/Downloads/ardy/newton_rtx_viewer/viewer_process.py \
   --viewer rtx \
   --websocket-server \
@@ -63,8 +78,12 @@ conda run --no-capture-output -n soma-retargeter python /home/jony/Downloads/ard
 ```text
 viewer_process.py
 assets/
-deps/newton/
-deps/newton_cache/warp/
+run_rtx_viewer.sh
+```
+
+Optional local-only paths:
+
+```text
 deps/world_lobby_newton_bg.usda
 deps/Collected_World_Lobby/
 ```
