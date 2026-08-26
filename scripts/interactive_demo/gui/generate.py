@@ -915,6 +915,31 @@ class GuiGenerateMixin:
                 )
                 g.gui_root_turn_left_button = client.gui.add_button("Constrain Turn Left", color="purple")
                 g.gui_root_turn_right_button = client.gui.add_button("Constrain Turn Right", color="purple")
+                g.gui_forward_left_forward_first_cm = client.gui.add_number(
+                    "FLF First Forward cm",
+                    initial_value=270.0,
+                    min=1.0,
+                    max=1000.0,
+                    step=1.0,
+                )
+                g.gui_forward_left_forward_turn_degrees = client.gui.add_number(
+                    "FLF Left Turn deg",
+                    initial_value=90.0,
+                    min=1.0,
+                    max=360.0,
+                    step=1.0,
+                )
+                g.gui_forward_left_forward_second_cm = client.gui.add_number(
+                    "FLF Second Forward cm",
+                    initial_value=500.0,
+                    min=1.0,
+                    max=1000.0,
+                    step=1.0,
+                )
+                g.gui_forward_left_forward_button = client.gui.add_button(
+                    "Constrain Forward Left Forward",
+                    color="green",
+                )
 
                 @g.gui_one_meter_root_button.on_click
                 def _(event: viser.GuiEvent) -> None:
@@ -948,6 +973,15 @@ class GuiGenerateMixin:
                         float(g.gui_root_turn_degrees.value),
                         float(g.gui_root_turn_duration_s.value),
                         clockwise=True,
+                    )
+
+                @g.gui_forward_left_forward_button.on_click
+                def _(event: viser.GuiEvent) -> None:
+                    self.apply_forward_left_forward_constraint(
+                        event.client.client_id,
+                        float(g.gui_forward_left_forward_first_cm.value) / 100.0,
+                        float(g.gui_forward_left_forward_turn_degrees.value),
+                        float(g.gui_forward_left_forward_second_cm.value) / 100.0,
                     )
 
             with client.gui.add_folder("Target Velocity", expand_by_default=False):

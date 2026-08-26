@@ -63,6 +63,55 @@ class GuiVisualizeMixin:
                 step=1,
                 hint="Number of generated frames to send per accurate SOMA/Newton retarget packet",
             )
+            newton_websocket_initial = (
+                os.environ.get("ARDY_NEWTON_USE_WEBSOCKET", "1").strip().lower() in {"1", "true", "yes", "on"}
+            )
+            g.gui_viz_retarget_viewer_button = client.gui.add_button(
+                "Connect RTX",
+                hint="Connect to an independently launched Newton RTX viewer websocket server.",
+            )
+            g.gui_viz_retarget_viewer_status = client.gui.add_text(
+                "Newton Viewer",
+                initial_value="closed",
+                disabled=True,
+            )
+            g.gui_viz_newton_websocket_checkbox = client.gui.add_checkbox(
+                "Use Newton WebSocket",
+                initial_value=newton_websocket_initial,
+                hint="Stream frames to an independently launched Newton RTX viewer websocket server.",
+            )
+            g.gui_viz_newton_websocket_url = client.gui.add_text(
+                "Newton WebSocket URL",
+                initial_value=os.environ.get("ARDY_NEWTON_WEBSOCKET_URL", "ws://127.0.0.1:8765"),
+                hint="URL shown in the independent Newton RTX viewer WebSocket Control panel.",
+            )
+            g.gui_viz_file_bvh_path = client.gui.add_text(
+                "SOMA BVH Path",
+                initial_value=os.environ.get("ARDY_NEWTON_FILE_BVH_PATH", ""),
+                hint="SOMA BVH exported from ARDY to replay in the native Newton viewer",
+            )
+            g.gui_viz_file_csv_path = client.gui.add_text(
+                "T3 CSV Path",
+                initial_value=os.environ.get("ARDY_NEWTON_FILE_CSV_PATH", ""),
+                hint="T3 CSV generated from the same ARDY motion to replay on the robot",
+            )
+            g.gui_viz_file_csv_rtx_button = client.gui.add_button(
+                "Play CSV in RTX",
+                hint="Replay only the selected T3 CSV in the already-open RTX viewer",
+            )
+            g.gui_viz_file_bvh_rtx_button = client.gui.add_button(
+                "Play BVH in RTX",
+                hint="Replay only the selected SOMA BVH in the already-open RTX viewer",
+            )
+            g.gui_viz_file_both_rtx_button = client.gui.add_button(
+                "Play Both in RTX",
+                hint="Replay the selected SOMA BVH and T3 CSV together in the already-open RTX viewer",
+            )
+            g.gui_viz_file_viewer_status = client.gui.add_text(
+                "BVH/CSV Viewer",
+                initial_value="closed",
+                disabled=True,
+            )
             g.gui_viz_t3_offset = client.gui.add_vector3(
                 "T3 Offset",
                 initial_value=(0.0, 0.0, 0.0),
@@ -326,6 +375,50 @@ class GuiVisualizeMixin:
                     session.t3_retarget_pending_start_frame = None
                 if g.gui_viz_t3_robot_checkbox.value and g.gui_viz_t3_soma_retarget_checkbox.value:
                     self.request_soma_t3_retarget(client_id, force=True, start_frame=0)
+
+            @g.gui_viz_retarget_viewer_button.on_click
+            def _(_) -> None:
+                self.toggle_retarget_debug_viewer(client_id)
+
+            @g.gui_viz_newton_websocket_checkbox.on_update
+            def _(_) -> None:
+                if not self.client_active(client_id):
+                    return
+                session = self.client_sessions[client_id]
+                session.retarget_debug_websocket_enabled = bool(g.gui_viz_newton_websocket_checkbox.value)
+                if session.retarget_debug_viewer is not None:
+                    session.retarget_debug_viewer.clear()
+                    session.retarget_debug_viewer = None
+                session.retarget_debug_viewer_visible = False
+                g.gui_viz_retarget_viewer_button.label = "Connect RTX"
+                g.gui_viz_retarget_viewer_status.value = (
+                    "ready to connect" if session.retarget_debug_websocket_enabled else "websocket disabled"
+                )
+
+            @g.gui_viz_newton_websocket_url.on_update
+            def _(_) -> None:
+                if not self.client_active(client_id):
+                    return
+                session = self.client_sessions[client_id]
+                session.retarget_debug_websocket_url = str(g.gui_viz_newton_websocket_url.value).strip() or "ws://127.0.0.1:8765"
+                if session.retarget_debug_websocket_enabled and session.retarget_debug_viewer is not None:
+                    session.retarget_debug_viewer.clear()
+                    session.retarget_debug_viewer = None
+                    session.retarget_debug_viewer_visible = False
+                    g.gui_viz_retarget_viewer_button.label = "Connect RTX"
+                    g.gui_viz_retarget_viewer_status.value = "websocket URL changed"
+
+            @g.gui_viz_file_csv_rtx_button.on_click
+            def _(_) -> None:
+                self.play_files_in_retarget_viewer(client_id, mode="csv")
+
+            @g.gui_viz_file_bvh_rtx_button.on_click
+            def _(_) -> None:
+                self.play_files_in_retarget_viewer(client_id, mode="bvh")
+
+            @g.gui_viz_file_both_rtx_button.on_click
+            def _(_) -> None:
+                self.play_files_in_retarget_viewer(client_id, mode="both")
 
             @g.gui_viz_ref_motion_checkbox.on_update
             def _(_) -> None:

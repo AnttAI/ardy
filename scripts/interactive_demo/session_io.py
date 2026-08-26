@@ -176,6 +176,67 @@ class SessionIOMixin:
                 writer.writerow(out)
         return output_csv, len(merged_rows) - 1
 
+    def _write_full_soma_t3_stream_files(
+        self,
+        client_id: int,
+        generation: int,
+        local_rot_mats,
+        root_positions,
+        fps: float,
+        rows: list[dict],
+    ):
+        """Save one complete SOMA BVH + T3 CSV pair for RTX replay."""
+        import csv
+        from pathlib import Path
+
+        from ardy.exports.bvh import export_soma_bvh_from_arrays
+        from ardy.retarget_to_t3.embedded_soma_t3 import VENDORED_REFERENCE_BVH
+
+        full_root = Path(REPO_ROOT) / ".cache" / "t3_live" / "full"
+        full_root.mkdir(parents=True, exist_ok=True)
+        stem = f"client_{client_id}_gen_{generation}_full"
+        csv_path = full_root / f"{stem}.csv"
+        bvh_path = full_root / f"{stem}.soma.bvh"
+
+        export_soma_bvh_from_arrays(
+            local_rot_mats=local_rot_mats,
+            root_positions=root_positions,
+            fps=fps,
+            reference_bvh=VENDORED_REFERENCE_BVH,
+            output_bvh=bvh_path,
+        )
+
+        fieldnames: list[str] = []
+        for row in rows:
+            for key in row.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        if "Frame" in fieldnames:
+            fieldnames.remove("Frame")
+        fieldnames.insert(0, "Frame")
+
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for frame_idx, row in enumerate(rows):
+                out = {key: row.get(key, "") for key in fieldnames}
+                out["Frame"] = frame_idx
+                writer.writerow(out)
+
+        session = self.client_sessions[client_id]
+        session.t3_retarget_csv_path = str(csv_path)
+        gui = getattr(session, "gui_elements", None)
+        if gui is not None:
+            if getattr(gui, "gui_viz_file_csv_path", None) is not None:
+                gui.gui_viz_file_csv_path.value = str(csv_path)
+            if getattr(gui, "gui_viz_file_bvh_path", None) is not None:
+                gui.gui_viz_file_bvh_path.value = str(bvh_path)
+        print(
+            f"[T3 Live] Saved complete RTX replay pair: {csv_path} + {bvh_path} ({len(rows)} frames)",
+            flush=True,
+        )
+        return csv_path, bvh_path
+
     def _read_t3_csv_rows(self, csv_path):
         import csv
         from pathlib import Path
@@ -601,6 +662,16 @@ class SessionIOMixin:
                 pending_start_frame = session.t3_retarget_pending_start_frame
                 session.t3_retarget_pending_after_current = False
                 session.t3_retarget_pending_start_frame = None
+                full_rows = [dict(row) for row in session.t3_stream_rows if row]
+            if full_rows:
+                self._write_full_soma_t3_stream_files(
+                    client_id,
+                    generation,
+                    local_rot_mats[: len(full_rows)],
+                    root_positions[: len(full_rows)],
+                    fps,
+                    full_rows,
+                )
             print(
                 f"[T3 Live] Soma stream generation {generation} ready: "
                 f"frames 0-{merged_end_frame} in {time.time() - retarget_start_time:.2f}s"

@@ -240,6 +240,7 @@ VELOCITY_TRANSITION_DURATION = 2.0  # seconds - duration for velocity to smoothl
 START_DIRECTION_MARKER_LENGTH = 0.5
 KIMODO_PICK_MOTION_FILE_PATH = "/home/jony/Downloads/soma-retargeter/assets/motions/bvh/generated/kimodo_0eaccddc7f.bvh"
 KIMODO_PICK_CONSTRAINT_FRAMES = "0,20,38,52,64,84,end"
+SAY_HI_MOTION_FILE_PATH = "/home/jony/Downloads/soma-retargeter/assets/motions/bvh/generated/say hi.bvh"
 
 
 @dataclass
@@ -308,6 +309,10 @@ class GuiElements:
     gui_root_turn_duration_s: viser.GuiInputHandle[float]
     gui_root_turn_left_button: viser.GuiInputHandle
     gui_root_turn_right_button: viser.GuiInputHandle
+    gui_forward_left_forward_first_cm: viser.GuiInputHandle[float]
+    gui_forward_left_forward_turn_degrees: viser.GuiInputHandle[float]
+    gui_forward_left_forward_second_cm: viser.GuiInputHandle[float]
+    gui_forward_left_forward_button: viser.GuiInputHandle
     gui_root_file_path: viser.GuiInputHandle[str]
     gui_load_root_button: viser.GuiInputHandle
     gui_save_root_button: viser.GuiInputHandle
@@ -323,6 +328,7 @@ class GuiElements:
     gui_max_keyframe_num: viser.GuiInputHandle[int]
     gui_constraint_frame_indices: viser.GuiInputHandle[str]
     gui_motion_file_path: viser.GuiInputHandle[str]
+    gui_crop_motion_checkbox: viser.GuiInputHandle[bool]
     gui_constraint_fullbody_checkbox: viser.GuiInputHandle[bool]
     gui_constraint_hands_checkbox: viser.GuiInputHandle[bool]
     gui_constraint_forearm_orientation_checkbox: viser.GuiInputHandle[bool]
@@ -342,6 +348,16 @@ class GuiElements:
     gui_viz_t3_retarget_now_button: viser.GuiInputHandle
     gui_viz_t3_retarget_status: viser.GuiInputHandle[str]
     gui_viz_t3_packet_size: viser.GuiInputHandle[int]
+    gui_viz_retarget_viewer_button: viser.GuiInputHandle
+    gui_viz_retarget_viewer_status: viser.GuiInputHandle[str]
+    gui_viz_newton_websocket_checkbox: viser.GuiInputHandle[bool]
+    gui_viz_newton_websocket_url: viser.GuiInputHandle[str]
+    gui_viz_file_bvh_path: viser.GuiInputHandle[str]
+    gui_viz_file_csv_path: viser.GuiInputHandle[str]
+    gui_viz_file_csv_rtx_button: viser.GuiInputHandle
+    gui_viz_file_bvh_rtx_button: viser.GuiInputHandle
+    gui_viz_file_both_rtx_button: viser.GuiInputHandle
+    gui_viz_file_viewer_status: viser.GuiInputHandle[str]
     gui_viz_t3_offset: viser.GuiInputHandle[tuple[float, float, float]]
     gui_viz_t3_yaw_offset: viser.GuiInputHandle[float]
     gui_t3_hardware_enable_checkbox: viser.GuiInputHandle[bool]
@@ -432,6 +448,17 @@ class ClientSession:
     target_velocity_arrow: Optional[object] = None  # VelocityArrowMesh for target velocity visualization
     t3_live_retargeter: Optional[object] = None
     t3_csv_player: Optional[object] = None
+    retarget_debug_viewer: Optional[object] = None
+    retarget_debug_viewer_visible: bool = False
+    retarget_debug_viewer_backend: str = "gl"
+    retarget_debug_background_usd: Optional[str] = None
+    retarget_debug_camera_preset: str = "default"
+    retarget_debug_rtx_environment: str = "studio"
+    retarget_debug_newton_pythonpath: Optional[str] = None
+    retarget_debug_viewer_python: Optional[str] = None
+    retarget_debug_websocket_enabled: bool = False
+    retarget_debug_websocket_url: str = "ws://127.0.0.1:8765"
+    retarget_debug_disconnect_reported: bool = False
     t3_retarget_thread: Optional[threading.Thread] = None
     t3_retarget_lock: threading.Lock = field(default_factory=threading.Lock)
     t3_retarget_generation: int = 0
@@ -483,6 +510,9 @@ class ClientSession:
     task_end_frame_idx: Optional[int] = None
     task_generation_pending: bool = False
     task_reached_reported: bool = False
+    pending_say_hi_after_task: bool = False
+    pending_say_hi_root_position: Optional[np.ndarray] = None
+    pending_say_hi_heading: Optional[float] = None
     cur_time: float = -1.0
     playback_fps: int = 30
 

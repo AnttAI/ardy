@@ -8,7 +8,7 @@ import warp as wp
 
 class FacingDirectionType(IntEnum):
     """Enumeration of supported facing directions for source models."""
-    MAYA = auto(),
+    MAYA = auto()
     MUJOCO = auto()
 
 _FACING_DIRECTION_TYPE_TO_STR = {

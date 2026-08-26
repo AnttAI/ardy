@@ -91,6 +91,9 @@ class T3LiveRetargeter:
         self.joint_limits = self._read_joint_limits()
         self.cfg = np.zeros(len(self.joint_names), dtype=np.float64)
         self.base_tracker = T3BaseTracker()
+        self.newton_root_x_m = 0.0
+        self.newton_root_y_m = 0.0
+        self.newton_root_yaw_rad = 0.0
 
     def _read_joint_limits(self) -> dict[str, tuple[float, float]]:
         limits: dict[str, tuple[float, float]] = {}
@@ -178,6 +181,9 @@ class T3LiveRetargeter:
         base = self.base_tracker.update(root_pos[[0, 2]], waist_yaw, fps, root_velocity_xz_m_s=root_velocity_xz)
 
         self.root_frame.position = np.array([base.world_x_m, 0.0, base.world_z_m], dtype=np.float64) + offset
+        self.newton_root_x_m = float(base.x_m + offset[0])
+        self.newton_root_y_m = float(-(base.z_m + offset[2]))
+        self.newton_root_yaw_rad = float(base.yaw_rad + yaw_offset_rad)
         yaw_rot = Rotation.from_euler("y", base.yaw_rad + yaw_offset_rad)
         self.root_frame.wxyz = (yaw_rot * WHEEL_Z_UP_TO_SCENE_Y_UP).as_quat(scalar_first=True)
 
@@ -185,6 +191,17 @@ class T3LiveRetargeter:
         self._set_joint("right_wheel_joint", base.right_wheel_angle_rad)
         self._set_joint(T3_LIFT_JOINT, compute_t3_lift_extension(joints_pos, self.skeleton))
         return root_pos, base.yaw_rad + yaw_offset_rad
+
+    def newton_state_row(self) -> dict[str, float | list[str] | list[float]]:
+        return {
+            "root_x_m": self.newton_root_x_m,
+            "root_y_m": self.newton_root_y_m,
+            "root_yaw_rad": self.newton_root_yaw_rad,
+            "viser_root_position": np.asarray(self.root_frame.position, dtype=float).tolist(),
+            "viser_root_wxyz": np.asarray(self.root_frame.wxyz, dtype=float).tolist(),
+            "joint_names": list(self.joint_names),
+            "joint_cfg": self.cfg.astype(float).tolist(),
+        }
 
     def _stiffen_waist(self) -> None:
         self._set_joint("waist_yaw_joint", 0.0)
@@ -317,6 +334,7 @@ class T3LiveRetargeter:
                 csv_yaw_rad = float(t3_csv_row["root_yaw_rad"])
             else:
                 csv_yaw_rad = math.radians(float(t3_csv_row.get("root_rotateY", 0.0)))
+            self.newton_root_yaw_rad = float(csv_yaw_rad)
             yaw_rot = Rotation.from_euler("y", csv_yaw_rad)
             self.root_frame.wxyz = (yaw_rot * WHEEL_Z_UP_TO_SCENE_Y_UP).as_quat(scalar_first=True)
         self._stiffen_waist()

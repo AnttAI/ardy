@@ -22,6 +22,10 @@ from ardy.retarget_to_t3.embedded_soma_t3 import (  # noqa: E402
     SomaT3LiveUpperBodySolver,
     T3_LIFT_HEIGHT_OFFSET_M,
 )
+from ardy.retarget_to_t3.soma_bvh_converter import (  # noqa: E402
+    _append_lift_column_to_t3_csv,
+    _compute_bvh_lift_extensions,
+)
 
 
 DEFAULT_CONFIG = {
@@ -51,6 +55,12 @@ def _handle_retarget_bvh(payload: dict) -> dict:
         bvh_path,
         output_csv,
     )
+    lift_extensions = _compute_bvh_lift_extensions(
+        bvh_path,
+        source_facing_direction=config.get("retarget_source_facing_direction", DEFAULT_CONFIG["retarget_source_facing_direction"]),
+        lift_height_offset_m=T3_LIFT_HEIGHT_OFFSET_M,
+    )
+    _append_lift_column_to_t3_csv(output_csv, lift_extensions)
     return {
         "ok": True,
         "output_csv": str(output_csv),

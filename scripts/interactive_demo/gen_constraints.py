@@ -26,6 +26,7 @@ class GenConstraintsMixin:
 
         device = self.device
         dense_root_pos_2d = None
+        dense_root_frame_to_pos_2d = None
 
         model_constraints = []
         for track_name in ["2D Root", "Full-Body", "End-Effectors"]:
@@ -65,13 +66,21 @@ class GenConstraintsMixin:
                 # get the full 2d root for other tracks
                 if session.constraints["2D Root"].dense_path:
                     dense_root_pos_2d = _to_device_tensor(constraint_info["root_pos"][:, [0, 2]], device)
+                    dense_root_frame_to_pos_2d = {
+                        int(frame): dense_root_pos_2d[idx]
+                        for idx, frame in enumerate(constraint_info["frame_idx"])
+                    }
             elif track_name == "Full-Body":
                 constraint_joints_pos = _to_device_tensor(constraint_info["joints_pos"][valid_idx], device)
                 constraint_joints_rot = _to_device_tensor(constraint_info["joints_rot"][valid_idx], device)
 
                 root_pos_2d = None
-                if dense_root_pos_2d is not None:
-                    root_pos_2d = dense_root_pos_2d[frame_indices]
+                if dense_root_frame_to_pos_2d is not None:
+                    if all(int(frame) in dense_root_frame_to_pos_2d for frame in valid_frame_idx):
+                        root_pos_2d = torch.stack(
+                            [dense_root_frame_to_pos_2d[int(frame)] for frame in valid_frame_idx],
+                            dim=0,
+                        )
 
                 model_constraints.append(
                     FullBodyConstraintSet(
@@ -100,8 +109,10 @@ class GenConstraintsMixin:
                 for idx, joint_names in enumerate(joint_names_lst):
                     frame_indices_el = frame_indices[idx : idx + 1]
                     root_pos_2d = None
-                    if dense_root_pos_2d is not None:
-                        root_pos_2d = dense_root_pos_2d[frame_indices_el]
+                    if dense_root_frame_to_pos_2d is not None:
+                        frame_el = int(frame_indices_el[0])
+                        if frame_el in dense_root_frame_to_pos_2d:
+                            root_pos_2d = dense_root_frame_to_pos_2d[frame_el].unsqueeze(0)
 
                     model_constraints.append(
                         EndEffectorConstraintSet(

@@ -117,6 +117,8 @@ class EmbeddingCache:
         ``encoder`` is called at most once, batched over every miss.
         """
         if not texts:
+            if encoder is None:
+                return torch.empty(0), []
             # Preserve whatever the wrapped encoder does with an empty
             # batch instead of inventing our own (kimodo's equivalent path
             # calls the shape-less ``torch.empty()``, which raises).
@@ -141,6 +143,12 @@ class EmbeddingCache:
                     misses.append((idx, key))
 
         if misses:
+            if encoder is None:
+                missing_texts = [texts[idx] for idx, _key in misses]
+                raise RuntimeError(
+                    "Text encoder is disabled and cached embeddings were not found for: "
+                    + ", ".join(repr(text) for text in missing_texts)
+                )
             miss_texts = [texts[idx] for idx, _key in misses]
             # Encoding runs outside the lock: it's the slow part (network
             # round-trip or GPU forward pass) and unrelated cache lookups
@@ -211,10 +219,16 @@ class CachedTextEncoder:
         encoder,
         cache_dir: str = DEFAULT_CACHE_DIR,
         max_mem_entries: int = DEFAULT_MAX_MEM_ENTRIES,
+        device=None,
+        dtype=None,
     ) -> None:
         self.encoder = encoder
         self.cache = EmbeddingCache(cache_dir=cache_dir, max_mem_entries=max_mem_entries)
-        self._device, self._dtype = _probe_device_dtype(encoder)
+        if encoder is None:
+            self._device = device or torch.device("cpu")
+            self._dtype = dtype or torch.float32
+        else:
+            self._device, self._dtype = _probe_device_dtype(encoder)
 
     def __call__(self, texts):
         texts = _normalize_texts(texts)

@@ -447,3 +447,78 @@ def export_soma_bvh_from_arrays(
             ]
         )
     )
+
+
+def export_core_bvh_from_arrays(local_rot_mats: np.ndarray, root_positions: np.ndarray, fps: float, output_bvh: Path) -> None:
+    """Export ARDY CoreSkeleton27 arrays as a simple BVH for debugging/archival use."""
+    if local_rot_mats.shape[1] != len(CSKEL27_JOINTS):
+        raise ValueError(f"Expected {len(CSKEL27_JOINTS)} source joints, got {local_rot_mats.shape[1]}")
+    try:
+        from ardy.skeleton import CoreSkeleton27
+
+        skeleton = CoreSkeleton27(load=True)
+        neutral = skeleton.neutral_joints.detach().cpu().numpy()
+    except Exception:
+        neutral = np.zeros((len(CSKEL27_JOINTS), 3), dtype=np.float32)
+
+    children: dict[int, list[int]] = {idx: [] for idx in range(len(CSKEL27_JOINTS))}
+    root_idx = 0
+    for idx, parent in enumerate(CORE27_PARENTS):
+        if parent < 0:
+            root_idx = idx
+        else:
+            children[int(parent)].append(idx)
+
+    lines: list[str] = ["HIERARCHY"]
+
+    def add_joint(joint_idx: int, indent: int) -> None:
+        prefix = "\t" * indent
+        name = CSKEL27_JOINTS[joint_idx]
+        lines.append(f"{prefix}{'ROOT' if CORE27_PARENTS[joint_idx] < 0 else 'JOINT'} {name}")
+        lines.append(f"{prefix}{{")
+        if CORE27_PARENTS[joint_idx] < 0:
+            offset = np.zeros(3, dtype=np.float32)
+            lines.append(f"{prefix}\tOFFSET {offset[0]:.6f} {offset[1]:.6f} {offset[2]:.6f}")
+            lines.append(f"{prefix}\tCHANNELS 6 Xposition Yposition Zposition Zrotation Yrotation Xrotation")
+        else:
+            offset = (neutral[joint_idx] - neutral[int(CORE27_PARENTS[joint_idx])]) * 100.0
+            lines.append(f"{prefix}\tOFFSET {offset[0]:.6f} {offset[1]:.6f} {offset[2]:.6f}")
+            lines.append(f"{prefix}\tCHANNELS 3 Zrotation Yrotation Xrotation")
+        if children[joint_idx]:
+            for child_idx in children[joint_idx]:
+                add_joint(child_idx, indent + 1)
+        else:
+            lines.append(f"{prefix}\tEnd Site")
+            lines.append(f"{prefix}\t{{")
+            lines.append(f"{prefix}\t\tOFFSET 0.000000 0.000000 0.000000")
+            lines.append(f"{prefix}\t}}")
+        lines.append(f"{prefix}}}")
+
+    add_joint(root_idx, 0)
+    eulers = matrix_to_zyx_degrees(local_rot_mats)
+    root_cm = root_positions * 100.0
+    frames = []
+    for frame_idx in range(local_rot_mats.shape[0]):
+        values: list[float] = []
+        for joint_idx in range(len(CSKEL27_JOINTS)):
+            rot = eulers[frame_idx, joint_idx]
+            if joint_idx == root_idx:
+                pos = root_cm[frame_idx]
+                values.extend([pos[0], pos[1], pos[2], rot[0], rot[1], rot[2]])
+            else:
+                values.extend([rot[0], rot[1], rot[2]])
+        frames.append(" ".join(f"{value:.6f}" for value in values))
+
+    output_bvh.parent.mkdir(parents=True, exist_ok=True)
+    output_bvh.write_text(
+        "\n".join(
+            [
+                *lines,
+                "MOTION",
+                f"Frames: {local_rot_mats.shape[0]}",
+                f"Frame Time: {1.0 / fps:.6f}",
+                *frames,
+                "",
+            ]
+        )
+    )

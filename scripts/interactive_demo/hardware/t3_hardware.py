@@ -33,6 +33,43 @@ class T3HardwareMixin:
         self._ensure_t3_hardware_log_path(session)
         return Path(session.t3_hardware_csv_log_path)
 
+    def _export_t3_hardware_bvh_sidecars(self, session) -> tuple[Path, Path] | None:
+        if session.motion_tensor is None or session.motion_rep is None:
+            return None
+        self._ensure_t3_hardware_log_path(session)
+        csv_path = Path(session.t3_hardware_csv_log_path)
+        soma_bvh_path = csv_path.with_suffix(".soma.bvh")
+        core_bvh_path = csv_path.with_suffix(".core.bvh")
+        try:
+            from ardy.exports.bvh import export_core_bvh_from_arrays, export_soma_bvh_from_arrays
+            from ardy.retarget_to_t3.embedded_soma_t3 import VENDORED_REFERENCE_BVH
+
+            with torch.no_grad():
+                tensor_unnorm = session.motion_rep.unnormalize(session.motion_tensor)
+                inverse_output = session.motion_rep.inverse(tensor_unnorm, is_normalized=False)
+                local_rot_mats = inverse_output["local_rot_mats"][0].detach().cpu().numpy()
+                root_positions = inverse_output["root_positions"][0].detach().cpu().numpy()
+            export_soma_bvh_from_arrays(
+                local_rot_mats=local_rot_mats,
+                root_positions=root_positions,
+                fps=session.model_fps,
+                reference_bvh=VENDORED_REFERENCE_BVH,
+                output_bvh=soma_bvh_path,
+            )
+            export_core_bvh_from_arrays(
+                local_rot_mats=local_rot_mats,
+                root_positions=root_positions,
+                fps=session.model_fps,
+                output_bvh=core_bvh_path,
+            )
+            return soma_bvh_path, core_bvh_path
+        except Exception as exc:
+            print(f"[T3 Hardware] Failed to export BVH sidecars: {exc}")
+            import traceback
+
+            traceback.print_exc()
+            return None
+
     def _append_t3_hardware_log(
         self,
         session,
@@ -1123,6 +1160,7 @@ class T3HardwareMixin:
             self._build_current_t3_hardware_payload(client_id, mode, frame_idx=0, emit_lift=False)
             session.t3_hardware_stop_event = threading.Event()
             session.t3_hardware_clock_active = True
+            sidecars = self._export_t3_hardware_bvh_sidecars(session)
             session.playing = True
             session.play_once = session.playing and not session.realtime_mode
             session.gui_elements.gui_play_pause_button.label = "Pause"
@@ -1136,7 +1174,11 @@ class T3HardwareMixin:
             session.t3_hardware_clock_thread.start()
             event.client.add_notification(
                 title=f"T3 {mode} stream started",
-                body="Hardware is running on a dedicated sequential frame clock.",
+                body=(
+                    "Hardware is running on a dedicated sequential frame clock."
+                    if sidecars is None
+                    else f"Hardware clock started. BVHs saved: {sidecars[0].name}, {sidecars[1].name}."
+                ),
                 color="green",
                 auto_close_seconds=3.0,
             )

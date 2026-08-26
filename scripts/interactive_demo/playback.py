@@ -4,9 +4,221 @@
 """Part of InteractiveTimelineDemo (split for readability)."""
 
 from .common import *  # noqa: F401,F403
+from .retarget_viewer import RetargetViewerPose, SomaT3RetargetViewer
 
 
 class PlaybackMixin:
+    def play_files_in_retarget_viewer(self, client_id: int, mode: str) -> None:
+        if not self.client_active(client_id):
+            return
+        session = self.client_sessions[client_id]
+        gui = session.gui_elements
+        try:
+            mode = mode.lower()
+            if mode not in {"csv", "bvh", "both"}:
+                raise ValueError(f"Unsupported file playback mode: {mode}")
+            session.playing = False
+            session.play_once = False
+            if getattr(gui, "gui_play_pause_button", None) is not None:
+                gui.gui_play_pause_button.label = "Play"
+            session.retarget_debug_websocket_enabled = True
+            if getattr(gui, "gui_viz_newton_websocket_checkbox", None) is not None:
+                gui.gui_viz_newton_websocket_checkbox.value = True
+            session.retarget_debug_viewer_visible = True
+            gui.gui_viz_retarget_viewer_button.label = "Disconnect RTX"
+            gui.gui_viz_retarget_viewer_status.value = "connecting websocket"
+            if (
+                session.retarget_debug_viewer is not None
+                and not session.retarget_debug_websocket_enabled
+                and getattr(session.retarget_debug_viewer, "viewer_backend", "gl") != "rtx"
+            ):
+                session.retarget_debug_viewer.clear()
+                session.retarget_debug_viewer = None
+            if session.retarget_debug_viewer is None:
+                character = session.characters.get(0) or next(iter(session.characters.values()), None)
+                if session.soma_live_mapper is None and character is not None:
+                    from ardy.retarget_to_t3.soma_debug import SomaLivePoseMapper
+
+                    session.soma_live_mapper = SomaLivePoseMapper(character.skeleton)
+                if character is None:
+                    soma_skeleton = SOMASkeleton77(load=True)
+                    core_skeleton = soma_skeleton
+                else:
+                    soma_skeleton = session.soma_live_mapper.soma_skeleton
+                    core_skeleton = character.skeleton
+                session.retarget_debug_viewer = SomaT3RetargetViewer(
+                    session.client,
+                    client_id,
+                    core_skeleton,
+                    soma_skeleton,
+                    viewer_backend="rtx" if not session.retarget_debug_websocket_enabled else session.retarget_debug_viewer_backend,
+                    background_usd=session.retarget_debug_background_usd,
+                    camera_preset=session.retarget_debug_camera_preset,
+                    rtx_environment=session.retarget_debug_rtx_environment,
+                    newton_pythonpath=session.retarget_debug_newton_pythonpath,
+                    viewer_python=session.retarget_debug_viewer_python,
+                    websocket_enabled=session.retarget_debug_websocket_enabled,
+                    websocket_url=session.retarget_debug_websocket_url,
+                )
+            status = session.retarget_debug_viewer.play_files(
+                bvh_path=gui.gui_viz_file_bvh_path.value,
+                csv_path=gui.gui_viz_file_csv_path.value,
+                mode=mode,
+            )
+            gui.gui_viz_file_viewer_status.value = status
+            if "failed" in status or "not available" in status or "Set the" in status:
+                raise RuntimeError(status)
+            session.client.add_notification(
+                title=f"RTX {mode.upper()} playback started",
+                body=(
+                    "Streaming into the independent RTX viewer websocket."
+                    if session.retarget_debug_websocket_enabled
+                    else "Streaming into the existing RTX viewer window."
+                ),
+                auto_close_seconds=3.0,
+                color="green",
+            )
+        except Exception as exc:
+            gui.gui_viz_file_viewer_status.value = str(exc)
+            session.client.add_notification(
+                title="RTX file playback failed",
+                body=str(exc),
+                auto_close_seconds=6.0,
+                color="red",
+            )
+
+    def toggle_retarget_debug_viewer(self, client_id: int) -> None:
+        if not self.client_active(client_id):
+            return
+        session = self.client_sessions[client_id]
+        gui = session.gui_elements
+        session.retarget_debug_websocket_enabled = True
+        if getattr(gui, "gui_viz_newton_websocket_checkbox", None) is not None:
+            gui.gui_viz_newton_websocket_checkbox.value = True
+        opening = not bool(session.retarget_debug_viewer_visible)
+        session.retarget_debug_viewer_visible = opening
+        if opening:
+            session.retarget_debug_disconnect_reported = False
+        gui.gui_viz_retarget_viewer_button.label = "Disconnect RTX" if opening else "Connect RTX"
+        gui.gui_viz_retarget_viewer_status.value = "connecting websocket" if opening else "disconnected"
+
+        if not opening:
+            if session.retarget_debug_viewer is not None:
+                session.retarget_debug_viewer.set_visible(False)
+            return
+
+        if hasattr(self, "warm_live_soma_t3_solver"):
+            self.warm_live_soma_t3_solver(client_id)
+        self.set_frame(client_id, session.frame_idx)
+        if session.retarget_debug_viewer is not None:
+            gui.gui_viz_retarget_viewer_status.value = "connecting websocket"
+        session.client.add_notification(
+            title="Newton RTX connected",
+            body="Streaming to the independently launched Newton RTX viewer.",
+            auto_close_seconds=3.0,
+            color="blue",
+        )
+
+    def _update_retarget_debug_viewer(
+        self,
+        client_id: int,
+        character,
+        frame_idx: int,
+        soma_joints_pos,
+        soma_joints_rot,
+        effective_fps: float,
+        root_velocity,
+        t3_state_row=None,
+    ) -> None:
+        if not self.client_active(client_id):
+            return
+        session = self.client_sessions[client_id]
+        if not session.retarget_debug_viewer_visible or soma_joints_pos is None or soma_joints_rot is None:
+            return
+
+        if session.retarget_debug_viewer is None:
+            if session.soma_live_mapper is None:
+                return
+            session.retarget_debug_viewer = SomaT3RetargetViewer(
+                session.client,
+                client_id,
+                character.skeleton,
+                session.soma_live_mapper.soma_skeleton,
+                viewer_backend=session.retarget_debug_viewer_backend,
+                background_usd=session.retarget_debug_background_usd,
+                camera_preset=session.retarget_debug_camera_preset,
+                rtx_environment=session.retarget_debug_rtx_environment,
+                newton_pythonpath=session.retarget_debug_newton_pythonpath,
+                viewer_python=session.retarget_debug_viewer_python,
+                websocket_enabled=session.retarget_debug_websocket_enabled,
+                websocket_url=session.retarget_debug_websocket_url,
+            )
+            session.retarget_debug_viewer.open()
+            session.client.add_notification(
+                title="Newton viewer ready",
+                body=(
+                    "Live SOMA/Newton frames are streaming to the independent Newton websocket viewer."
+                    if session.retarget_debug_websocket_enabled
+                    else "Live SOMA/Newton frames are streaming to the Newton mesh viewer."
+                ),
+                auto_close_seconds=3.0,
+                color="green",
+            )
+
+        live_row = None
+        if t3_state_row is None and hasattr(self, "solve_live_soma_mesh_t3_frame"):
+            live_row = self.solve_live_soma_mesh_t3_frame(
+                client_id,
+                frame_idx,
+                soma_joints_pos,
+                soma_joints_rot,
+                session.soma_live_mapper.soma_skeleton,
+            )
+        status = session.retarget_debug_viewer.update(
+            RetargetViewerPose(
+                soma_joints_pos=soma_joints_pos,
+                soma_joints_rot=soma_joints_rot,
+                core_joints_pos=session.joints_pos[0, frame_idx],
+                core_joints_rot=session.joints_rot[0, frame_idx],
+                t3_row=live_row,
+                t3_state_row=t3_state_row,
+                root_velocity=root_velocity,
+                soma_offset=session.gui_elements.gui_viz_soma_mesh_offset.value,
+                fps=effective_fps,
+                frame_idx=frame_idx,
+                accurate_ready_until=frame_idx if live_row is not None else -1,
+            )
+        )
+        if session.retarget_debug_websocket_enabled:
+            status_lower = str(status).lower()
+            connected = (
+                "websocket connected" in status_lower
+                or status_lower.startswith("live newton frame")
+                or status_lower.startswith("warming live")
+            )
+            disconnected = (
+                "websocket disconnected" in status_lower
+                or "websocket unavailable" in status_lower
+                or "websocket connect failed" in status_lower
+                or "websocket not available" in status_lower
+            )
+            if connected:
+                session.retarget_debug_disconnect_reported = False
+                if session.retarget_debug_viewer_visible:
+                    session.gui_elements.gui_viz_retarget_viewer_button.label = "Disconnect RTX"
+            elif disconnected:
+                session.retarget_debug_viewer_visible = False
+                session.gui_elements.gui_viz_retarget_viewer_button.label = "Connect RTX"
+                if not session.retarget_debug_disconnect_reported:
+                    session.client.add_notification(
+                        title="Newton RTX disconnected",
+                        body=str(status),
+                        auto_close_seconds=6.0,
+                        color="red",
+                    )
+                    session.retarget_debug_disconnect_reported = True
+        session.gui_elements.gui_viz_retarget_viewer_status.value = status
+
     def run_client_playback(self, client_id: int):
         """Playback loop for a specific client."""
         print(f"Starting playback loop for client {client_id}")
@@ -20,6 +232,13 @@ class PlaybackMixin:
                 break
 
             session = self.client_sessions[client_id]
+            if (
+                getattr(session, "retarget_debug_viewer", None) is not None
+                and getattr(session.gui_elements, "gui_viz_file_viewer_status", None) is not None
+            ):
+                status = getattr(session.retarget_debug_viewer, "file_playback_status", "")
+                if status and status != "idle":
+                    session.gui_elements.gui_viz_file_viewer_status.value = status
             if session.stop_playback:
                 print(f"Stop signal received for client {client_id}")
                 break
@@ -95,7 +314,10 @@ class PlaybackMixin:
                                 session.frame_idx >= session.max_frame_idx
                             )
                             session.gui_elements.gui_prev_frame_button.disabled = session.frame_idx <= 0
-                            if session.task_end_frame_idx is not None:
+                            followup_started = False
+                            if hasattr(self, "_apply_pending_say_hi_after_task"):
+                                followup_started = self._apply_pending_say_hi_after_task(client_id)
+                            if session.task_end_frame_idx is not None and not followup_started:
                                 session.client.add_notification(
                                     title="Task motion complete",
                                     body=f"Reached frame {session.task_end_frame_idx}.",
@@ -275,6 +497,7 @@ class PlaybackMixin:
                                 and session.gui_elements.gui_viz_t3_soma_retarget_checkbox.value
                                 and session.gui_elements.gui_viz_t3_robot_checkbox.value
                             )
+                            or session.retarget_debug_viewer_visible
                         )
                     ):
                         try:
@@ -313,6 +536,16 @@ class PlaybackMixin:
                                 session.soma_debug_character.set_pose(
                                     soma_joints_pos + soma_offset,
                                     soma_joints_rot,
+                                )
+                            if not session.gui_elements.gui_viz_t3_robot_checkbox.value:
+                                self._update_retarget_debug_viewer(
+                                    client_id,
+                                    character,
+                                    frame_idx,
+                                    soma_joints_pos,
+                                    soma_joints_rot,
+                                    effective_fps,
+                                    display_root_velocity,
                                 )
                         except Exception as e:
                             self._set_soma_t3_status(client_id, "SOMA live mesh failed")
@@ -417,6 +650,16 @@ class PlaybackMixin:
                                     yaw_offset_deg=session.gui_elements.gui_viz_t3_yaw_offset.value,
                                     root_velocity=display_root_velocity,
                                 )
+                                self._update_retarget_debug_viewer(
+                                    client_id,
+                                    character,
+                                    frame_idx,
+                                    soma_joints_pos,
+                                    soma_joints_rot,
+                                    effective_fps,
+                                    display_root_velocity,
+                                    t3_state_row=session.t3_live_retargeter.newton_state_row(),
+                                )
                             else:
                                 ready_until = (
                                     max(len(session.t3_stream_rows) - 1, int(session.t3_retarget_csv_end_frame))
@@ -448,6 +691,16 @@ class PlaybackMixin:
                                     client_id,
                                     f"previewing mesh IK for frame {frame_idx}; accurate ready to {ready_until}",
                                 )
+                                self._update_retarget_debug_viewer(
+                                    client_id,
+                                    character,
+                                    frame_idx,
+                                    soma_joints_pos,
+                                    soma_joints_rot,
+                                    effective_fps,
+                                    display_root_velocity,
+                                    t3_state_row=session.t3_live_retargeter.newton_state_row(),
+                                )
                             continue
                         if session.t3_csv_player is not None:
                             session.t3_csv_player.set_visible(False)
@@ -474,6 +727,16 @@ class PlaybackMixin:
                             offset=session.gui_elements.gui_viz_t3_offset.value,
                             yaw_offset_deg=session.gui_elements.gui_viz_t3_yaw_offset.value,
                             root_velocity=display_root_velocity,
+                        )
+                        self._update_retarget_debug_viewer(
+                            client_id,
+                            character,
+                            frame_idx,
+                            soma_joints_pos,
+                            soma_joints_rot,
+                            effective_fps,
+                            display_root_velocity,
+                            t3_state_row=session.t3_live_retargeter.newton_state_row(),
                         )
 
         # Update reference motion character

@@ -18,6 +18,190 @@ EE_JOINT_TO_TYPE = {
 
 
 class ConstraintsMixin:
+    def _load_cached_say_hi_motion(self, session):
+        """Load the cached say-hi BVH parse and return normalized motion features."""
+        skeleton_name = type(session.motion_rep.skeleton).__name__
+        patterns = [
+            os.path.join(REPO_ROOT, ".cache", "motion", f"say hi_{skeleton_name}_*.pt"),
+            os.path.join(REPO_ROOT, "datasets", "bones-seed", "cache", f"say hi_{skeleton_name}_*.pt"),
+        ]
+        cache_paths = []
+        for pattern in patterns:
+            cache_paths.extend(sorted(glob.glob(pattern)))
+        if not cache_paths:
+            return None, None
+
+        cached = torch.load(cache_paths[0], weights_only=True)
+        if "local_rot_mats" not in cached or "root_trans" not in cached:
+            return None, cache_paths[0]
+
+        motion_rep = session.motion_rep
+        device = (
+            next(iter(motion_rep.skeleton.buffers())).device
+            if list(motion_rep.skeleton.buffers())
+            else self.device
+        )
+        local_rot_mats = cached["local_rot_mats"].to(device=device, dtype=torch.float32).unsqueeze(0)
+        root_trans = cached["root_trans"].to(device=device, dtype=torch.float32).unsqueeze(0)
+        feats = motion_rep(local_rot_mats, root_trans, to_normalize=False)
+        rotated = motion_rep.rotate_to(feats, torch.tensor(0.0, device=device))
+        root_pos = rotated[:, :, motion_rep.slice_dict["root_pos"]]
+        first_2d = root_pos[:, 0, [0, 2]].clone()
+        canonical = motion_rep.translate_2d(rotated, -first_2d)
+        return motion_rep.normalize(canonical).squeeze(0), cache_paths[0]
+
+    def _add_say_hi_constraints_from_cache(
+        self,
+        client_id: int,
+        start_frame: int,
+        root_position: np.ndarray,
+        heading: float,
+    ) -> tuple[int, int]:
+        """Append selected say-hi full-body BVH keyframes after a route."""
+        session = self.client_sessions[client_id]
+        motion, cache_path = self._load_cached_say_hi_motion(session)
+        if motion is None:
+            print("[Forward Left Forward] No cached say-hi motion found for this skeleton.")
+            return start_frame, 0
+
+        motion_rep = session.motion_rep
+        motion_unnorm = motion_rep.unnormalize(motion.unsqueeze(0))
+        motion_rotated = motion_rep.rotate_to(motion_unnorm, torch.tensor(float(heading), device=motion.device))
+        target_2d = torch.tensor(
+            [[float(root_position[0]), float(root_position[2])]],
+            device=motion.device,
+            dtype=torch.float32,
+        )
+        motion_transformed = motion_rep.translate_2d_to(motion_rotated, target_2d)
+        motion_normalized = motion_rep.normalize(motion_transformed).squeeze(0)
+
+        inverse_output = motion_rep.inverse(motion_normalized, is_normalized=True)
+        joints_pos = inverse_output["posed_joints"]
+        joints_rot = inverse_output["global_rot_mats"]
+        motion_len = int(motion_normalized.shape[0])
+        if motion_len <= 0:
+            return start_frame, 0
+
+        selected = sorted(
+            set(
+                max(0, min(motion_len - 1, int(round((motion_len - 1) * ratio))))
+                for ratio in (0.0, 0.25, 0.5, 0.75, 1.0)
+            )
+        )
+        fullbody_constraint = session.constraints.get("Full-Body")
+        if fullbody_constraint is None:
+            return start_frame, 0
+
+        timeline_added = 0
+        for seq_idx in selected:
+            frame_idx = start_frame + seq_idx
+            constraint_id = f"say_hi_fullbody_{frame_idx}"
+            fullbody_constraint.add_keyframe(
+                keyframe_id=constraint_id,
+                frame_idx=frame_idx,
+                joints_pos=joints_pos[seq_idx],
+                joints_rot=joints_rot[seq_idx],
+                exists_ok=True,
+            )
+            self.add_keyframe_to_timeline(client_id, "Full-Body", frame_idx, constraint_id)
+            timeline_added += 1
+
+        if session.gui_elements.gui_viz_ref_motion_checkbox.value:
+            prefix_pos = session.ref_joints_pos
+            prefix_rot = session.ref_joints_rot
+            if prefix_pos is None or prefix_pos.shape[0] < start_frame:
+                pad_pos = joints_pos[:1].repeat(start_frame, 1, 1)
+                pad_rot = joints_rot[:1].repeat(start_frame, 1, 1, 1)
+                prefix_pos = pad_pos
+                prefix_rot = pad_rot
+            else:
+                prefix_pos = prefix_pos[:start_frame]
+                prefix_rot = prefix_rot[:start_frame]
+            session.ref_joints_pos = torch.cat([prefix_pos.to(joints_pos), joints_pos], dim=0)
+            session.ref_joints_rot = torch.cat([prefix_rot.to(joints_rot), joints_rot], dim=0)
+            self._create_ref_character(client_id)
+
+        print(f"[Forward Left Forward] Added say-hi constraints from {cache_path}: frames {selected}")
+        return start_frame + motion_len - 1, timeline_added
+
+    def _apply_pending_say_hi_after_task(self, client_id: int) -> bool:
+        """Install the say-hi BVH constraints after an FLF route has completed."""
+        if not self.client_active(client_id):
+            return False
+        session = self.client_sessions[client_id]
+        if not session.pending_say_hi_after_task:
+            return False
+        if session.pending_say_hi_root_position is None or session.pending_say_hi_heading is None:
+            session.pending_say_hi_after_task = False
+            return False
+
+        route_end_frame = int(session.task_end_frame_idx if session.task_end_frame_idx is not None else session.frame_idx)
+        session.pending_say_hi_after_task = False
+
+        if not os.path.exists(SAY_HI_MOTION_FILE_PATH):
+            session.client.add_notification(
+                title="Say Hi skipped",
+                body=f"BVH not found: {SAY_HI_MOTION_FILE_PATH}",
+                color="orange",
+                auto_close_seconds=4.0,
+            )
+            return False
+
+        if session.max_frame_idx >= 0:
+            self.set_frame(client_id, min(route_end_frame, session.max_frame_idx))
+
+        g = session.gui_elements
+        g.gui_motion_file_path.value = SAY_HI_MOTION_FILE_PATH
+        crop_10s = True
+        if getattr(g, "gui_crop_motion_checkbox", None) is not None:
+            g.gui_crop_motion_checkbox.value = crop_10s
+        g.gui_constraint_fullbody_checkbox.value = True
+        g.gui_constraint_hands_checkbox.value = True
+        g.gui_constraint_forearm_orientation_checkbox.value = False
+        g.gui_constraint_hand_only_motion_checkbox.value = False
+        g.gui_constraint_feet_checkbox.value = True
+        g.gui_constraint_hands_feet_checkbox.value = True
+        g.gui_constraint_2d_waypoints_checkbox.value = True
+        g.gui_constraint_2d_trajectory_checkbox.value = True
+        g.gui_continue_from_current_checkbox.value = True
+        g.gui_max_keyframe_num.value = 11
+        g.gui_constraint_frame_indices.value = ""
+
+        try:
+            seq_data = self.load_motion_from_file(SAY_HI_MOTION_FILE_PATH, session, crop_10s=crop_10s)
+            self.load_sequence(
+                client_id,
+                seq_data,
+                constraint_types=[
+                    "Full Body",
+                    "Hands",
+                    "Feet",
+                    "Hands and Feet",
+                    "2D Root Waypoints",
+                    "2D Root Trajectory",
+                ],
+                continue_from_current=True,
+                update_text=bool(seq_data.get("text")),
+            )
+            session.play_once = True
+            session.playing = True
+            session.gui_elements.gui_play_pause_button.label = "Pause"
+            session.client.add_notification(
+                title="Say Hi BVH started",
+                body=f"Cropped to 10s, max keyframes 11, continuing after frame {route_end_frame}.",
+                color="green",
+                auto_close_seconds=3.0,
+            )
+            return True
+        except Exception as e:
+            session.client.add_notification(
+                title="Say Hi failed",
+                body=str(e),
+                color="red",
+                auto_close_seconds=5.0,
+            )
+            raise
+
     def remove_keyframe_from_timeline(
         self,
         client_id: int,
@@ -610,6 +794,181 @@ class ConstraintsMixin:
             progress.color = "green"
         except Exception as e:
             progress.title = "Root Rotation Failed"
+            progress.body = str(e)
+            progress.color = "red"
+            raise
+        finally:
+            progress.loading = False
+            progress.with_close_button = True
+            progress.auto_close_seconds = 6.0
+
+    def apply_forward_left_forward_constraint(
+        self,
+        client_id: int,
+        first_distance_m: float = 2.5,
+        turn_degrees: float = 90.0,
+        second_distance_m: float = 2.0,
+    ):
+        """Constrain the root to go forward, turn left, then continue forward."""
+        if not self.client_active(client_id):
+            return
+        session = self.client_sessions[client_id]
+        client = session.client
+
+        if "2D Root" not in session.constraints:
+            client.add_notification(
+                title="No 2D Root Track",
+                body="The active model does not provide root path constraints.",
+                color="red",
+                auto_close_seconds=4.0,
+            )
+            return
+
+        progress = client.add_notification(
+            title="Forward Left Forward Constraint",
+            body="Installing rack-style straight-turn-straight root path...",
+            loading=True,
+            with_close_button=False,
+        )
+        client.flush()
+
+        try:
+            first_distance_m = max(0.01, float(first_distance_m))
+            second_distance_m = max(0.01, float(second_distance_m))
+            turn_degrees = max(1.0, min(abs(float(turn_degrees)), 360.0))
+
+            fps = float(session.model_fps)
+            walk_speed_m_s = 0.60
+            turn_seconds_per_90 = 0.75
+            first_frames = max(2, int(round(first_distance_m / walk_speed_m_s * fps)))
+            turn_frames = max(2, int(round(turn_seconds_per_90 * fps * turn_degrees / 90.0)))
+            second_frames = max(2, int(round(second_distance_m / walk_speed_m_s * fps)))
+            route_end_frame = first_frames + turn_frames + second_frames
+            total_frames = route_end_frame + 1
+            end_frame = route_end_frame
+
+            start = (
+                np.asarray(session.init_global_translation, dtype=np.float32).copy()
+                if session.init_global_translation is not None
+                else np.zeros(3, dtype=np.float32)
+            )
+            start[1] = 0.0
+            start_heading = float(session.init_first_heading_angle or 0.0)
+            end_heading = start_heading + math.radians(turn_degrees)
+
+            start_forward = np.array([math.sin(start_heading), 0.0, math.cos(start_heading)], dtype=np.float32)
+            end_forward = np.array([math.sin(end_heading), 0.0, math.cos(end_heading)], dtype=np.float32)
+            turn_position = start + start_forward * first_distance_m
+            turn_position[1] = 0.0
+            end_position = turn_position + end_forward * second_distance_m
+            end_position[1] = 0.0
+
+            session.playing = False
+            session.play_once = False
+            session.realtime_mode = False
+            session.gui_elements.gui_play_pause_button.label = "Play"
+            session.gui_elements.gui_realtime_mode_checkbox.value = False
+            session.gui_elements.gui_next_frame_button.disabled = False
+            session.gui_elements.gui_prev_frame_button.disabled = True
+            session.gui_elements.gui_enable_auto_replan_checkbox.value = False
+            session.gui_elements.gui_enable_auto_replan_checkbox.disabled = True
+
+            session.init_global_translation = start.astype(np.float32)
+            session.init_first_heading_angle = start_heading
+            session.t3_base_route_positions = None
+            session.t3_base_route_headings = None
+            if session.transform_gizmo is not None:
+                session.transform_gizmo.position = tuple(session.init_global_translation.tolist())
+                session.transform_gizmo.wxyz = viser.transforms.SO3.from_y_radians(start_heading).wxyz
+            self._update_start_direction_marker(client_id)
+
+            with session.timeline_data["keyframe_update_lock"]:
+                for constraint in list(session.constraints.values()):
+                    constraint.clear()
+                if hasattr(client, "timeline"):
+                    client.timeline.clear_keyframes()
+                    client.timeline.clear_intervals()
+                session.timeline_data["keyframes"].clear()
+                session.timeline_data["intervals"].clear()
+
+            root_constraint = session.constraints["2D Root"]
+            root_constraint.set_smooth_path(False)
+            root_constraint.set_dense_path(False)
+
+            first_end_frame = first_frames
+            turn_end_frame = first_frames + turn_frames
+            waypoint_indices = (0, first_end_frame, turn_end_frame, route_end_frame)
+            for frame_idx in waypoint_indices:
+                if frame_idx <= first_end_frame:
+                    alpha = frame_idx / max(float(first_end_frame), 1.0)
+                    position = start + (turn_position - start) * alpha
+                    heading = start_heading
+                elif frame_idx <= turn_end_frame:
+                    alpha = (frame_idx - first_end_frame) / max(float(turn_frames), 1.0)
+                    heading = start_heading + (end_heading - start_heading) * alpha
+                    position = turn_position
+                else:
+                    alpha = (frame_idx - turn_end_frame) / max(float(second_frames), 1.0)
+                    position = turn_position + (end_position - turn_position) * alpha
+                    heading = end_heading
+
+                root_constraint.add_keyframe(
+                    keyframe_id=f"root_forward_left_forward_{frame_idx}",
+                    frame_idx=frame_idx,
+                    root_pos=torch.tensor(position, dtype=torch.float32),
+                    global_root_heading=float(heading),
+                    viz_label=frame_idx in {0, first_end_frame, turn_end_frame, end_frame},
+                    exists_ok=True,
+                    update_path=False,
+                    add_annulus=frame_idx in {0, first_end_frame, turn_end_frame, end_frame},
+                )
+
+            session.ref_joints_pos = None
+            session.ref_joints_rot = None
+            if session.ref_character is not None:
+                session.ref_character.clear()
+                session.ref_character = None
+            session.pending_say_hi_after_task = True
+            session.pending_say_hi_root_position = end_position.astype(np.float32)
+            session.pending_say_hi_heading = float(end_heading)
+
+            root_constraint.set_dense_path(True)
+            root_constraint.update_line_segments()
+            self.add_interval_to_timeline(client_id, "2D Root", 0, route_end_frame, "root_forward_left_forward")
+
+            if hasattr(client, "timeline"):
+                client.timeline.set_frame_range(
+                    start_frame=0,
+                    end_frame=max(route_end_frame + TIMELINE_WINDOW_BEFORE, TIMELINE_WINDOW_AFTER),
+                )
+
+            session.task_end_frame_idx = route_end_frame
+            session.task_generation_pending = True
+            session.task_reached_reported = False
+
+            prompt = RACK_ROUTE_WALKING_PROMPT
+            text_feat, _ = session.model.text_encoder([prompt])
+            session.text_embedding = text_feat.to(self.device)
+            session.gui_elements.gui_prompt_text.value = prompt
+            session.gui_elements.gui_active_prompt_label.content = (
+                f"**Active Prompt:** {prompt} + {first_distance_m * 100.0:.0f} cm forward, "
+                f"{turn_degrees:.0f} deg left, {second_distance_m * 100.0:.0f} cm forward"
+            )
+
+            progress.body = "Generating rack-style straight-left-straight motion..."
+            client.flush()
+            self.restart(client_id)
+            self.set_frame(client_id, 0)
+
+            progress.title = "Forward Left Forward Applied"
+            progress.body = (
+                f"{first_distance_m * 100.0:.0f} cm forward, {turn_degrees:.0f} deg left, "
+                f"{second_distance_m * 100.0:.0f} cm forward over {(route_end_frame + 1) / fps:.1f}s "
+                f"with {len(waypoint_indices)} route waypoints. Say-hi BVH will start after completion."
+            )
+            progress.color = "green"
+        except Exception as e:
+            progress.title = "Forward Left Forward Failed"
             progress.body = str(e)
             progress.color = "red"
             raise
@@ -1893,6 +2252,9 @@ class ConstraintsMixin:
         session.task_end_frame_idx = None
         session.task_generation_pending = False
         session.task_reached_reported = False
+        session.pending_say_hi_after_task = False
+        session.pending_say_hi_root_position = None
+        session.pending_say_hi_heading = None
         session.t3_base_route_positions = None
         session.t3_base_route_headings = None
 

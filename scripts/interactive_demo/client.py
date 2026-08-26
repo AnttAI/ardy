@@ -31,6 +31,10 @@ class ClientMixin:
         if session.t3_csv_player is not None:
             session.t3_csv_player.clear()
             session.t3_csv_player = None
+        if getattr(session, "retarget_debug_viewer", None) is not None:
+            session.retarget_debug_viewer.clear()
+            session.retarget_debug_viewer = None
+            session.retarget_debug_viewer_visible = False
         session.t3_csv_player_generation = -1
         session.t3_retarget_ready_generation = -1
 
@@ -80,6 +84,15 @@ class ClientMixin:
             gui_elements=gui_elements,
             constraints=constraint_tracks,
             timeline_data=timeline_data,
+            retarget_debug_viewer_backend=getattr(self, "newton_viewer_backend", "gl"),
+            retarget_debug_background_usd=getattr(self, "newton_background_usd", None),
+            retarget_debug_camera_preset=getattr(self, "newton_camera_preset", "default"),
+            retarget_debug_rtx_environment=getattr(self, "newton_rtx_environment", "studio"),
+            retarget_debug_newton_pythonpath=getattr(self, "newton_pythonpath", None),
+            retarget_debug_viewer_python=getattr(self, "newton_viewer_python", None),
+            retarget_debug_websocket_enabled=bool(gui_elements.gui_viz_newton_websocket_checkbox.value),
+            retarget_debug_websocket_url=str(gui_elements.gui_viz_newton_websocket_url.value).strip()
+            or "ws://127.0.0.1:8765",
         )
 
         self.client_sessions[client.client_id] = session
