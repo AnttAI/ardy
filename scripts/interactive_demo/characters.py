@@ -100,7 +100,8 @@ class CharactersMixin:
         session.t3_live_root_positions = None
         session.t3_live_last_row_frame_idx = -1
         session.t3_live_last_row = None
-        session.t3_live_soma_solver = None
+        if session.t3_live_soma_solver is not None:
+            session.t3_live_soma_solver.reset()
         session.t3_retarget_ready_generation = -1
         session.t3_csv_player_generation = -1
         session.t3_retarget_csv_start_frame = 0

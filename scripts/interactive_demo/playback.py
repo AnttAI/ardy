@@ -59,6 +59,8 @@ class PlaybackMixin:
                     viewer_python=session.retarget_debug_viewer_python,
                     websocket_enabled=session.retarget_debug_websocket_enabled,
                     websocket_url=session.retarget_debug_websocket_url,
+                    websocket_payload=session.retarget_debug_websocket_payload,
+                    websocket_delivery=session.retarget_debug_websocket_delivery,
                 )
             status = session.retarget_debug_viewer.play_files(
                 bvh_path=gui.gui_viz_file_bvh_path.value,
@@ -152,6 +154,8 @@ class PlaybackMixin:
                 viewer_python=session.retarget_debug_viewer_python,
                 websocket_enabled=session.retarget_debug_websocket_enabled,
                 websocket_url=session.retarget_debug_websocket_url,
+                websocket_payload=session.retarget_debug_websocket_payload,
+                websocket_delivery=session.retarget_debug_websocket_delivery,
             )
             session.retarget_debug_viewer.open()
             session.client.add_notification(
@@ -193,6 +197,7 @@ class PlaybackMixin:
             status_lower = str(status).lower()
             connected = (
                 "websocket connected" in status_lower
+                or "websocket live queued" in status_lower
                 or status_lower.startswith("live newton frame")
                 or status_lower.startswith("warming live")
             )

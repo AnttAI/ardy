@@ -698,6 +698,11 @@ class GenerationMixin:
         ):
             session.t3_live_soma77_local_rot_mats = None
             session.t3_live_root_positions = None
+            session.t3_live_last_row_frame_idx = -1
+            session.t3_live_last_row = None
+            with session.t3_live_solver_lock:
+                if session.t3_live_soma_solver is not None:
+                    session.t3_live_soma_solver.reset()
             self.request_soma_t3_retarget(client_id, start_frame=0)
 
         end_time = time.time()

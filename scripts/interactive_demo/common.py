@@ -458,6 +458,8 @@ class ClientSession:
     retarget_debug_viewer_python: Optional[str] = None
     retarget_debug_websocket_enabled: bool = False
     retarget_debug_websocket_url: str = "ws://127.0.0.1:8765"
+    retarget_debug_websocket_payload: str = "joints"
+    retarget_debug_websocket_delivery: str = "latest"
     retarget_debug_disconnect_reported: bool = False
     t3_retarget_thread: Optional[threading.Thread] = None
     t3_retarget_lock: threading.Lock = field(default_factory=threading.Lock)

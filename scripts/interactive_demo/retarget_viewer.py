@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import select
 import socket
 import struct
@@ -138,6 +139,117 @@ class WebSocketFrameSender:
             pass
 
 
+class LiveWebSocketFrameSender:
+    """Background sender for live frames.
+
+    delivery="latest" keeps Viser playback independent by replacing stale RTX
+    frames. delivery="all" preserves every frame and may backpressure playback.
+    """
+
+    def __init__(self, url: str, delivery: str = "latest"):
+        self.url = url
+        self.delivery = delivery if delivery in {"all", "latest"} else "latest"
+        self._condition = threading.Condition()
+        self._pending_payload: dict | None = None
+        self._payload_queue: queue.Queue[dict] = queue.Queue(maxsize=1)
+        self._closed = False
+        self._thread: threading.Thread | None = None
+        self._sender: WebSocketFrameSender | None = None
+        self._status = "websocket starting"
+        self._last_sent_frame_idx = -1
+        self._replaced_frames = 0
+
+    @property
+    def status(self) -> str:
+        return self._status
+
+    @property
+    def last_sent_frame_idx(self) -> int:
+        return self._last_sent_frame_idx
+
+    @property
+    def replaced_frames(self) -> int:
+        return self._replaced_frames
+
+    @property
+    def connected(self) -> bool:
+        return self._sender is not None and self._sender.connected
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, name="ardy-newton-ws-sender", daemon=True)
+        self._thread.start()
+
+    def submit_live(self, payload: dict) -> None:
+        self.start()
+        if self.delivery == "all":
+            self._payload_queue.put(payload)
+            return
+        with self._condition:
+            if self._pending_payload is not None:
+                self._replaced_frames += 1
+            self._pending_payload = payload
+            self._condition.notify()
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._pending_payload = None
+            self._condition.notify()
+        while True:
+            try:
+                self._payload_queue.get_nowait()
+            except queue.Empty:
+                break
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+        if self._sender is not None:
+            self._sender.close()
+            self._sender = None
+        self._status = "websocket closed"
+
+    def _run(self) -> None:
+        while True:
+            if self.delivery == "all":
+                if self._closed:
+                    return
+                try:
+                    payload = self._payload_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+            else:
+                with self._condition:
+                    while self._pending_payload is None and not self._closed:
+                        self._condition.wait(timeout=0.5)
+                    if self._closed:
+                        return
+                    payload = self._pending_payload
+                    self._pending_payload = None
+            if payload is None:
+                continue
+            while not self._closed:
+                try:
+                    if self._sender is None or not self._sender.connected:
+                        self._sender = WebSocketFrameSender(self.url)
+                        self._sender.connect()
+                        print(f"[ARDY Newton Sender] websocket connected: {self._sender.url}", flush=True)
+                    self._sender.send_json(payload)
+                    self._last_sent_frame_idx = int(payload.get("frame_idx", -1))
+                    self._status = f"websocket connected: sent frame {self._last_sent_frame_idx}"
+                    break
+                except (BrokenPipeError, ConnectionError, OSError) as exc:
+                    if self._sender is not None:
+                        self._sender.close()
+                        self._sender = None
+                    self._status = f"websocket disconnected: {exc}"
+                    if self.delivery == "latest":
+                        break
+                    time.sleep(0.1)
+
+
 class SomaT3RetargetViewer:
     """Stream live/file retarget payloads to an independently launched RTX viewer."""
 
@@ -155,6 +267,8 @@ class SomaT3RetargetViewer:
         viewer_python: str | None = None,
         websocket_enabled: bool = False,
         websocket_url: str = "ws://127.0.0.1:8765",
+        websocket_payload: str = "joints",
+        websocket_delivery: str = "latest",
     ):
         self.client = client
         self.client_id = client_id
@@ -168,16 +282,27 @@ class SomaT3RetargetViewer:
         self.viewer_python = viewer_python
         self.websocket_enabled = True
         self.websocket_url = websocket_url or "ws://127.0.0.1:8765"
+        self.websocket_payload = (websocket_payload or "joints").strip().lower()
+        if self.websocket_payload not in {"joints", "vertices"}:
+            self.websocket_payload = "joints"
+        self.websocket_delivery = (websocket_delivery or "latest").strip().lower()
+        if self.websocket_delivery not in {"all", "latest"}:
+            self.websocket_delivery = "latest"
         self.visible = False
         self._last_error: str | None = None
-        self._soma_skin = SOMASkin(soma_skeleton)
+        self._soma_skin = SOMASkin(soma_skeleton) if self.websocket_payload == "vertices" else None
+        self._soma_joint_parents = (
+            soma_skeleton.joint_parents.detach().cpu().numpy().astype(int).tolist()
+            if hasattr(soma_skeleton, "joint_parents")
+            else None
+        )
         self._sent_soma_faces = False
         self._soma_faces_send_count = 0
         self._file_thread: threading.Thread | None = None
         self._file_stop_event = threading.Event()
         self._file_playback_active = False
         self._file_playback_status = "idle"
-        self._ws_sender: WebSocketFrameSender | None = None
+        self._ws_sender: LiveWebSocketFrameSender | None = None
         self._last_send_report_time = 0.0
 
     @property
@@ -187,27 +312,18 @@ class SomaT3RetargetViewer:
     def open(self) -> None:
         self.visible = True
         self._last_error = None
-        if self._ws_sender is None or not self._ws_sender.connected:
-            self._ws_sender = WebSocketFrameSender(self.websocket_url)
-            try:
-                self._ws_sender.connect()
-                print(f"[ARDY Newton Sender] websocket connected: {self._ws_sender.url}", flush=True)
-            except Exception as exc:
-                self._last_error = f"Newton websocket connect failed: {exc}"
+        if self._ws_sender is None:
+            self._ws_sender = LiveWebSocketFrameSender(self.websocket_url, delivery=self.websocket_delivery)
+            self._ws_sender.start()
 
     def update(self, pose: RetargetViewerPose) -> str:
         if self._file_playback_active:
             return self._file_playback_status
         if not self.visible:
             return "Newton viewer closed"
-        if self._ws_sender is None or not self._ws_sender.connected:
-            self._ws_sender = WebSocketFrameSender(self.websocket_url)
-            try:
-                self._ws_sender.connect()
-                print(f"[ARDY Newton Sender] websocket connected: {self._ws_sender.url}", flush=True)
-                self._last_error = None
-            except Exception as exc:
-                return f"Newton websocket disconnected: {exc}"
+        if self._ws_sender is None:
+            self._ws_sender = LiveWebSocketFrameSender(self.websocket_url, delivery=self.websocket_delivery)
+            self._ws_sender.start()
 
         soma_offset = np.zeros(3, dtype=np.float32)
         if pose.soma_offset is not None:
@@ -225,22 +341,25 @@ class SomaT3RetargetViewer:
 
         t3_row = pose.t3_state_row if pose.t3_state_row is not None else pose.t3_row
 
-        send_soma_faces = self._soma_faces_send_count < 10 or int(pose.frame_idx) % 30 == 0
-        soma_vertices = self._soma_skin.skin(
-            pose.soma_joints_rot[None],
-            displayed_soma_joints_pos[None],
-            rot_is_global=True,
-        )[0].detach().cpu().numpy()
-        soma_mesh_vertices_payload = soma_vertices.astype(float).tolist()
-        soma_mesh_faces_payload = (
-            self._soma_skin.faces.detach().cpu().numpy().astype(int).tolist() if send_soma_faces else None
-        )
+        send_soma_faces = False
+        soma_mesh_vertices_payload = None
+        soma_mesh_faces_payload = None
+        if self.websocket_payload == "vertices":
+            assert self._soma_skin is not None
+            send_soma_faces = self._soma_faces_send_count < 10 or int(pose.frame_idx) % 30 == 0
+            soma_vertices = self._soma_skin.skin(
+                pose.soma_joints_rot[None],
+                displayed_soma_joints_pos[None],
+                rot_is_global=True,
+            )[0].detach().cpu().numpy()
+            soma_mesh_vertices_payload = soma_vertices.astype(float).tolist()
+            soma_mesh_faces_payload = (
+                self._soma_skin.faces.detach().cpu().numpy().astype(int).tolist() if send_soma_faces else None
+            )
 
         payload = {
             "soma_joint_names": self.soma_joint_names,
-            "soma_joint_parents": self._soma_skin.skeleton_skin.joint_parents.detach().cpu().numpy().astype(int).tolist()
-            if hasattr(self._soma_skin, "skeleton_skin")
-            else None,
+            "soma_joint_parents": self._soma_joint_parents,
             "soma_joints_pos": pose.soma_joints_pos.detach().cpu().numpy().astype(float).tolist(),
             "soma_joints_rot": pose.soma_joints_rot.detach().cpu().numpy().astype(float).tolist(),
             "soma_mesh_vertices": soma_mesh_vertices_payload,
@@ -251,34 +370,32 @@ class SomaT3RetargetViewer:
             "fps": float(pose.fps),
             "frame_idx": int(pose.frame_idx),
         }
-        try:
-            self._send_payload(payload)
-            now = time.monotonic()
-            if now - self._last_send_report_time >= 1.0:
-                faces_count = len(payload["soma_mesh_faces"]) // 3 if payload["soma_mesh_faces"] is not None else 0
-                verts_count = len(payload["soma_mesh_vertices"]) if payload["soma_mesh_vertices"] is not None else 0
-                print(
-                    "[ARDY Newton Sender] "
-                    f"frame={int(pose.frame_idx)} "
-                    f"soma_verts={verts_count} "
-                    f"soma_tris={faces_count} "
-                    f"has_t3={t3_row is not None} "
-                    "transport=websocket",
-                    flush=True,
-                )
-                self._last_send_report_time = now
-            self._sent_soma_faces = True
-            if send_soma_faces and self._soma_faces_send_count < 10:
-                self._soma_faces_send_count += 1
-        except (BrokenPipeError, ConnectionError, OSError) as exc:
-            if self._ws_sender is not None:
-                self._ws_sender.close()
-                self._last_error = f"Newton websocket disconnected: {exc}"
-            return self._last_error
+        self._send_payload(payload)
+        now = time.monotonic()
+        if now - self._last_send_report_time >= 1.0:
+            faces_count = len(payload["soma_mesh_faces"]) // 3 if payload["soma_mesh_faces"] is not None else 0
+            verts_count = len(payload["soma_mesh_vertices"]) if payload["soma_mesh_vertices"] is not None else 0
+            replaced = self._ws_sender.replaced_frames if self._ws_sender is not None else 0
+            print(
+                "[ARDY Newton Sender] "
+                f"live_frame={int(pose.frame_idx)} "
+                f"payload={self.websocket_payload} "
+                f"delivery={self.websocket_delivery} "
+                f"soma_verts={verts_count} "
+                f"soma_tris={faces_count} "
+                f"has_t3={t3_row is not None} "
+                f"replaced={replaced} "
+                "transport=websocket",
+                flush=True,
+            )
+            self._last_send_report_time = now
+        self._sent_soma_faces = True
+        if send_soma_faces and self._soma_faces_send_count < 10:
+            self._soma_faces_send_count += 1
 
         if t3_row is None:
-            return f"RTX websocket connected: warming live Newton solver for frame {pose.frame_idx}"
-        return f"RTX websocket connected: live Newton frame {pose.frame_idx}"
+            return f"RTX websocket live queued: warming frame {pose.frame_idx}"
+        return f"RTX websocket live queued: frame {pose.frame_idx}"
 
     def play_files(
         self,
@@ -290,7 +407,7 @@ class SomaT3RetargetViewer:
         self.open()
         if self._last_error is not None:
             return self._last_error
-        if self._ws_sender is None or not self._ws_sender.connected:
+        if self._ws_sender is None:
             return "Newton websocket not available"
 
         mode = mode.lower()
@@ -339,8 +456,8 @@ class SomaT3RetargetViewer:
 
     def _send_payload(self, payload: dict) -> None:
         if self._ws_sender is None:
-            self._ws_sender = WebSocketFrameSender(self.websocket_url)
-        self._ws_sender.send_json(payload)
+            self._ws_sender = LiveWebSocketFrameSender(self.websocket_url, delivery=self.websocket_delivery)
+        self._ws_sender.submit_live(payload)
 
     def _feed_file_frames(
         self,
@@ -362,7 +479,7 @@ class SomaT3RetargetViewer:
             for frame_idx in range(frame_count):
                 if self._file_stop_event.is_set():
                     break
-                if self._ws_sender is None or not self._ws_sender.connected:
+                if self._ws_sender is None:
                     raise RuntimeError("Newton websocket unavailable")
                 payload = {
                     "show_soma_mesh": bool(has_bvh),

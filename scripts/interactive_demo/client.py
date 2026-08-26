@@ -93,6 +93,8 @@ class ClientMixin:
             retarget_debug_websocket_enabled=bool(gui_elements.gui_viz_newton_websocket_checkbox.value),
             retarget_debug_websocket_url=str(gui_elements.gui_viz_newton_websocket_url.value).strip()
             or "ws://127.0.0.1:8765",
+            retarget_debug_websocket_payload=getattr(self, "newton_websocket_payload", "joints"),
+            retarget_debug_websocket_delivery=getattr(self, "newton_websocket_delivery", "latest"),
         )
 
         self.client_sessions[client.client_id] = session

@@ -60,6 +60,8 @@ class InteractiveTimelineDemo(
         cached_text_only: bool = True,
         newton_use_websocket: bool = False,
         newton_websocket_url: str = "ws://127.0.0.1:8765",
+        newton_websocket_payload: str = "joints",
+        newton_websocket_delivery: str = "latest",
     ):
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         print(f"Using device: {self.device}")
@@ -69,12 +71,21 @@ class InteractiveTimelineDemo(
         self.newton_rtx_environment = "studio"
         self.newton_pythonpath = None
         self.newton_viewer_python = None
+        self.newton_viewer_backend = "rtx"
+        self.newton_background_usd = None
+        self.newton_camera_preset = "saved_origin_back"
+        self.newton_rtx_environment = "studio"
+        self.newton_pythonpath = None
+        self.newton_viewer_python = None
         self.newton_use_websocket = bool(newton_use_websocket)
         self.newton_websocket_url = newton_websocket_url
+        self.newton_websocket_payload = (newton_websocket_payload or "joints").strip().lower()
+        self.newton_websocket_delivery = (newton_websocket_delivery or "latest").strip().lower()
         print(
             "[ARDY] Newton websocket sender: "
             f"{'on' if self.newton_use_websocket else 'off'} "
-            f"({self.newton_websocket_url})"
+            f"({self.newton_websocket_url}, payload={self.newton_websocket_payload}, "
+            f"delivery={self.newton_websocket_delivery})"
         )
 
         # Built once and reused across all model loads (core / g1 / soma).
@@ -205,12 +216,28 @@ def main() -> None:
         default=None,
         help="Independent Newton viewer websocket URL, e.g. ws://127.0.0.1:8765.",
     )
+    parser.add_argument(
+        "--newton-websocket-payload",
+        choices=("joints", "vertices"),
+        default=None,
+        help="joints streams live joint/T3 state only; vertices sends the old full SOMA mesh payload.",
+    )
+    parser.add_argument(
+        "--newton-websocket-delivery",
+        choices=("all", "latest"),
+        default=None,
+        help="latest keeps Viser fast by replacing stale RTX frames; all preserves every frame and may slow Viser.",
+    )
     args = parser.parse_args()
 
     if args.newton_websocket_url:
         os.environ["ARDY_NEWTON_WEBSOCKET_URL"] = args.newton_websocket_url
     if args.newton_use_websocket:
         os.environ["ARDY_NEWTON_USE_WEBSOCKET"] = "1"
+    if args.newton_websocket_payload:
+        os.environ["ARDY_NEWTON_WEBSOCKET_PAYLOAD"] = args.newton_websocket_payload
+    if args.newton_websocket_delivery:
+        os.environ["ARDY_NEWTON_WEBSOCKET_DELIVERY"] = args.newton_websocket_delivery
 
     demo = InteractiveTimelineDemo(
         compile_model=not args.no_compile,
@@ -221,6 +248,10 @@ def main() -> None:
         ),
         newton_websocket_url=args.newton_websocket_url
         or os.environ.get("ARDY_NEWTON_WEBSOCKET_URL", "ws://127.0.0.1:8765"),
+        newton_websocket_payload=args.newton_websocket_payload
+        or os.environ.get("ARDY_NEWTON_WEBSOCKET_PAYLOAD", "joints"),
+        newton_websocket_delivery=args.newton_websocket_delivery
+        or os.environ.get("ARDY_NEWTON_WEBSOCKET_DELIVERY", "latest"),
     )
     demo.run()
 
