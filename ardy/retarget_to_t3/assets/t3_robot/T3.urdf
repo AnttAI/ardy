@@ -873,12 +873,12 @@
   <joint name="torso_to_right_nero_base" type="fixed">
     <parent link="torso_link" />
     <child link="right_base_link" />
-    <origin xyz="0.00197060 -0.07316000 0.35789000" rpy="1.5707963267948966 -1.5707963267948966 0" />
+    <origin xyz="0.00197060 -0.07316000 0.32038000" rpy="1.5707963267948966 -1.5707963267948966 0" />
     </joint>
   <joint name="torso_to_left_nero_base" type="fixed">
     <parent link="torso_link" />
     <child link="left_base_link" />
-    <origin xyz="0.00197790 0.07684000 0.35792000" rpy="1.5707963267948966 -1.5707963267948966 3.141592653589793" />
+    <origin xyz="0.00197790 0.07684000 0.32038000" rpy="1.5707963267948966 -1.5707963267948966 3.141592653589793" />
     </joint>
   <link name="telescopic_lift_base_link">
     <visual name="telescopic_lift_outer_square_sleeve">
