@@ -155,16 +155,20 @@ class ConstraintsMixin:
         crop_10s = True
         if getattr(g, "gui_crop_motion_checkbox", None) is not None:
             g.gui_crop_motion_checkbox.value = crop_10s
-        g.gui_constraint_fullbody_checkbox.value = True
+        g.gui_constraint_fullbody_checkbox.value = False
         g.gui_constraint_hands_checkbox.value = True
         g.gui_constraint_forearm_orientation_checkbox.value = False
-        g.gui_constraint_hand_only_motion_checkbox.value = False
-        g.gui_constraint_feet_checkbox.value = True
-        g.gui_constraint_hands_feet_checkbox.value = True
+        g.gui_constraint_hand_only_motion_checkbox.value = True
+        g.gui_constraint_feet_checkbox.value = False
+        g.gui_constraint_hands_feet_checkbox.value = False
         g.gui_constraint_2d_waypoints_checkbox.value = True
-        g.gui_constraint_2d_trajectory_checkbox.value = True
+        g.gui_constraint_2d_trajectory_checkbox.value = False
         g.gui_continue_from_current_checkbox.value = True
         g.gui_max_keyframe_num.value = 11
+        if getattr(g, "gui_min_keyframe_gap", None) is not None:
+            g.gui_min_keyframe_gap.value = round(1.5 * session.motion_rep.fps)
+        if getattr(g, "gui_motion_stretch", None) is not None:
+            g.gui_motion_stretch.value = 1.0
         g.gui_constraint_frame_indices.value = ""
 
         try:
@@ -173,12 +177,8 @@ class ConstraintsMixin:
                 client_id,
                 seq_data,
                 constraint_types=[
-                    "Full Body",
                     "Hands",
-                    "Feet",
-                    "Hands and Feet",
                     "2D Root Waypoints",
-                    "2D Root Trajectory",
                 ],
                 continue_from_current=True,
                 update_text=bool(seq_data.get("text")),
@@ -188,7 +188,7 @@ class ConstraintsMixin:
             session.gui_elements.gui_play_pause_button.label = "Pause"
             session.client.add_notification(
                 title="Say Hi BVH started",
-                body=f"Cropped to 10s, max keyframes 11, continuing after frame {route_end_frame}.",
+                body=f"Cropped to 10s, sparse hand/root constraints, continuing after frame {route_end_frame}.",
                 color="green",
                 auto_close_seconds=3.0,
             )

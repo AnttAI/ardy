@@ -19,6 +19,10 @@ import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
+
 from ardy.data_processing.bvh import Bvh
 from ardy.skeleton import SOMASkeleton77
 from ardy.viz.soma_skin import SOMASkin

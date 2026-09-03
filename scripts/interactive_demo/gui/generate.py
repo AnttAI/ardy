@@ -504,6 +504,23 @@ class GuiGenerateMixin:
                     step=1,
                     hint="Maximum number of keyframes to sample from sequence",
                 )
+                g.gui_min_keyframe_gap = client.gui.add_number(
+                    "Min Keyframe Gap",
+                    initial_value=30,
+                    min=0,
+                    max=120,
+                    step=1,
+                    hint="Minimum frame gap for automatically sampled constraints.",
+                )
+                g.gui_motion_stretch = client.gui.add_number(
+                    "Motion Stretch",
+                    initial_value=1.0,
+                    min=1.0,
+                    max=5.0,
+                    step=0.25,
+                    hint="Automatically computed from Max Keyframes and Min Keyframe Gap.",
+                )
+                g.gui_motion_stretch.disabled = True
                 g.gui_constraint_frame_indices = client.gui.add_text(
                     "Constraint Frames",
                     initial_value="",
@@ -518,6 +535,71 @@ class GuiGenerateMixin:
                     initial_value=False,
                     hint="If enabled, transform loaded sequence to continue from current position and heading",
                 )
+
+                def update_motion_stretch_preview() -> None:
+                    source_frames = 0
+                    file_path = g.gui_motion_file_path.value.strip()
+                    resolved_file_path = (
+                        file_path
+                        if os.path.isabs(file_path)
+                        else os.path.join(REPO_ROOT, file_path)
+                    )
+                    try:
+                        if file_path and os.path.exists(resolved_file_path):
+                            ext = os.path.splitext(resolved_file_path)[1].lower()
+                            if ext == ".bvh":
+                                with open(resolved_file_path, "r", encoding="utf-8", errors="ignore") as f:
+                                    for line in f:
+                                        stripped = line.strip()
+                                        if stripped.startswith("Frames:"):
+                                            source_frames = int(stripped.split(":", 1)[1].strip())
+                                            break
+                            elif ext == ".csv":
+                                with open(resolved_file_path, "r", encoding="utf-8", errors="ignore") as f:
+                                    source_frames = max(0, sum(1 for _ in f) - 1)
+                    except Exception:
+                        source_frames = 0
+
+                    if source_frames <= 1:
+                        g.gui_motion_stretch.value = 1.0
+                        return
+
+                    if g.gui_crop_motion_checkbox.value and session.motion_rep is not None:
+                        source_frames = min(source_frames, int(10.0 * session.motion_rep.fps))
+
+                    max_keyframes = int(g.gui_max_keyframe_num.value)
+                    min_gap = int(g.gui_min_keyframe_gap.value)
+                    if max_keyframes <= 1 or min_gap <= 0:
+                        g.gui_motion_stretch.value = 1.0
+                        return
+
+                    fps = float(session.motion_rep.fps) if session.motion_rep is not None else 20.0
+                    reach_in_frames = round(2 * fps) if g.gui_continue_from_current_checkbox.value else 0
+                    required_frames = reach_in_frames + (max_keyframes - 1) * min_gap + 1
+                    stretch = max(1.0, (required_frames - 1) / (source_frames - 1))
+                    g.gui_motion_stretch.value = min(float(g.gui_motion_stretch.max), round(stretch, 2))
+
+                @g.gui_max_keyframe_num.on_update
+                def _(_) -> None:
+                    update_motion_stretch_preview()
+
+                @g.gui_min_keyframe_gap.on_update
+                def _(_) -> None:
+                    update_motion_stretch_preview()
+
+                @g.gui_continue_from_current_checkbox.on_update
+                def _(_) -> None:
+                    update_motion_stretch_preview()
+
+                @g.gui_crop_motion_checkbox.on_update
+                def _(_) -> None:
+                    update_motion_stretch_preview()
+
+                @g.gui_motion_file_path.on_update
+                def _(_) -> None:
+                    update_motion_stretch_preview()
+
+                update_motion_stretch_preview()
 
                 g.gui_load_seq_button = client.gui.add_button("Sample Constraints", color="green")
 

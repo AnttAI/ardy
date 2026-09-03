@@ -214,8 +214,27 @@ class GenerationMixin:
             filtered_local[:, start:, frozen_indices] = filtered_local[:, anchor_idx : anchor_idx + 1, frozen_indices]
         filtered_root[:, start:] = filtered_root[:, anchor_idx : anchor_idx + 1]
 
-        arm_rots = filtered_local[:, start:, moving_indices]
-        filtered_local[:, start:, moving_indices] = self._smooth_rotation_sequence(arm_rots, window=7)
+        skeleton = session.motion_rep.skeleton
+        proximal_names = ("Shoulder", "Arm")
+        distal_names = ("ForeArm", "Hand", "Thumb", "Index", "Middle", "Ring", "Pinky")
+        proximal_indices = [
+            idx
+            for idx in moving_indices
+            if any(name in skeleton.bone_order_names[idx] for name in proximal_names)
+            and not any(name in skeleton.bone_order_names[idx] for name in distal_names)
+        ]
+        distal_indices = [
+            idx
+            for idx in moving_indices
+            if any(name in skeleton.bone_order_names[idx] for name in distal_names)
+        ]
+
+        if proximal_indices:
+            arm_rots = filtered_local[:, start:, proximal_indices]
+            filtered_local[:, start:, proximal_indices] = self._smooth_rotation_sequence(arm_rots, window=7)
+        if distal_indices:
+            wrist_rots = filtered_local[:, start:, distal_indices]
+            filtered_local[:, start:, distal_indices] = self._smooth_rotation_sequence(wrist_rots, window=13)
 
         filtered_global_rot, filtered_pos, _ = session.motion_rep.skeleton.fk(filtered_local, filtered_root)
         filtered_unnorm = session.motion_rep(

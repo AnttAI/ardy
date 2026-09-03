@@ -15,7 +15,7 @@ from scipy.spatial.transform import Rotation
 
 from ardy.exports.bvh import export_soma_bvh_from_arrays
 
-from .embedded_soma_t3 import VENDORED_REFERENCE_BVH, ensure_vendored_soma_importable
+from .embedded_soma_t3 import VENDORED_REFERENCE_BVH, ensure_vendored_soma_importable, limit_t3_arm_joint_rates
 from .lift import lift_extension_m_to_display_cm
 from .constants import (
     T3_LIFT_HEIGHT_OFFSET_M,
@@ -92,14 +92,17 @@ def _save_t3_csv_from_t2_buffer(path: Path, buffer) -> None:
     t2_config = csv_utils.get_csv_config("t2")
     t2_header = t2_config.csv_header
     t3_indices = [t2_header.index(column) for column in T3_CSV_HEADER]
+    rows = [
+        [float(t2_config.to_csv_row(frame_idx, buffer.get_data(frame_idx))[index]) for index in t3_indices]
+        for frame_idx in range(buffer.num_frames)
+    ]
+    rows = limit_t3_arm_joint_rates(rows, T3_CSV_HEADER, fps=float(buffer.sample_rate))
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(T3_CSV_HEADER)
-        for frame_idx in range(buffer.num_frames):
-            t2_row = t2_config.to_csv_row(frame_idx, buffer.get_data(frame_idx))
-            writer.writerow([t2_row[index] for index in t3_indices])
+        writer.writerows(rows)
 
 
 def _joint_indices(skeleton, names: tuple[str, ...]) -> list[int]:

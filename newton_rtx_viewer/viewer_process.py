@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import csv
 import hashlib
@@ -14,6 +15,7 @@ import json
 import math
 import os
 import queue
+import re
 import socket
 import struct
 import subprocess
@@ -28,6 +30,8 @@ from scipy.spatial.transform import Rotation
 
 
 REPO_ROOT = Path(os.environ.get("ARDY_REPO_ROOT", "/home/jony/Downloads/ardy")).expanduser().resolve()
+ARDY_WORKSPACE_ROOT = REPO_ROOT.parent if REPO_ROOT.name == "newton_rtx_viewer" else REPO_ROOT
+DOWNLOADS_ROOT = Path.home() / "Downloads"
 SOMA_RETARGETER_ROOT = Path("/home/jony/Downloads/soma-retargeter")
 SOMA_RETARGETER_APP = SOMA_RETARGETER_ROOT / "app"
 DEFAULT_T3_URDF = Path("/home/jony/Downloads/kimodo/robot_demo_outputs/t3_robot/T3.urdf")
@@ -49,6 +53,8 @@ T3_LINEAR_JOINTS = {
     "right_gripper_joint1",
     "right_gripper_joint2",
 }
+T3_GRIPPER_MAX_APERTURE_M = 0.10
+T3_GRIPPER_DEFAULT_APERTURE_M = 0.0
 T3_STIFF_POSTURE_JOINTS = {
     "waist_yaw_joint",
     "waist_roll_joint",
@@ -100,13 +106,22 @@ CAMERA_PRESETS = {
     "lobby": ((-4.01, 4.86, 2.7), -12.0, -51.0),
 }
 RECORD_VIEW_OFFSETS = {
-    "follow": ((0.0, -3.2, 1.45), (0.0, 0.0, 0.75)),
-    "orbit_front": ((0.0, -3.0, 1.55), (0.0, 0.0, 0.85)),
-    "orbit_left": ((-2.8, -0.35, 1.50), (0.0, 0.0, 0.80)),
-    "orbit_right": ((2.8, -0.35, 1.50), (0.0, 0.0, 0.80)),
-    "orbit_back": ((0.0, 3.0, 1.55), (0.0, 0.0, 0.85)),
+    "follow": ((0.0, -6.0, 2.10), (0.0, 0.0, 0.75)),
+    "orbit_front": ((0.0, -6.0, 2.10), (0.0, 0.0, 0.75)),
+    "orbit_left": ((-6.0, 0.0, 2.10), (0.0, 0.0, 0.75)),
+    "orbit_right": ((6.0, 0.0, 2.10), (0.0, 0.0, 0.75)),
+    "orbit_back": ((0.0, 6.0, 2.10), (0.0, 0.0, 0.75)),
     "hero": ((-2.2, -2.4, 1.65), (0.0, 0.0, 0.90)),
     "top_follow": ((0.0, -0.15, 6.0), (0.0, 0.0, 0.0)),
+}
+RECORD_VIEW_FOV = {
+    "follow": 48.0,
+    "orbit_front": 48.0,
+    "orbit_left": 48.0,
+    "orbit_right": 48.0,
+    "orbit_back": 48.0,
+    "hero": 40.0,
+    "top_follow": 50.0,
 }
 FIXED_RECORD_SHOTS = {
     "diagonal": ((-4.01, 4.86, 2.70), (0.70, -0.40, 1.00), 37.0),
@@ -127,7 +142,7 @@ DIRECT_CAMERA_SHOTS = {
     "saved_grass": ((7.365, -2.646, 1.333), -3.95, 172.09, 34.8),
     "saved_straight_left": ((15.088, -2.831, 1.734), -5.95, -177.31, 34.0),
     "saved_straight_left_back": ((0.147, -2.654, 1.353), -4.22, 0.47, 31.0),
-    "saved_front": ((0.384, -4.188, 1.619), -11.72, 92.77, 31.0),
+    "saved_front": ((1.440, -4.150, 0.760), 0.52, 109.14, 31.0),
     "saved_full_lobby_diagonal": ((16.108, 2.953, 2.585), 0.30, -146.50, 28.0),
     "saved_origin_back": ((1.332, 2.920, 2.269), -17.54, -93.56, 31.0),
     "saved_top_left": ((0.357, 0.537, 4.007), -24.40, -3.61, 28.0),
@@ -138,6 +153,101 @@ PICK_OBJECT_CHOICES = ("none", "cube")
 PICK_OBJECT_DENSITY_KG_M3 = 300.0
 PICK_OBJECT_PUSH_MASS_LIMIT_KG = 310.0
 DEFAULT_RECORD_VIEWS = ("manual",)
+INTERACTIVE_BOTTLE_POSITIONS = (
+    (-0.38, -0.86, 0.0),
+    (0.0, -0.86, 0.0),
+    (0.38, -0.86, 0.0),
+)
+INTERACTIVE_BOTTLE_RADIUS = 0.040
+INTERACTIVE_BOTTLE_HALF_HEIGHT = 0.145
+INTERACTIVE_BOTTLE_MASS_KG = 0.75
+INTERACTIVE_BOTTLE_INSERT_DISTANCE_M = 0.13
+INTERACTIVE_GRIPPER_PROXY_RADIUS = 0.045
+INTERACTIVE_GRIPPER_PROXY_MAX_STEP_M = 0.018
+INTERACTIVE_ROBOT_PROXY_MAX_STEP_M = 0.080
+PICK_TABLE_SCENE_JSON = Path(__file__).resolve().parent / "assets" / "environment" / "pick_table_scene.json"
+T3_GRIPPER_OPEN_APERTURE_M = 0.075
+T3_GRIPPER_CLOSED_APERTURE_M = 0.045
+T3_GRIPPER_SIDES = ("left", "right")
+T3_BOTTLE_COLLIDER_RADIUS_BY_SUFFIX = {
+    "waist_yaw_link": 0.10,
+    "waist_roll_link": 0.10,
+    "torso_link": 0.17,
+    "head_pitch_link": 0.11,
+    "head_yaw_link": 0.11,
+    "left_wheel_link": 0.115,
+    "right_wheel_link": 0.115,
+    "left_base_link": 0.065,
+    "right_base_link": 0.065,
+    "left_gripper_base": 0.045,
+    "right_gripper_base": 0.045,
+    "left_gripper_flange": 0.035,
+    "right_gripper_flange": 0.035,
+    "left_gripper_link1": 0.022,
+    "left_gripper_link2": 0.022,
+    "right_gripper_link1": 0.022,
+    "right_gripper_link2": 0.022,
+}
+for _t3_side in ("left", "right"):
+    for _t3_link_index, _t3_radius in (
+        (1, 0.060),
+        (2, 0.055),
+        (3, 0.060),
+        (4, 0.050),
+        (5, 0.050),
+        (6, 0.045),
+        (7, 0.040),
+        (8, 0.035),
+    ):
+        T3_BOTTLE_COLLIDER_RADIUS_BY_SUFFIX[f"{_t3_side}_link{_t3_link_index}"] = _t3_radius
+T3_BOTTLE_COLLIDER_BOX_BY_SUFFIX = {
+    # Local offsets and half extents follow the T3 URDF collision geometry with
+    # a small contact margin so bottles hit the shell instead of the rendered mesh.
+    "base_link": (
+        ((0.0, 0.0, 0.13), (0.255, 0.175, 0.085)),
+        ((0.0, 0.155, 0.10), (0.245, 0.055, 0.115)),
+        ((0.0, -0.155, 0.10), (0.245, 0.055, 0.115)),
+    ),
+    "telescopic_lift_base_link": (
+        ((0.0, 0.0, 0.34), (0.075, 0.075, 0.34)),
+    ),
+    "telescopic_lift_carriage_link": (
+        ((0.0, 0.0, 0.22), (0.060, 0.060, 0.22)),
+    ),
+    "torso_link": (
+        ((0.02, 0.0, 0.20), (0.155, 0.105, 0.235)),
+    ),
+}
+SOMA_COLLIDER_SPECS = (
+    ("soma_torso", "Hips", "Chest", "box", 0.34, 0.22),
+    ("soma_head", "Neck2", "Head", "capsule", 0.18, 0.12),
+    ("soma_left_upper_arm", "LeftShoulder", "LeftForeArm", "capsule", 0.09, 0.0),
+    ("soma_left_forearm", "LeftForeArm", "LeftHand", "capsule", 0.075, 0.0),
+    ("soma_right_upper_arm", "RightShoulder", "RightForeArm", "capsule", 0.09, 0.0),
+    ("soma_right_forearm", "RightForeArm", "RightHand", "capsule", 0.075, 0.0),
+    ("soma_left_thigh", "LeftLeg", "LeftShin", "capsule", 0.11, 0.0),
+    ("soma_left_shin", "LeftShin", "LeftFoot", "capsule", 0.095, 0.0),
+    ("soma_right_thigh", "RightLeg", "RightShin", "capsule", 0.11, 0.0),
+    ("soma_right_shin", "RightShin", "RightFoot", "capsule", 0.095, 0.0),
+)
+SOMA_77_JOINT_INDEX = {
+    "Hips": 0,
+    "Chest": 3,
+    "Neck2": 5,
+    "Head": 6,
+    "LeftShoulder": 11,
+    "LeftForeArm": 13,
+    "LeftHand": 14,
+    "RightShoulder": 39,
+    "RightForeArm": 41,
+    "RightHand": 42,
+    "LeftLeg": 64,
+    "LeftShin": 65,
+    "LeftFoot": 66,
+    "RightLeg": 69,
+    "RightShin": 70,
+    "RightFoot": 71,
+}
 
 
 def _env_vec3(name: str, default: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -385,12 +495,65 @@ def _as_float(value, default: float = 0.0) -> float:
     return parsed if np.isfinite(parsed) else default
 
 
+def _clean_pasted_path(value: str | Path) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.replace("\n", " ").replace("\r", " ").strip()
+    if text.startswith("file://"):
+        text = text[len("file://") :]
+    text = text.strip().strip("'\"")
+    text = re.sub(r"\\([^\\])", r"\1", text)
+    return text.strip()
+
+
+def _resolve_playback_path(value: str | Path, suffixes: tuple[str, ...]) -> Path:
+    text = _clean_pasted_path(value)
+    if not text:
+        return Path("")
+    path = Path(text).expanduser()
+    if path.is_file():
+        return path
+    name = path.name
+    roots = (
+        Path.cwd(),
+        DOWNLOADS_ROOT,
+        DOWNLOADS_ROOT / "full",
+        DOWNLOADS_ROOT / "t3_hardware_logs",
+        ARDY_WORKSPACE_ROOT,
+        ARDY_WORKSPACE_ROOT / ".cache" / "t3_live",
+        ARDY_WORKSPACE_ROOT / ".cache" / "t3_live" / "full",
+        REPO_ROOT,
+        REPO_ROOT / ".cache" / "t3_live",
+        REPO_ROOT / ".cache" / "t3_live" / "full",
+    )
+    candidates = []
+    if name:
+        for root in roots:
+            candidate = root / name
+            if candidate.is_file():
+                candidates.append(candidate)
+    if not candidates:
+        stem = path.stem
+        for suffix in suffixes:
+            for root in roots:
+                candidate = root / f"{stem}{suffix}"
+                if candidate.is_file():
+                    candidates.append(candidate)
+    if candidates:
+        return max(candidates, key=lambda candidate: candidate.stat().st_mtime)
+    return path
+
+
 def _read_t3_csv_rows(path: str | Path) -> list[dict[str, float | str]]:
-    csv_path = Path(path).expanduser()
+    csv_path = _resolve_playback_path(path, (".csv",))
     with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         if reader.fieldnames is None:
             raise ValueError(f"T3 CSV has no header: {csv_path}")
+        joint_columns = sorted(set(reader.fieldnames) & set(T3_ROW_TO_JOINT))
+        if not joint_columns and "joint_names" not in reader.fieldnames and "joint_cfg" not in reader.fieldnames:
+            raise ValueError(f"T3 CSV has no known robot joint columns: {csv_path}")
         rows: list[dict[str, float | str]] = []
         for row in reader:
             parsed = {}
@@ -462,15 +625,28 @@ def _apply_differential_drive_root(rows: list[dict[str, float | str]]) -> None:
 
 def _latest_file(patterns: tuple[str, ...]) -> str:
     all_files = []
-    for pattern in patterns:
-        all_files.extend(path for path in Path(REPO_ROOT).glob(pattern) if path.is_file())
+    roots = (REPO_ROOT, ARDY_WORKSPACE_ROOT, Path.cwd(), DOWNLOADS_ROOT, DOWNLOADS_ROOT / "full")
+    seen = set()
+    for root in roots:
+        for pattern in patterns:
+            for path in Path(root).glob(pattern):
+                if not path.is_file():
+                    continue
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                all_files.append(resolved)
     return str(max(all_files, key=lambda path: path.stat().st_mtime)) if all_files else ""
 
 
 def _latest_t3_csv_path() -> str:
     return _latest_file(
         (
+            ".cache/t3_live/*.csv",
             ".cache/t3_live/full/*.csv",
+            "full/*.csv",
+            "t3_hardware_logs/*.csv",
             "outputs/t3_hardware_logs/*.csv",
             "outputs/t3_hardware_csv_segments/*.csv",
             ".cache/export/*.csv",
@@ -481,7 +657,14 @@ def _latest_t3_csv_path() -> str:
 def _latest_soma_bvh_path() -> str:
     return _latest_file(
         (
+            ".cache/t3_live/*.soma.bvh",
+            ".cache/t3_live/*.bvh",
             ".cache/t3_live/full/*.soma.bvh",
+            ".cache/t3_live/full/*.bvh",
+            "full/*.soma.bvh",
+            "full/*.bvh",
+            "t3_hardware_logs/*.soma.bvh",
+            "t3_hardware_logs/*.bvh",
             "outputs/t3_hardware_logs/*.soma.bvh",
             ".cache/export/*.bvh",
         )
@@ -489,13 +672,16 @@ def _latest_soma_bvh_path() -> str:
 
 
 def _matching_bvh_for_csv(csv_path: str | Path) -> str:
-    path = Path(csv_path).expanduser()
+    path = _resolve_playback_path(csv_path, (".csv",))
     candidate = path.with_suffix(".soma.bvh")
-    return str(candidate) if candidate.is_file() else ""
+    if candidate.is_file():
+        return str(candidate)
+    resolved = _resolve_playback_path(path.with_suffix(".soma.bvh").name, (".soma.bvh", ".bvh"))
+    return str(resolved) if resolved.is_file() else ""
 
 
 def _matching_csv_for_bvh(bvh_path: str | Path) -> str:
-    path = Path(bvh_path).expanduser()
+    path = _resolve_playback_path(bvh_path, (".soma.bvh", ".bvh"))
     name = path.name
     if name.endswith(".soma.bvh"):
         candidate = path.with_name(name[: -len(".soma.bvh")] + ".csv")
@@ -503,17 +689,43 @@ def _matching_csv_for_bvh(bvh_path: str | Path) -> str:
         candidate = path.with_suffix(".csv")
     else:
         candidate = path.with_suffix(".csv")
-    return str(candidate) if candidate.is_file() else ""
+    if candidate.is_file():
+        return str(candidate)
+    resolved = _resolve_playback_path(candidate.name, (".csv",))
+    return str(resolved) if resolved.is_file() else ""
 
 
 def _read_path_file(filename: str) -> str:
-    path = REPO_ROOT / ".cache" / "t3_live" / filename
-    try:
-        value = path.read_text(encoding="utf-8").strip().splitlines()[0].strip()
-    except Exception:
+    def read_existing(name: str) -> str:
+        candidates = (
+            REPO_ROOT / ".cache" / "t3_live" / name,
+            ARDY_WORKSPACE_ROOT / ".cache" / "t3_live" / name,
+            REPO_ROOT / name,
+            ARDY_WORKSPACE_ROOT / name,
+            Path.cwd() / name,
+            Path.cwd() / ".cache" / "t3_live" / name,
+        )
+        for candidate in candidates:
+            try:
+                value = candidate.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+            except Exception:
+                continue
+            if value:
+                return value
         return ""
-    return value
 
+    direct_value = read_existing(filename)
+    if direct_value:
+        return direct_value
+    if filename == "rtx_bvh_path.txt":
+        csv_path = read_existing("rtx_csv_path.txt")
+        paired_bvh = _matching_bvh_for_csv(csv_path) if csv_path else ""
+        return paired_bvh or _latest_soma_bvh_path()
+    if filename == "rtx_csv_path.txt":
+        bvh_path = read_existing("rtx_bvh_path.txt")
+        paired_csv = _matching_csv_for_bvh(bvh_path) if bvh_path else ""
+        return paired_csv or _latest_t3_csv_path()
+    return ""
 
 def _rotation_from_bvh_channels(channels: list[str], values: np.ndarray) -> np.ndarray:
     rotation_channels = []
@@ -585,9 +797,11 @@ def _load_bvh_frames_with_ardy_python(bvh_path: str | Path) -> tuple[list[dict],
         raise RuntimeError(f"BVH helper not found: {BVH_FRAME_HELPER}")
 
     env = dict(os.environ)
-    repo_path = str(REPO_ROOT)
+    repo_paths = [str(REPO_ROOT), str(ARDY_WORKSPACE_ROOT)]
     current_pythonpath = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{repo_path}{os.pathsep}{current_pythonpath}" if current_pythonpath else repo_path
+    if current_pythonpath:
+        repo_paths.append(current_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(repo_paths)
     cmd = [
         str(helper_python),
         str(BVH_FRAME_HELPER),
@@ -627,8 +841,8 @@ def _make_file_playback_frames(
     mode: str,
 ) -> tuple[list[dict], float]:
     mode = mode.lower()
-    bvh_path = str(bvh_path or "").strip()
-    csv_path = str(csv_path or "").strip()
+    bvh_path = _clean_pasted_path(bvh_path)
+    csv_path = _clean_pasted_path(csv_path)
     if mode == "both":
         paired_bvh = _matching_bvh_for_csv(csv_path) if csv_path else ""
         paired_csv = _matching_csv_for_bvh(bvh_path) if bvh_path else ""
@@ -752,15 +966,35 @@ def _make_file_playback_frames(
 def _ui_input_text(ui, label: str, value: str) -> str:
     try:
         changed, new_value = ui.input_text(label, value, 2048)
-        return str(new_value) if changed else value
+        return _clean_pasted_path(new_value) if changed else value
     except Exception:
         try:
             changed, new_value = ui.input_text(label, value)
-            return str(new_value) if changed else value
+            return _clean_pasted_path(new_value) if changed else value
         except Exception:
             ui.text(f"{label}:")
             ui.text(value if value else "(set ARDY_NEWTON_FILE_* env var)")
             return value
+
+
+def _browse_playback_file(title: str, filetypes: tuple[tuple[str, str], ...]) -> str:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askopenfilename(
+            title=title,
+            initialdir=str(DOWNLOADS_ROOT),
+            filetypes=filetypes,
+        )
+        root.destroy()
+        return _clean_pasted_path(path)
+    except Exception as exc:
+        print(f"[ARDY Newton Viewer] file picker failed: {exc}", flush=True)
+        return ""
 
 
 def _parse_args() -> argparse.Namespace:
@@ -795,12 +1029,6 @@ def _parse_args() -> argparse.Namespace:
         help="Newton floor height used to align streamed SOMA/T3 meshes to the ground plane.",
     )
     parser.add_argument(
-        "--pick-object",
-        choices=PICK_OBJECT_CHOICES,
-        default=os.environ.get("ARDY_NEWTON_PICK_OBJECT", "cube").lower(),
-        help="Add a Newton collision object to touch/pick in the viewer.",
-    )
-    parser.add_argument(
         "--pick-object-position",
         type=float,
         nargs=3,
@@ -819,6 +1047,18 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=float(os.environ.get("ARDY_NEWTON_PICK_OBJECT_PUSH_MASS_LIMIT_KG", str(PICK_OBJECT_PUSH_MASS_LIMIT_KG))),
         help="Objects at or below this mass can be pushed by streamed actors; heavier objects block them.",
+    )
+    parser.add_argument(
+        "--physics-test-shapes",
+        action="store_true",
+        default=os.environ.get("ARDY_NEWTON_PHYSICS_TEST_SHAPES", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Add the falling dynamic shapes from Newton's basic_shapes example.",
+    )
+    parser.add_argument(
+        "--pick-table-physics",
+        action="store_true",
+        default=os.environ.get("ARDY_NEWTON_PICK_TABLE_PHYSICS", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Add shared pick-table table collider and dynamic bottle physics independent of the background USD.",
     )
     parser.add_argument(
         "--record-video",
@@ -867,6 +1107,18 @@ def _parse_args() -> argparse.Namespace:
         help="Native Newton viewer window height in pixels.",
     )
     parser.add_argument(
+        "--headless",
+        action="store_true",
+        default=os.environ.get("ARDY_NEWTON_HEADLESS", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Run ViewerRTX without opening a window.",
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=int(os.environ.get("ARDY_NEWTON_NUM_FRAMES", "0")),
+        help="Stop after this many rendered frames in headless mode; 0 means run until closed.",
+    )
+    parser.add_argument(
         "--file-csv",
         default=os.environ.get("ARDY_NEWTON_FILE_CSV_PATH", ""),
         help="T3 CSV path preloaded into the native viewer File Playback panel.",
@@ -893,12 +1145,418 @@ def _parse_args() -> argparse.Namespace:
         default=int(os.environ.get("ARDY_NEWTON_WEBSOCKET_PORT", "8765")),
         help="Port for --websocket-server.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--ovstream-webrtc",
+        action="store_true",
+        default=os.environ.get("ARDY_NEWTON_OVSTREAM_WEBRTC", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Stream ViewerRTX output to a browser with ovstream WebRTC.",
+    )
+    parser.add_argument(
+        "--ovstream-port",
+        type=int,
+        action="append",
+        default=None,
+        help="WebRTC signaling port for --ovstream-webrtc. May be passed multiple times.",
+    )
+    parser.add_argument(
+        "--ovstream-stream-port",
+        type=int,
+        action="append",
+        default=None,
+        help="WebRTC media stream port for --ovstream-webrtc. May be passed multiple times.",
+    )
+    args = parser.parse_args()
+    args.pick_object = "none"
+    args.ovstream_port = _resolve_repeated_ports(
+        args.ovstream_port,
+        os.environ.get("ARDY_NEWTON_OVSTREAM_PORT"),
+        49100,
+    )
+    args.ovstream_stream_port = _resolve_repeated_ports(
+        args.ovstream_stream_port,
+        os.environ.get("ARDY_NEWTON_OVSTREAM_STREAM_PORT"),
+        47998,
+        count=len(args.ovstream_port),
+    )
+    return args
+
+
+def _resolve_repeated_ports(
+    cli_values: list[int] | None,
+    env_value: str | None,
+    default: int,
+    count: int | None = None,
+) -> list[int]:
+    values = list(cli_values or [])
+    if not values and env_value:
+        for part in re.split(r"[\s,]+", env_value.strip()):
+            if part:
+                values.append(int(part))
+    if not values:
+        values = [int(default)]
+    if count is not None and len(values) < count:
+        next_port = int(values[-1])
+        while len(values) < count:
+            next_port += 1
+            values.append(next_port)
+    return values[:count] if count is not None else values
+
+
+
+class OvstreamWebRtcBridge:
+    def __init__(self, viewer, wp, port: int, stream_port: int, camera_preset: str):
+        self.viewer = viewer
+        self.wp = wp
+        self.port = int(port)
+        self.stream_port = int(stream_port)
+        self.camera_preset = camera_preset
+        self.enabled = False
+        self.server = None
+        self.stream_buf = None
+        self.width = 0
+        self.height = 0
+        self.frame_count = 0
+        self.drop_count = 0
+        self.client_connected = False
+        self._last_disconnect_time = 0.0
+        self.status = "ovstream stopped"
+        self._ovstream = None
+        self._ovrtx_device = None
+        self._draw_stream = None
+        self._draw_event = None
+        self._swap_kernel = None
+        self._copy_rgba_kernel = None
+        self._copy_vec4ub_kernel = None
+        self._first_stream_logged = False
+        self._first_error_logged = False
+        self._first_pixel_logged = False
+        self._input_count = 0
+        self._left_button = False
+        self._last_mouse_x = None
+        self._last_mouse_y = None
+        self._orbit_target = np.array([0.0, 0.0, 0.8], dtype=np.float64)
+        self._orbit_radius = None
+        self._orbit_theta = None
+        self._orbit_phi = None
+
+    def start(self) -> None:
+        if self.enabled:
+            return
+        try:
+            import ovstream
+            from ovrtx import Device
+        except Exception as exc:
+            self.status = f"ovstream unavailable: {exc}"
+            print(f"[ARDY Newton Viewer] {self.status}", flush=True)
+            return
+        if not hasattr(self.viewer, "_render_products"):
+            self.status = "ovstream requires ViewerRTX render products"
+            print(f"[ARDY Newton Viewer] {self.status}", flush=True)
+            return
+        self._ovstream = ovstream
+        self._ovrtx_device = Device
+        self._swap_kernel = _ovstream_swap_rb_kernel(self.wp)
+        self._copy_rgba_kernel = _ovstream_copy_rgba_to_bgra_kernel(self.wp)
+        self._copy_vec4ub_kernel = _ovstream_copy_vec4ub_to_bgra_kernel(self.wp)
+        try:
+            ovstream.initialize()
+            self.server = ovstream.Server(ovstream.ServerType.WEBRTC)
+
+            def on_connection(connected):
+                self.client_connected = bool(connected)
+                if self.client_connected:
+                    self.status = f"ovstream client connected on {self.port}"
+                    self.drop_count = 0
+                else:
+                    self._last_disconnect_time = time.monotonic()
+                    self.status = f"ovstream waiting for client on {self.port}"
+                print(
+                    f"[ARDY Newton Viewer] ovstream WebRTC client {'connected' if connected else 'disconnected'} "
+                    f"on {self.port}",
+                    flush=True,
+                )
+
+            self.server.on_connection = on_connection
+            self.server.on_input = self._on_input
+            self.enabled = True
+            self.status = "ovstream waiting for first RTX frame"
+            print(
+                f"[ARDY Newton Viewer] ovstream WebRTC enabled; signaling port will be {self.port}, media port {self.stream_port}",
+                flush=True,
+            )
+        except Exception as exc:
+            self.status = f"ovstream start failed: {exc}"
+            print(f"[ARDY Newton Viewer] {self.status}", flush=True)
+            self.close()
+
+    def _ensure_orbit_camera_state(self) -> None:
+        if self._orbit_radius is not None:
+            return
+        position, _pitch, _yaw, _fov = _camera_values(self.viewer)
+        offset = position - self._orbit_target
+        radius = float(np.linalg.norm(offset))
+        if radius < 1.0e-4:
+            radius = 4.0
+            offset = np.array([0.0, -radius, 0.8], dtype=np.float64)
+        horizontal = max(float(np.hypot(offset[0], offset[1])), 1.0e-6)
+        self._orbit_radius = max(0.5, radius)
+        self._orbit_theta = float(math.atan2(offset[1], offset[0]))
+        self._orbit_phi = float(math.atan2(offset[2], horizontal))
+
+    def _apply_orbit_camera(self) -> None:
+        self._ensure_orbit_camera_state()
+        phi = max(math.radians(-75.0), min(math.radians(75.0), float(self._orbit_phi)))
+        radius = max(0.5, float(self._orbit_radius))
+        theta = float(self._orbit_theta)
+        cos_phi = math.cos(phi)
+        position = self._orbit_target + np.array(
+            [
+                radius * cos_phi * math.cos(theta),
+                radius * cos_phi * math.sin(theta),
+                radius * math.sin(phi),
+            ],
+            dtype=np.float64,
+        )
+        if position[2] < 0.1:
+            position[2] = 0.1
+        _set_camera_look_at(self.viewer, self.wp, position, self._orbit_target)
+
+    def _reset_orbit_camera(self) -> None:
+        _set_camera_by_name(self.viewer, self.wp, self.camera_preset)
+        self._orbit_radius = None
+        self._orbit_theta = None
+        self._orbit_phi = None
+
+    def _on_input(self, event) -> None:
+        try:
+            self._input_count += 1
+            if self._input_count <= 5:
+                print(f"[ARDY Newton Viewer] ovstream input {event.type.name}", flush=True)
+            if event.type == self._ovstream.InputEventType.MOUSE:
+                mouse = event.mouse
+                if mouse.type == self._ovstream.MouseEventType.BUTTON:
+                    if mouse.data == self._ovstream.MouseButton.LEFT:
+                        self._left_button = mouse.button_state == self._ovstream.KeyState.DOWN
+                        self._last_mouse_x = mouse.x
+                        self._last_mouse_y = mouse.y
+                        self._ensure_orbit_camera_state()
+                elif mouse.type == self._ovstream.MouseEventType.MOVE:
+                    if self._left_button and self._last_mouse_x is not None and self._last_mouse_y is not None:
+                        self._ensure_orbit_camera_state()
+                        dx = float(mouse.x - self._last_mouse_x)
+                        dy = float(mouse.y - self._last_mouse_y)
+                        self._orbit_theta -= dx * 0.005
+                        self._orbit_phi += dy * 0.005
+                        self._apply_orbit_camera()
+                    self._last_mouse_x = mouse.x
+                    self._last_mouse_y = mouse.y
+                elif mouse.type == self._ovstream.MouseEventType.WHEEL:
+                    self._ensure_orbit_camera_state()
+                    self._orbit_radius = max(0.5, float(self._orbit_radius) - float(mouse.scroll_y) * 0.25)
+                    self._apply_orbit_camera()
+            elif event.type == self._ovstream.InputEventType.KEYBOARD:
+                if event.keyboard.key_state == self._ovstream.KeyState.DOWN:
+                    self._reset_orbit_camera()
+        except Exception as exc:
+            print(f"[ARDY Newton Viewer] ovstream input failed: {exc}", flush=True)
+
+    def stream_latest(self) -> None:
+        if not self.enabled or self._ovstream is None:
+            return
+        products = getattr(self.viewer, "_render_products", None)
+        if products is None:
+            return
+        if self.server is None:
+            return
+        if not self.client_connected and self.stream_buf is not None:
+            self.status = f"ovstream waiting for client on {self.port}"
+            return
+        try:
+            for _pname, product in products.items():
+                for frame in product.frames:
+                    render_var = frame.render_vars.get("LdrColor")
+                    if render_var is None:
+                        continue
+                    with render_var.map(device=self._ovrtx_device.CUDA) as mapping:
+                        tensor_obj = getattr(mapping, "tensor", None)
+                        source = None
+                        if tensor_obj is not None:
+                            try:
+                                source = self.wp.from_dlpack(tensor_obj)
+                            except Exception:
+                                source = None
+                        if source is None:
+                            source = self.wp.from_dlpack(mapping, dtype=self.wp.vec4ub)
+                        if source.ndim == 3 and source.shape[2] == 4 and source.dtype == self.wp.uint8:
+                            height, source_width = int(source.shape[0]), int(source.shape[1])
+                            stream_width = _ovstream_encoder_safe_width(source_width)
+                            self._ensure_started(stream_width, height)
+                            self.wp.launch(
+                                self._copy_rgba_kernel,
+                                dim=(self.width, self.height),
+                                inputs=[source, self.stream_buf],
+                                device="cuda:0",
+                            )
+                        elif source.ndim == 2 and source.dtype == self.wp.vec4ub:
+                            height, source_width = int(source.shape[0]), int(source.shape[1])
+                            stream_width = _ovstream_encoder_safe_width(source_width)
+                            self._ensure_started(stream_width, height)
+                            self.wp.launch(
+                                self._copy_vec4ub_kernel,
+                                dim=(self.width, self.height),
+                                inputs=[source, self.stream_buf],
+                                device="cuda:0",
+                            )
+                        else:
+                            self.status = f"ovstream unexpected frame shape/dtype: {source.shape} {source.dtype}"
+                            if not self._first_error_logged:
+                                print(f"[ARDY Newton Viewer] {self.status}", flush=True)
+                                self._first_error_logged = True
+                            return
+                        self.wp.synchronize_device("cuda:0")
+                    if not self._first_pixel_logged:
+                        sample = self.stream_buf.numpy()
+                        mean = float(np.mean(sample[:, :, :3]))
+                        std = float(np.std(sample[:, :, :3]))
+                        alpha_mean = float(np.mean(sample[:, :, 3]))
+                        self.status = (
+                            f"ovstream buffer {self.width}x{self.height} "
+                            f"rgb_mean={mean:.2f} rgb_std={std:.2f} alpha_mean={alpha_mean:.2f}"
+                        )
+                        print(f"[ARDY Newton Viewer] {self.status}", flush=True)
+                        self._first_pixel_logged = True
+                    if not self.client_connected:
+                        if time.monotonic() - self._last_disconnect_time < 0.5:
+                            self.status = f"ovstream reconnect settling on {self.port}"
+                        else:
+                            self.status = f"ovstream ready on {self.port}; waiting for client"
+                        return
+                    self._draw_stream.record_event(self._draw_event)
+                    video_frame = self._ovstream.VideoFrame.from_cuda_array(
+                        self.stream_buf,
+                        sync=self._ovstream.CudaSync(
+                            stream=self._draw_stream.cuda_stream,
+                            wait_event=self._draw_event.cuda_event,
+                        ),
+                    )
+                    try:
+                        self.server.stream_video(video_frame)
+                    except self._ovstream.OvstreamError as exc:
+                        self.drop_count += 1
+                        message = str(exc)
+                        self.status = f"ovstream stream_video failed: {message} drops={self.drop_count}"
+                        if self.client_connected or "no client connected" not in message.lower():
+                            print(f"[ARDY Newton Viewer] {self.status}", flush=True)
+                        return
+                    self.frame_count += 1
+                    self.status = f"ovstream WebRTC {self.width}x{self.height} frames={self.frame_count} drops={self.drop_count}"
+                    if not self._first_stream_logged:
+                        print(f"[ARDY Newton Viewer] {self.status}", flush=True)
+                        self._first_stream_logged = True
+                    return
+        except Exception as exc:
+            self.status = f"ovstream stream failed: {exc}"
+            print(f"[ARDY Newton Viewer] {self.status}", flush=True)
+            self.enabled = False
+
+    def _ensure_started(self, width: int, height: int) -> None:
+        if self.server is None:
+            raise RuntimeError("ovstream server was not created")
+        if self.stream_buf is not None and self.width == width and self.height == height:
+            return
+        if self.stream_buf is not None:
+            raise RuntimeError(
+                f"ovstream frame size changed from {self.width}x{self.height} to {width}x{height}"
+            )
+        self.width = width
+        self.height = height
+        self.stream_buf = self.wp.zeros((height, width, 4), dtype=self.wp.uint8, device="cuda:0")
+        self._draw_stream = self.wp.get_stream("cuda:0")
+        self._draw_event = self.wp.Event(device="cuda:0")
+        cuda_context = int(self.wp.get_device("cuda:0").context)
+        cfg = self._ovstream.ServerConfig(
+            width=width,
+            height=height,
+            cuda_device=0,
+            cuda_context=cuda_context,
+        )
+        cfg.webrtc_signal_port = self.port
+        cfg.stream_port = self.stream_port
+        self.server.start(cfg)
+        print(
+            f"[ARDY Newton Viewer] ovstream WebRTC signal port {self.port}, media port {self.stream_port}; "
+            f"open ovstream-src/examples/webrtc_client/index.html and connect to 127.0.0.1:{self.port}",
+            flush=True,
+        )
+
+    def close(self) -> None:
+        if self.server is not None:
+            try:
+                self.server.stop()
+            except Exception:
+                pass
+            try:
+                self.server.close()
+            except Exception:
+                pass
+            self.server = None
+        if self._ovstream is not None:
+            try:
+                self._ovstream.shutdown()
+            except Exception:
+                pass
+        self.enabled = False
+        self.status = "ovstream stopped"
+
+
+def _ovstream_swap_rb_kernel(wp):
+    @wp.kernel
+    def swap_rb(buf: wp.array3d(dtype=wp.uint8)):
+        x, y = wp.tid()
+        r = buf[y, x, 0]
+        b = buf[y, x, 2]
+        buf[y, x, 0] = b
+        buf[y, x, 2] = r
+        buf[y, x, 3] = wp.uint8(255)
+
+    return swap_rb
+
+
+def _ovstream_encoder_safe_width(width: int) -> int:
+    safe_width = int(width) - (int(width) % 8)
+    return max(8, safe_width)
+
+
+def _ovstream_copy_rgba_to_bgra_kernel(wp):
+    @wp.kernel
+    def copy_rgba_to_bgra(src: wp.array3d(dtype=wp.uint8), dst: wp.array3d(dtype=wp.uint8)):
+        x, y = wp.tid()
+        dst[y, x, 0] = src[y, x, 2]
+        dst[y, x, 1] = src[y, x, 1]
+        dst[y, x, 2] = src[y, x, 0]
+        dst[y, x, 3] = wp.uint8(255)
+
+    return copy_rgba_to_bgra
+
+
+def _ovstream_copy_vec4ub_to_bgra_kernel(wp):
+    @wp.kernel
+    def copy_vec4ub_to_bgra(src: wp.array2d(dtype=wp.vec4ub), dst: wp.array3d(dtype=wp.uint8)):
+        x, y = wp.tid()
+        rgba = src[y, x]
+        dst[y, x, 0] = rgba[2]
+        dst[y, x, 1] = rgba[1]
+        dst[y, x, 2] = rgba[0]
+        dst[y, x, 3] = wp.uint8(255)
+
+    return copy_vec4ub_to_bgra
 
 
 def _create_viewer(newton, args: argparse.Namespace):
     width = max(320, int(args.viewer_width))
     height = max(240, int(args.viewer_height))
+    if args.headless and args.viewer != "rtx":
+        raise RuntimeError("--headless is currently supported only with --viewer rtx")
     if args.viewer == "rtx":
         try:
             viewer = newton.viewer.ViewerRTX(
@@ -907,6 +1565,8 @@ def _create_viewer(newton, args: argparse.Namespace):
                 vsync=True,
                 environment=args.rtx_environment,
                 async_rendering=True,
+                headless=bool(args.headless),
+                num_frames=int(args.num_frames) if int(args.num_frames) > 0 else None,
             )
             _wrap_rtx_init_logging(viewer)
             return viewer
@@ -984,7 +1644,9 @@ def _infer_background_floor_z(background_usd: str | None) -> float | None:
         candidates: list[tuple[float, float, str]] = []
         for prim in stage.Traverse():
             prim_path = str(prim.GetPath()).lower()
-            if "ceiling" in prim_path or not any(token in prim_path for token in ("floor", "ground", "carpet", "rug", "tile")):
+            if "ceiling" in prim_path or not any(
+                token in prim_path for token in ("floor", "ground", "carpet", "rug", "tile", "plane")
+            ):
                 continue
             if not prim.IsA(UsdGeom.Boundable):
                 continue
@@ -1025,6 +1687,7 @@ def _resolve_floor_z(args: argparse.Namespace) -> float:
         args.floor_z = inferred
         return inferred
     args.floor_z = 0.0
+    print("[ARDY Newton Viewer] using default floor_z=0.000", flush=True)
     return 0.0
 
 
@@ -1133,6 +1796,7 @@ class RtxVideoRecorder:
         self._last_capture_time = 0.0
         self._current_view = None
         self._error = None
+        self._finalized = False
         if self.enabled:
             self.frames_dir.mkdir(parents=True, exist_ok=True)
             print(
@@ -1163,6 +1827,8 @@ class RtxVideoRecorder:
             camera_offset, target_offset = RECORD_VIEW_OFFSETS[view]
             camera_position = target_np + np.asarray(camera_offset, dtype=np.float64)
             look_target = target_np + np.asarray(target_offset, dtype=np.float64)
+            if hasattr(self.viewer, "camera") and hasattr(self.viewer.camera, "fov"):
+                self.viewer.camera.fov = float(RECORD_VIEW_FOV.get(view, 45.0))
             _set_camera_look_at(self.viewer, self.wp, camera_position, look_target)
             self._current_view = view
             return
@@ -1204,6 +1870,9 @@ class RtxVideoRecorder:
     def finalize(self) -> None:
         if not self.enabled:
             return
+        if self._finalized:
+            return
+        self._finalized = True
         if self.frame_count <= 0:
             print("[ARDY Newton Viewer] recording skipped: no frames captured", flush=True)
             return
@@ -1497,6 +2166,473 @@ def _actor_separation_from_pick_object(
     return correction
 
 
+def _actor_separation_from_aabb(
+    actor_bounds: tuple[np.ndarray, np.ndarray] | None,
+    obstacle_bounds: tuple[np.ndarray, np.ndarray],
+    margin: float = 0.02,
+    check_z: bool = True,
+) -> np.ndarray:
+    if actor_bounds is None:
+        return np.zeros(2, dtype=np.float64)
+    actor_mins, actor_maxs = actor_bounds
+    obstacle_mins, obstacle_maxs = obstacle_bounds
+    if (
+        actor_maxs[0] <= obstacle_mins[0]
+        or actor_mins[0] >= obstacle_maxs[0]
+        or actor_maxs[1] <= obstacle_mins[1]
+        or actor_mins[1] >= obstacle_maxs[1]
+        or (check_z and actor_maxs[2] <= obstacle_mins[2])
+        or (check_z and actor_mins[2] >= obstacle_maxs[2])
+    ):
+        return np.zeros(2, dtype=np.float64)
+
+    overlaps = np.array(
+        [
+            min(actor_maxs[0] - obstacle_mins[0], obstacle_maxs[0] - actor_mins[0]),
+            min(actor_maxs[1] - obstacle_mins[1], obstacle_maxs[1] - actor_mins[1]),
+        ],
+        dtype=np.float64,
+    )
+    actor_center = (actor_mins[:2] + actor_maxs[:2]) * 0.5
+    obstacle_center = (obstacle_mins[:2] + obstacle_maxs[:2]) * 0.5
+    axis = int(np.argmin(overlaps))
+    direction = 1.0 if actor_center[axis] >= obstacle_center[axis] else -1.0
+    if abs(actor_center[axis] - obstacle_center[axis]) < 1.0e-6:
+        direction = 1.0
+    correction = np.zeros(2, dtype=np.float64)
+    correction[axis] = direction * (float(overlaps[axis]) + float(margin))
+    return correction
+
+
+def _background_table_blockers(
+    background_usd: str | None,
+    force_pick_table: bool = False,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    path = Path(background_usd).expanduser().resolve() if background_usd else None
+    use_pick_table = bool(force_pick_table or (path is not None and path.name == "table_bottles_preview.usda"))
+    if not use_pick_table:
+        return []
+    scene = _load_pick_table_scene()
+    table = scene.get("table") if scene else None
+    if isinstance(table, dict):
+        center = np.asarray(table.get("center", (0.0, -0.75, 0.375)), dtype=np.float64)
+        size = np.asarray(table.get("size", (1.8, 0.9, 0.75)), dtype=np.float64)
+        if center.shape == (3,) and size.shape == (3,) and np.all(np.isfinite(center)) and np.all(np.isfinite(size)):
+            mins = center - size * 0.5
+            maxs = center + size * 0.5
+            print(
+                "[ARDY Newton Viewer] table blocker bounds from pick table scene: "
+                f"min=({mins[0]:.2f},{mins[1]:.2f},{mins[2]:.2f}) "
+                f"max=({maxs[0]:.2f},{maxs[1]:.2f},{maxs[2]:.2f})",
+                flush=True,
+            )
+            return [(mins, maxs)]
+    if path is None:
+        return []
+    try:
+        from pxr import Usd, UsdGeom
+
+        stage = Usd.Stage.Open(str(path))
+        table_prim = stage.GetPrimAtPath("/World/Table") if stage is not None else None
+        if table_prim is None or not table_prim.IsValid():
+            return []
+        cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+            useExtentsHint=True,
+        )
+        box = cache.ComputeWorldBound(table_prim).ComputeAlignedBox()
+        mins = np.array(box.GetMin(), dtype=np.float64)
+        maxs = np.array(box.GetMax(), dtype=np.float64)
+        if not np.all(np.isfinite(mins)) or not np.all(np.isfinite(maxs)):
+            return []
+        margin = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        mins -= margin
+        maxs += margin
+        print(
+            "[ARDY Newton Viewer] table blocker bounds from USD: "
+            f"min=({mins[0]:.2f},{mins[1]:.2f},{mins[2]:.2f}) "
+            f"max=({maxs[0]:.2f},{maxs[1]:.2f},{maxs[2]:.2f})",
+            flush=True,
+        )
+        return [(mins, maxs)]
+    except Exception as exc:
+        print(f"[ARDY Newton Viewer] table blocker disabled: could not read USD table bounds: {exc}", flush=True)
+        return []
+
+
+def _load_pick_table_scene() -> dict:
+    try:
+        with PICK_TABLE_SCENE_JSON.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _is_table_bottle_preview(background_usd: str | None) -> bool:
+    if not background_usd:
+        return False
+    return Path(background_usd).expanduser().name == "table_bottles_preview.usda"
+
+
+def _use_pick_table_physics(args: argparse.Namespace) -> bool:
+    return bool(args.pick_table_physics or _is_table_bottle_preview(args.background_usd))
+
+
+def _interactive_bottle_spawn_positions(
+    obstacle_bounds: list[tuple[np.ndarray, np.ndarray]] | None,
+) -> list[tuple[float, float, float]]:
+    scene = _load_pick_table_scene()
+    bottles = scene.get("bottles") if scene else None
+    if isinstance(bottles, list):
+        positions = []
+        for bottle in bottles:
+            if not isinstance(bottle, dict):
+                continue
+            center = bottle.get("center")
+            if isinstance(center, list | tuple) and len(center) == 3:
+                positions.append((float(center[0]), float(center[1]), float(center[2])))
+        if positions:
+            return positions
+    table_top_z = None
+    if obstacle_bounds:
+        table_top_z = max(float(maxs[2]) for _, maxs in obstacle_bounds)
+    z = (
+        float(table_top_z) + INTERACTIVE_BOTTLE_HALF_HEIGHT
+        if table_top_z is not None
+        else 0.898
+    )
+    return [(float(x), float(y), z) for x, y, _ in INTERACTIVE_BOTTLE_POSITIONS]
+
+
+def _add_table_physics_colliders(newton, wp, builder, obstacle_bounds: list[tuple[np.ndarray, np.ndarray]]) -> int:
+    if not obstacle_bounds:
+        return 0
+    cfg = newton.ModelBuilder.ShapeConfig(
+        density=0.0,
+        mu=0.9,
+        ke=8.0e4,
+        kd=2.0e3,
+        kf=2.0e3,
+        mu_torsional=0.04,
+        mu_rolling=0.02,
+        is_visible=False,
+        has_shape_collision=True,
+    )
+    count = 0
+    for table_idx, (mins, maxs) in enumerate(obstacle_bounds, start=1):
+        center = (np.asarray(mins, dtype=np.float64) + np.asarray(maxs, dtype=np.float64)) * 0.5
+        half = (np.asarray(maxs, dtype=np.float64) - np.asarray(mins, dtype=np.float64)) * 0.5
+        top_z = float(maxs[2])
+        builder.add_shape_box(
+            -1,
+            xform=wp.transform(
+                wp.vec3(float(center[0]), float(center[1]), top_z - 0.005),
+                wp.quat_identity(),
+            ),
+            hx=max(0.01, float(half[0])),
+            hy=max(0.01, float(half[1])),
+            hz=0.005,
+            cfg=cfg,
+            label=f"interactive_table_top_collider_{table_idx}",
+        )
+        count += 1
+    return count
+
+
+def _add_pick_table_visual_shapes(newton, wp, builder, enabled: bool) -> int:
+    if not enabled:
+        return 0
+    scene = _load_pick_table_scene()
+    table = scene.get("table") if scene else None
+    if not isinstance(table, dict):
+        return 0
+    center = np.asarray(table.get("center", (0.0, -0.75, 0.375)), dtype=np.float64)
+    size = np.asarray(table.get("size", (1.8, 0.9, 0.75)), dtype=np.float64)
+    if center.shape != (3,) or size.shape != (3,):
+        return 0
+    top_z = float(table.get("top_z", center[2] + size[2] * 0.5))
+    top_thickness = float(table.get("top_thickness", 0.05))
+    cfg = newton.ModelBuilder.ShapeConfig(
+        density=0.0,
+        mu=0.9,
+        ke=8.0e4,
+        kd=2.0e3,
+        kf=2.0e3,
+        is_visible=True,
+        has_shape_collision=False,
+    )
+    color = tuple(float(value) / 255.0 for value in table.get("color", (235, 238, 240)))
+    builder.add_shape_box(
+        -1,
+        xform=wp.transform(wp.vec3(float(center[0]), float(center[1]), top_z - top_thickness * 0.5), wp.quat_identity()),
+        hx=float(size[0]) * 0.5,
+        hy=float(size[1]) * 0.5,
+        hz=top_thickness * 0.5,
+        cfg=cfg,
+        color=color,
+        label="pick_table_visual_top",
+    )
+    leg_size = 0.045
+    leg_height = max(float(size[2]) - top_thickness, 0.05)
+    half_x = float(size[0]) * 0.5 - leg_size * 1.5
+    half_y = float(size[1]) * 0.5 - leg_size * 1.5
+    for index, (x_offset, y_offset) in enumerate(
+        ((-half_x, -half_y), (-half_x, half_y), (half_x, -half_y), (half_x, half_y)),
+        start=1,
+    ):
+        builder.add_shape_box(
+            -1,
+            xform=wp.transform(
+                wp.vec3(float(center[0] + x_offset), float(center[1] + y_offset), leg_height * 0.5),
+                wp.quat_identity(),
+            ),
+            hx=leg_size * 0.5,
+            hy=leg_size * 0.5,
+            hz=leg_height * 0.5,
+            cfg=cfg,
+            color=(0.34, 0.38, 0.42),
+            label=f"pick_table_visual_leg_{index}",
+        )
+    return 5
+
+
+def _add_interactive_bottles(newton, wp, builder, enabled: bool, bottle_positions) -> list[str]:
+    if not enabled:
+        return []
+    bottle_volume = (
+        math.pi * INTERACTIVE_BOTTLE_RADIUS**2 * (INTERACTIVE_BOTTLE_HALF_HEIGHT * 2.0)
+        + math.pi * 0.030**2 * 0.070
+    )
+    cfg = newton.ModelBuilder.ShapeConfig(
+        density=INTERACTIVE_BOTTLE_MASS_KG / bottle_volume,
+        mu=1.1,
+        ke=1.8e4,
+        kd=3.0e3,
+        kf=2.0e3,
+        restitution=0.0,
+        mu_torsional=0.10,
+        mu_rolling=0.08,
+    )
+    joint_names = []
+    for index, pos in enumerate(bottle_positions, start=1):
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(float(pos[0]), float(pos[1]), float(pos[2])), wp.quat_identity()),
+            label=f"interactive_water_bottle_{index}",
+        )
+        builder.add_shape_cylinder(
+            body,
+            radius=INTERACTIVE_BOTTLE_RADIUS,
+            half_height=INTERACTIVE_BOTTLE_HALF_HEIGHT,
+            cfg=cfg,
+            color=(0.38, 0.72, 0.96),
+            label=f"interactive_water_bottle_{index}_body",
+        )
+        builder.add_shape_cylinder(
+            body,
+            xform=wp.transform(wp.vec3(0.0, 0.0, -0.030), wp.quat_identity()),
+            radius=INTERACTIVE_BOTTLE_RADIUS * 1.015,
+            half_height=0.040,
+            cfg=cfg,
+            color=(0.03, 0.18, 0.42),
+            label=f"interactive_water_bottle_{index}_label",
+        )
+        builder.add_shape_cylinder(
+            body,
+            xform=wp.transform(wp.vec3(0.0, 0.0, INTERACTIVE_BOTTLE_HALF_HEIGHT + 0.035), wp.quat_identity()),
+            radius=0.030,
+            half_height=0.035,
+            cfg=cfg,
+            color=(0.78, 0.92, 1.00),
+            label=f"interactive_water_bottle_{index}_neck",
+        )
+        builder.add_shape_cylinder(
+            body,
+            xform=wp.transform(wp.vec3(0.0, 0.0, INTERACTIVE_BOTTLE_HALF_HEIGHT + 0.088), wp.quat_identity()),
+            radius=0.028,
+            half_height=0.018,
+            cfg=cfg,
+            color=(0.04, 0.34, 0.88),
+            label=f"interactive_water_bottle_{index}_cap",
+        )
+        joint_names.append(f"interactive_water_bottle_{index}")
+    return joint_names
+
+
+def _body_pose_by_suffix(model, state, suffix: str) -> tuple[np.ndarray, np.ndarray] | None:
+    body_q = state.body_q.numpy()
+    for body_idx, label in enumerate(model.body_label):
+        body_label = str(label).rsplit("/", 1)[-1]
+        if body_label == suffix:
+            body_pose = np.asarray(body_q[body_idx], dtype=np.float64)
+            return body_pose[0:3], body_pose[3:7]
+    return None
+
+
+def _body_center_by_suffix(model, state, suffix: str) -> np.ndarray | None:
+    pose = _body_pose_by_suffix(model, state, suffix)
+    return None if pose is None else pose[0]
+
+
+def _body_index_by_suffix(model, suffix: str) -> int | None:
+    for body_idx, label in enumerate(model.body_label):
+        body_label = str(label).rsplit("/", 1)[-1]
+        if body_label == suffix:
+            return int(body_idx)
+    return None
+
+
+def _set_body_pose(wp, state, body_idx: int, position, quat=None, zero_velocity: bool = True) -> None:
+    if body_idx < 0:
+        return
+    pos = np.asarray(position, dtype=np.float64)
+    q = np.asarray(quat if quat is not None else [0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    body_q = state.body_q.numpy().copy()
+    body_q[body_idx] = np.array([pos[0], pos[1], pos[2], q[0], q[1], q[2], q[3]], dtype=np.float32)
+    wp.copy(state.body_q, wp.array(body_q, dtype=wp.transform), 0, 0, len(body_q))
+    if zero_velocity and getattr(state, "body_qd", None) is not None:
+        body_qd = state.body_qd.numpy().copy()
+        body_qd[body_idx] = np.zeros(6, dtype=np.float32)
+        wp.copy(state.body_qd, wp.array(body_qd, dtype=wp.spatial_vector), 0, 0, len(body_qd))
+
+
+def _limited_step_position(previous: np.ndarray | None, target: np.ndarray, max_step: float) -> np.ndarray:
+    target = np.asarray(target, dtype=np.float64)
+    if previous is None:
+        return target
+    previous = np.asarray(previous, dtype=np.float64)
+    delta = target - previous
+    distance = float(np.linalg.norm(delta))
+    if distance <= float(max_step) or distance <= 1.0e-8:
+        return target
+    return previous + delta * (float(max_step) / distance)
+
+
+def _joint_scalar(model, joint_q_start, joint_name: str) -> float:
+    start = joint_q_start.get(joint_name)
+    if start is None:
+        return 0.0
+    return float(model.joint_q.numpy()[start])
+
+
+def _gripper_state(model, state, joint_q_start, side: str) -> dict | None:
+    base = _body_center_by_suffix(model, state, f"{side}_gripper_base")
+    finger1 = _body_center_by_suffix(model, state, f"{side}_gripper_link1")
+    finger2 = _body_center_by_suffix(model, state, f"{side}_gripper_link2")
+    if base is None or finger1 is None or finger2 is None:
+        return None
+    aperture = abs(_joint_scalar(model, joint_q_start, f"{side}_gripper_joint1")) + abs(
+        _joint_scalar(model, joint_q_start, f"{side}_gripper_joint2")
+    )
+    return {
+        "side": side,
+        "base": base,
+        "center": (finger1 + finger2) * 0.5,
+        "finger1": finger1,
+        "finger2": finger2,
+        "aperture": aperture,
+    }
+
+
+def _bottle_inside_gripper(bottle_pos: np.ndarray, gripper: dict) -> bool:
+    center = np.asarray(gripper["center"], dtype=np.float64)
+    base = np.asarray(gripper["base"], dtype=np.float64)
+    # The hand must be around the bottle, not just brushing it from far away.
+    return (
+        float(np.linalg.norm((bottle_pos - center)[:2])) <= INTERACTIVE_BOTTLE_INSERT_DISTANCE_M
+        and abs(float(bottle_pos[2] - center[2])) <= 0.18
+        and float(np.linalg.norm((bottle_pos - base)[:2])) <= 0.22
+    )
+
+
+def _update_interactive_bottles(
+    wp,
+    model,
+    state,
+    joint_q_start,
+    bottle_body_indices: list[int],
+    bottle_positions: list[np.ndarray],
+    held_bottles: dict[int, dict],
+    gripper_grasp_state: dict[str, dict],
+) -> None:
+    if not bottle_body_indices:
+        return
+    body_q = state.body_q.numpy()
+    for bottle_idx, body_idx in enumerate(bottle_body_indices):
+        if bottle_idx not in held_bottles:
+            bottle_positions[bottle_idx] = np.asarray(body_q[body_idx][0:3], dtype=np.float64)
+    grippers = [g for side in T3_GRIPPER_SIDES if (g := _gripper_state(model, state, joint_q_start, side)) is not None]
+    for gripper in grippers:
+        side_state = gripper_grasp_state.setdefault(
+            str(gripper["side"]),
+            {"was_open": False, "prev_aperture": float(gripper["aperture"])},
+        )
+        aperture = float(gripper["aperture"])
+        if aperture >= T3_GRIPPER_OPEN_APERTURE_M:
+            side_state["was_open"] = True
+        side_state["closing"] = aperture < float(side_state["prev_aperture"]) - 0.002
+        side_state["closed"] = aperture <= T3_GRIPPER_CLOSED_APERTURE_M
+        side_state["prev_aperture"] = aperture
+
+    for bottle_idx, bottle_pos in enumerate(bottle_positions):
+        if bottle_idx not in held_bottles:
+            for gripper in grippers:
+                side_state = gripper_grasp_state[str(gripper["side"])]
+                if (
+                    bool(side_state["was_open"])
+                    and bool(side_state["closing"])
+                    and bool(side_state["closed"])
+                    and _bottle_inside_gripper(bottle_pos, gripper)
+                ):
+                    held_bottles[bottle_idx] = {
+                        "side": str(gripper["side"]),
+                        "offset": bottle_pos - np.asarray(gripper["center"], dtype=np.float64),
+                    }
+                    side_state["was_open"] = False
+                    print(
+                        f"[ARDY Newton Viewer] {gripper['side']} gripper grasped bottle {bottle_idx + 1}",
+                        flush=True,
+                    )
+                    break
+        if bottle_idx in held_bottles:
+            hold = held_bottles[bottle_idx]
+            gripper = next((g for g in grippers if str(g["side"]) == hold["side"]), None)
+            if gripper is not None:
+                aperture = float(gripper["aperture"])
+                if aperture >= T3_GRIPPER_OPEN_APERTURE_M:
+                    print(
+                        f"[ARDY Newton Viewer] {gripper['side']} gripper released bottle {bottle_idx + 1}",
+                        flush=True,
+                    )
+                    del held_bottles[bottle_idx]
+                else:
+                    bottle_positions[bottle_idx] = np.asarray(gripper["center"], dtype=np.float64) + hold["offset"]
+                    _set_body_pose(wp, state, bottle_body_indices[bottle_idx], bottle_positions[bottle_idx])
+
+
+def _reset_interactive_bottles(
+    wp,
+    state,
+    state_next,
+    bottle_body_indices: list[int],
+    spawn_positions,
+    bottle_positions: list[np.ndarray],
+    held_bottles: dict[int, dict],
+    gripper_grasp_state: dict[str, dict],
+) -> None:
+    held_bottles.clear()
+    gripper_grasp_state.clear()
+    for bottle_idx, body_idx in enumerate(bottle_body_indices):
+        if bottle_idx >= len(spawn_positions):
+            break
+        position = np.asarray(spawn_positions[bottle_idx], dtype=np.float64)
+        bottle_positions[bottle_idx] = position
+        _set_body_pose(wp, state, body_idx, position)
+        _set_body_pose(wp, state_next, body_idx, position)
+    print(f"[ARDY Newton Viewer] reset {len(bottle_body_indices)} bottle position(s)", flush=True)
+
+
 def _apply_t3_row(
     wp,
     newton,
@@ -1512,6 +2648,9 @@ def _apply_t3_row(
     pick_size,
     pick_visible,
     pick_pushable,
+    body_flag_filter=None,
+    obstacle_bounds: list[tuple[np.ndarray, np.ndarray]] | None = None,
+    gripper_override: dict[str, float] | None = None,
 ):
     q = default_q.copy()
     live_root_pos = np.zeros(3, dtype=np.float64)
@@ -1568,20 +2707,56 @@ def _apply_t3_row(
                 if start is not None and row_key in row:
                     q[start] = float(row[row_key])
 
+        for joint_name in T3_STIFF_POSTURE_JOINTS:
+            start = joint_q_start.get(joint_name)
+            if start is not None:
+                q[start] = 0.0
+
+    if gripper_override:
+        for side in T3_GRIPPER_SIDES:
+            aperture = float(
+                np.clip(
+                    gripper_override.get(side, T3_GRIPPER_DEFAULT_APERTURE_M),
+                    0.0,
+                    T3_GRIPPER_MAX_APERTURE_M,
+                )
+            )
+            joint1_start = joint_q_start.get(f"{side}_gripper_joint1")
+            joint2_start = joint_q_start.get(f"{side}_gripper_joint2")
+            if joint1_start is not None:
+                q[joint1_start] = aperture * 0.5
+            if joint2_start is not None:
+                q[joint2_start] = -aperture * 0.5
+
     live_root_tx = _make_tx(wp, live_root_pos, live_root_quat)
     root_tx = wp.mul(offset_tx, live_root_tx)
     q[0:7] = _tx_to_numpy(root_tx)
     q[2] = float(floor_z)
     wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
-    newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
+    if body_flag_filter is None:
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
+    else:
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=body_flag_filter)
     bounds = _robot_shape_bounds(newton, model, state, t3_shape_count)
+    support_bounds = _robot_shape_bounds(
+        newton,
+        model,
+        state,
+        t3_shape_count,
+        body_suffixes=T3_GROUND_SUPPORT_BODY_SUFFIXES,
+    )
     correction = _actor_separation_from_pick_object(bounds, pick_position, pick_size, pick_visible, pick_pushable)
+    for obstacle in obstacle_bounds or []:
+        correction += _actor_separation_from_aabb(support_bounds, obstacle, margin=0.0, check_z=False)
     if np.any(correction):
         q[0] += correction[0]
         q[1] += correction[1]
         q[2] = float(floor_z)
         wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
-    newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
+    if body_flag_filter is None:
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
+    else:
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=body_flag_filter)
     return _make_tx(wp, q[0:3], q[3:7]), _robot_shape_bounds(newton, model, state, t3_shape_count)
 
 
@@ -1614,6 +2789,247 @@ def _add_pick_object(newton, wp, builder, args: argparse.Namespace) -> tuple[str
     return "ardy_pick_object_free_joint", size
 
 
+def _hidden_collider_cfg(newton):
+    return newton.ModelBuilder.ShapeConfig(
+        density=0.0,
+        mu=0.75,
+        ke=8.0e4,
+        kd=7.0e3,
+        kf=1.2e3,
+        restitution=0.0,
+        mu_torsional=0.04,
+        mu_rolling=0.06,
+        is_visible=False,
+        has_shape_collision=True,
+    )
+
+
+def _disable_shape_collision(newton, builder, start: int, end: int) -> None:
+    collide_bit = int(newton.ShapeFlags.COLLIDE_SHAPES)
+    for shape_idx in range(start, end):
+        builder.shape_flags[shape_idx] = int(builder.shape_flags[shape_idx]) & ~collide_bit
+
+
+def _add_hidden_actor_colliders(newton, wp, builder, floor_z: float) -> tuple[str, list[str]]:
+    cfg = _hidden_collider_cfg(newton)
+    robot_body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0, 0.0, float(floor_z) + 0.85), wp.quat_identity()),
+        mass=48.0,
+        is_kinematic=True,
+        label="hidden_robot_solid",
+    )
+    builder.add_shape_box(
+        robot_body,
+        hx=0.45,
+        hy=0.38,
+        hz=0.85,
+        cfg=cfg,
+        label="hidden_robot_solid_box",
+    )
+
+    human_body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0, 0.0, float(floor_z) + 0.9), wp.quat_identity()),
+        mass=70.0,
+        is_kinematic=True,
+        label="hidden_soma_solid",
+    )
+    builder.add_shape_capsule(
+        human_body,
+        radius=0.28,
+        half_height=0.75,
+        cfg=cfg,
+        label="hidden_soma_solid_capsule",
+    )
+    return "hidden_robot_solid_free_joint", "hidden_soma_solid_free_joint"
+
+
+def _add_hidden_gripper_colliders(newton, wp, builder) -> dict[str, str]:
+    cfg = _hidden_collider_cfg(newton)
+    joint_names: dict[str, str] = {}
+    for side in T3_GRIPPER_SIDES:
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+            mass=2.0,
+            is_kinematic=True,
+            label=f"hidden_{side}_gripper_contact",
+        )
+        builder.add_shape_sphere(
+            body,
+            radius=INTERACTIVE_GRIPPER_PROXY_RADIUS,
+            cfg=cfg,
+            label=f"hidden_{side}_gripper_contact_sphere",
+        )
+        joint_names[side] = f"hidden_{side}_gripper_contact_free_joint"
+    return joint_names
+
+
+def _add_hidden_t3_bottle_colliders(newton, wp, builder) -> dict[str, str]:
+    cfg = _hidden_collider_cfg(newton)
+    joint_names: dict[str, str] = {}
+    for suffix, shapes in T3_BOTTLE_COLLIDER_BOX_BY_SUFFIX.items():
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, -100.0), wp.quat_identity()),
+            mass=8.0,
+            is_kinematic=True,
+            label=f"hidden_t3_bottle_collision_{suffix}",
+        )
+        for shape_index, (offset, half_extents) in enumerate(shapes, start=1):
+            builder.add_shape_box(
+                body,
+                xform=wp.transform(
+                    wp.vec3(float(offset[0]), float(offset[1]), float(offset[2])),
+                    wp.quat_identity(),
+                ),
+                hx=float(half_extents[0]),
+                hy=float(half_extents[1]),
+                hz=float(half_extents[2]),
+                cfg=cfg,
+                label=f"hidden_t3_bottle_collision_{suffix}_box_{shape_index}",
+            )
+        companion_radius = T3_BOTTLE_COLLIDER_RADIUS_BY_SUFFIX.get(suffix)
+        if companion_radius is not None:
+            builder.add_shape_sphere(
+                body,
+                radius=float(companion_radius),
+                cfg=cfg,
+                label=f"hidden_t3_bottle_collision_{suffix}_sphere",
+            )
+        joint_names[suffix] = f"hidden_t3_bottle_collision_{suffix}_free_joint"
+    for suffix, radius in T3_BOTTLE_COLLIDER_RADIUS_BY_SUFFIX.items():
+        if suffix in T3_BOTTLE_COLLIDER_BOX_BY_SUFFIX:
+            continue
+        body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, -100.0), wp.quat_identity()),
+            mass=3.0,
+            is_kinematic=True,
+            label=f"hidden_t3_bottle_collision_{suffix}",
+        )
+        builder.add_shape_sphere(
+            body,
+            radius=float(radius),
+            cfg=cfg,
+            label=f"hidden_t3_bottle_collision_{suffix}_sphere",
+        )
+        joint_names[suffix] = f"hidden_t3_bottle_collision_{suffix}_free_joint"
+    return joint_names
+
+
+def _add_physics_test_shapes(newton, wp, builder, floor_z: float) -> tuple[int, int]:
+    from pxr import Usd
+    from newton.usd import get_mesh
+
+    drop_z = float(floor_z) + 2.0
+    x = 0.0
+    first_body = builder.body_count
+
+    builder.default_shape_cfg.mu = 1.0
+    builder.default_shape_cfg.mu_torsional = 0.01
+    builder.default_shape_cfg.mu_rolling = 3.0e-3
+
+    body_sphere = builder.add_body(
+        xform=wp.transform(p=wp.vec3(x, -2.0, drop_z), q=wp.quat_identity()),
+        label="physics_test_sphere",
+    )
+    builder.add_shape_sphere(body_sphere, radius=0.5)
+
+    body_ellipsoid = builder.add_body(
+        xform=wp.transform(p=wp.vec3(x, -6.0, drop_z), q=wp.quat_identity()),
+        label="physics_test_ellipsoid",
+    )
+    builder.add_shape_ellipsoid(body_ellipsoid, rx=0.5, ry=0.5, rz=0.25)
+
+    body_capsule = builder.add_body(
+        xform=wp.transform(p=wp.vec3(x, 0.0, drop_z), q=wp.quat_identity()),
+        label="physics_test_capsule",
+    )
+    builder.add_shape_capsule(body_capsule, radius=0.3, half_height=0.7)
+
+    body_cylinder = builder.add_body(
+        xform=wp.transform(p=wp.vec3(x, -4.0, drop_z), q=wp.quat_identity()),
+        label="physics_test_cylinder",
+    )
+    builder.add_shape_cylinder(body_cylinder, radius=0.4, half_height=0.6)
+
+    body_box = builder.add_body(
+        xform=wp.transform(p=wp.vec3(x, 2.0, drop_z), q=wp.quat_identity()),
+        label="physics_test_box",
+    )
+    builder.add_shape_box(body_box, hx=0.5, hy=0.35, hz=0.25)
+
+    bunny_candidates = [
+        Path(newton.__file__).resolve().parent / "examples" / "assets" / "bunny.usd",
+        REPO_ROOT / "deps" / "newton" / "newton" / "examples" / "assets" / "bunny.usd",
+    ]
+    for site_packages in Path(sys.prefix).glob("lib/python*/site-packages"):
+        bunny_candidates.append(site_packages / "newton" / "examples" / "assets" / "bunny.usd")
+    bunny_path = next((path for path in bunny_candidates if path.is_file()), None)
+    if bunny_path is None:
+        searched = ", ".join(str(path) for path in bunny_candidates)
+        raise FileNotFoundError(f"Could not find Newton bunny.usd asset; searched: {searched}")
+    usd_stage = Usd.Stage.Open(str(bunny_path))
+    demo_mesh = get_mesh(usd_stage.GetPrimAtPath("/root/bunny"))
+    body_mesh = builder.add_body(
+        xform=wp.transform(p=wp.vec3(x, 4.0, drop_z - 0.5), q=wp.quat(0.5, 0.5, 0.5, 0.5)),
+        label="physics_test_mesh",
+    )
+    builder.add_shape_mesh(body_mesh, mesh=demo_mesh)
+
+    body_cone = builder.add_body(
+        xform=wp.transform(p=wp.vec3(x, 6.0, drop_z), q=wp.quat_identity()),
+        label="physics_test_cone",
+    )
+    builder.add_shape_cone(body_cone, radius=0.45, half_height=0.6)
+    return 7, first_body
+
+
+def _set_kinematic_free_joint_pose(wp, newton, model, state, joint_q_start, joint_name: str | None, position) -> None:
+    if not joint_name:
+        return
+    start = joint_q_start.get(joint_name)
+    if start is None:
+        return
+    q = model.joint_q.numpy().copy()
+    if isinstance(position, tuple) and len(position) == 2:
+        pos = np.asarray(position[0], dtype=np.float64)
+        quat = np.asarray(position[1], dtype=np.float64)
+    else:
+        pos = np.asarray(position, dtype=np.float64)
+        quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    q[start : start + 7] = np.array([pos[0], pos[1], pos[2], quat[0], quat[1], quat[2], quat[3]], dtype=np.float32)
+    wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=int(newton.BodyFlags.KINEMATIC))
+
+
+def _set_kinematic_free_joint_poses(wp, newton, model, state, joint_q_start, poses: dict[str, object]) -> None:
+    if not poses:
+        return
+    q = model.joint_q.numpy().copy()
+    changed = False
+    for joint_name, pose in poses.items():
+        start = joint_q_start.get(joint_name)
+        if start is None:
+            continue
+        if isinstance(pose, tuple) and len(pose) == 2:
+            pos = np.asarray(pose[0], dtype=np.float64)
+            quat = np.asarray(pose[1], dtype=np.float64)
+        else:
+            pos = np.asarray(pose, dtype=np.float64)
+            quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        q[start : start + 7] = np.array([pos[0], pos[1], pos[2], quat[0], quat[1], quat[2], quat[3]], dtype=np.float32)
+        changed = True
+    if changed:
+        wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=int(newton.BodyFlags.KINEMATIC))
+
+
+def _step_physics_test(newton, wp, viewer, solver, collision_pipeline, contacts, state, state_next, control, dt: float):
+    state.clear_forces()
+    viewer.apply_forces(state)
+    collision_pipeline.collide(state, contacts)
+    solver.step(state, state_next, control, contacts, dt)
+    return state_next, state
+
+
 def _set_pick_object_pose(wp, newton, model, state, joint_q_start, pick_joint_name, position):
     if not pick_joint_name:
         return
@@ -1634,6 +3050,18 @@ def _set_non_ground_instance_visibility(viewer, newton, visible: bool) -> None:
         return
     for shapes in shape_instances.values():
         if int(getattr(shapes, "geo_type", -1)) == int(newton.GeoType.PLANE):
+            continue
+        name = viewer._qualify(shapes.name) if hasattr(viewer, "_qualify") else shapes.name
+        pending[name] = bool(visible)
+
+
+def _set_ground_instance_visibility(viewer, newton, visible: bool) -> None:
+    pending = getattr(viewer, "_pending_instance_visibility", None)
+    shape_instances = getattr(viewer, "_shape_instances", None)
+    if pending is None or not shape_instances:
+        return
+    for shapes in shape_instances.values():
+        if int(getattr(shapes, "geo_type", -1)) != int(newton.GeoType.PLANE):
             continue
         name = viewer._qualify(shapes.name) if hasattr(viewer, "_qualify") else shapes.name
         pending[name] = bool(visible)
@@ -1750,20 +3178,9 @@ def _ensure_runtime_soma_mesh(viewer, points_np: np.ndarray, faces_np: np.ndarra
 
 
 def _update_runtime_soma_mesh(viewer, points_np: np.ndarray, faces_np: np.ndarray | None) -> bool:
-    mesh_path = _ensure_runtime_soma_mesh(viewer, points_np, faces_np)
-    rtx = getattr(viewer, "_rtx", None)
-    if mesh_path is None or rtx is None or not hasattr(viewer, "_make_point3f_dltensor"):
-        return False
-    try:
-        rtx.write_array_attribute(
-            prim_paths=[mesh_path],
-            attribute_name="points",
-            tensors=[viewer._make_point3f_dltensor(np.asarray(points_np, dtype=np.float32))],
-        )
-        return True
-    except Exception as exc:
-        print(f"[ARDY Newton Viewer] runtime SOMA mesh update failed: {exc}", flush=True)
-        return False
+    # Use one live SOMA mesh path only. The RTX runtime USD path can leave a
+    # stale bind-pose mesh behind while the live logged mesh keeps updating.
+    return False
 
 
 class SomaMeshReconstructor:
@@ -1890,6 +3307,7 @@ def _soma_mesh_vertices_for_newton(
     pick_size,
     pick_visible,
     pick_pushable,
+    obstacle_bounds: list[tuple[np.ndarray, np.ndarray]] | None = None,
     reconstructor: SomaMeshReconstructor | None = None,
 ):
     vertices = np.asarray(frame.get("soma_mesh_vertices"), dtype=np.float32)
@@ -1909,13 +3327,23 @@ def _soma_mesh_vertices_for_newton(
         newton_vertices[:, 2] += lift
     bounds = (np.min(newton_vertices, axis=0), np.max(newton_vertices, axis=0))
     correction = _actor_separation_from_pick_object(bounds, pick_position, pick_size, pick_visible, pick_pushable)
+    for obstacle in obstacle_bounds or []:
+        correction += _actor_separation_from_aabb(bounds, obstacle, margin=0.0, check_z=False)
     if np.any(correction):
         newton_vertices[:, 0] += correction[0]
         newton_vertices[:, 1] += correction[1]
+        bounds = (np.min(newton_vertices, axis=0), np.max(newton_vertices, axis=0))
     transformed = _apply_tx_to_points(offset_tx, newton_vertices)
     if transformed.ndim == 2 and transformed.shape[1] == 3 and transformed.size:
         transformed = transformed.copy()
         transformed[:, 2] += float(floor_z) - float(np.min(transformed[:, 2]))
+        bounds = (np.min(transformed, axis=0), np.max(transformed, axis=0))
+        correction = np.zeros(2, dtype=np.float64)
+        for obstacle in obstacle_bounds or []:
+            correction += _actor_separation_from_aabb(bounds, obstacle, margin=0.0, check_z=False)
+        if np.any(correction):
+            transformed[:, 0] += correction[0]
+            transformed[:, 1] += correction[1]
     return transformed
 
 
@@ -2015,12 +3443,29 @@ def main() -> None:
             viewer.renderer.draw_shadows = True
 
     recorder = RtxVideoRecorder(viewer, wp, args)
+    atexit.register(recorder.finalize)
+    ovstream_bridges = [
+        OvstreamWebRtcBridge(viewer, wp, port, stream_port, args.camera_preset)
+        for port, stream_port in zip(args.ovstream_port, args.ovstream_stream_port)
+    ]
+    if args.ovstream_webrtc:
+        for ovstream_bridge in ovstream_bridges:
+            ovstream_bridge.start()
+    for ovstream_bridge in ovstream_bridges:
+        atexit.register(ovstream_bridge.close)
     show_human_mesh = True
     show_t3_robot = True
     show_gizmos = args.viewer != "rtx"
     latest_frame = None
     latest_status = "waiting for live SOMA frame"
     floor_z = _resolve_floor_z(args)
+    pick_table_physics_enabled = _use_pick_table_physics(args)
+    background_obstacle_bounds = _background_table_blockers(
+        args.background_usd,
+        force_pick_table=pick_table_physics_enabled,
+    )
+    if background_obstacle_bounds:
+        print("[ARDY Newton Viewer] background table blocker active for robot base/wheels", flush=True)
     show_contacts = False
     pick_object_visible = args.pick_object != "none"
     pick_object_position = list(args.pick_object_position)
@@ -2028,6 +3473,9 @@ def main() -> None:
     pick_object_mass_kg = PICK_OBJECT_DENSITY_KG_M3 * pick_object_size**3
     pick_object_push_mass_limit_kg = max(0.0, float(args.pick_object_push_mass_limit_kg))
     pick_object_pushable = args.pick_object != "none" and pick_object_mass_kg <= pick_object_push_mass_limit_kg
+    manual_gripper_enabled = False
+    manual_gripper_left_aperture = T3_GRIPPER_DEFAULT_APERTURE_M
+    manual_gripper_right_aperture = T3_GRIPPER_DEFAULT_APERTURE_M
     soma_offset_tx = wp.transform_identity()
     t3_offset_tx = wp.transform_identity()
     t3_live_root_tx = wp.transform_identity()
@@ -2069,6 +3517,18 @@ def main() -> None:
         soma_indices_wp = wp.array(soma_reconstructor.faces, dtype=wp.int32)
         soma_triangle_count = int(soma_reconstructor.faces.size // 3)
         soma_mesh_status = f"SOMA faces from local skin: {soma_triangle_count} tris"
+    if soma_indices_wp is not None and soma_reconstructor.bind_vertices is not None:
+        placeholder_vertices = np.asarray(soma_reconstructor.bind_vertices, dtype=np.float32) @ ARDY_Y_UP_TO_NEWTON_Z_UP.T
+        if placeholder_vertices.ndim == 2 and placeholder_vertices.shape[1] == 3 and placeholder_vertices.size:
+            placeholder_vertices = placeholder_vertices.copy()
+            placeholder_vertices[:, 2] += float(floor_z) - float(np.min(placeholder_vertices[:, 2])) - 1000.0
+            viewer.log_mesh(
+                "/ardy_live_soma_mesh",
+                wp.array(placeholder_vertices, dtype=wp.vec3),
+                soma_indices_wp,
+                backface_culling=False,
+            )
+            soma_mesh_status = f"SOMA live mesh prim ready: {soma_triangle_count} tris"
 
     def gui(ui):
         nonlocal show_human_mesh, show_t3_robot, show_gizmos, soma_offset_tx, t3_offset_tx
@@ -2077,6 +3537,7 @@ def main() -> None:
         nonlocal file_csv_path, file_bvh_path, file_playback_frames, file_playback_index
         nonlocal file_playback_next_time, file_playback_active, file_playback_status
         nonlocal websocket_enabled
+        nonlocal manual_gripper_enabled, manual_gripper_left_aperture, manual_gripper_right_aperture
         ui.set_next_window_pos(ui.ImVec2(16, 16))
         ui.set_next_window_size(ui.ImVec2(340, 560))
         ui.set_next_window_bg_alpha(0.82)
@@ -2115,16 +3576,45 @@ def main() -> None:
                 path_from_file = _read_path_file("rtx_bvh_path.txt")
                 file_bvh_path = path_from_file or file_bvh_path
                 file_playback_status = f"BVH: {Path(file_bvh_path).name}" if path_from_file else "no rtx_bvh_path.txt"
+            if ui.button("Browse CSV"):
+                selected_csv = _browse_playback_file("Select T3 CSV", (("CSV files", "*.csv"), ("All files", "*")))
+                if selected_csv:
+                    file_csv_path = selected_csv
+                    paired_bvh = _matching_bvh_for_csv(file_csv_path)
+                    if paired_bvh:
+                        file_bvh_path = paired_bvh
+                    file_playback_status = f"CSV: {Path(file_csv_path).name}"
+            ui.same_line()
+            if ui.button("Browse BVH"):
+                selected_bvh = _browse_playback_file(
+                    "Select SOMA BVH",
+                    (("BVH files", "*.bvh *.soma.bvh"), ("All files", "*")),
+                )
+                if selected_bvh:
+                    file_bvh_path = selected_bvh
+                    paired_csv = _matching_csv_for_bvh(file_bvh_path)
+                    if paired_csv:
+                        file_csv_path = paired_csv
+                    file_playback_status = f"BVH: {Path(file_bvh_path).name}"
             if file_csv_path:
                 ui.text(f"CSV: {Path(file_csv_path).name}")
             if file_bvh_path:
                 ui.text(f"BVH: {Path(file_bvh_path).name}")
 
             def start_file_mode(mode: str) -> None:
+                nonlocal file_csv_path, file_bvh_path
                 nonlocal file_playback_frames, file_playback_index, file_playback_next_time
                 nonlocal file_playback_active, file_playback_status
                 try:
                     file_playback_status = f"loading {mode}"
+                    file_csv_path = str(_resolve_playback_path(file_csv_path, (".csv",))) if file_csv_path else ""
+                    file_bvh_path = (
+                        str(_resolve_playback_path(file_bvh_path, (".soma.bvh", ".bvh"))) if file_bvh_path else ""
+                    )
+                    if mode in {"both", "bvh"} and not file_bvh_path and file_csv_path:
+                        file_bvh_path = _matching_bvh_for_csv(file_csv_path)
+                    if mode in {"both", "csv"} and not file_csv_path and file_bvh_path:
+                        file_csv_path = _matching_csv_for_bvh(file_bvh_path)
                     file_playback_frames, source_fps = _make_file_playback_frames(
                         bvh_path=file_bvh_path,
                         csv_path=file_csv_path,
@@ -2265,8 +3755,49 @@ def main() -> None:
                     _set_direct_camera_shot(viewer, wp, "saved_origin_top")
         ui.separator()
         if ui.collapsing_header("Placement", flags=ui.TreeNodeFlags_.default_open):
-            ui.set_next_item_width(120)
-            _, floor_z = ui.slider_float("Floor Z", floor_z, -2.0, 2.0, "%.3f")
+            ui.text(f"Floor Z: {floor_z:.3f}")
+        ui.separator()
+        if bottle_body_indices and ui.collapsing_header("Bottle Physics", flags=ui.TreeNodeFlags_.default_open):
+            ui.text(f"Bottles: {len(bottle_body_indices)}")
+            if ui.button("Reset Bottles"):
+                _reset_interactive_bottles(
+                    wp,
+                    state,
+                    state_next,
+                    bottle_body_indices,
+                    bottle_spawn_positions,
+                    bottle_positions,
+                    held_bottles,
+                    gripper_grasp_state,
+                )
+        ui.separator()
+        if ui.collapsing_header("Manual Grippers", flags=ui.TreeNodeFlags_.default_open):
+            _, manual_gripper_enabled = ui.checkbox("Override Grippers", manual_gripper_enabled)
+            ui.set_next_item_width(140)
+            _, manual_gripper_left_aperture = ui.slider_float(
+                "Left Open m",
+                manual_gripper_left_aperture,
+                0.0,
+                T3_GRIPPER_MAX_APERTURE_M,
+                "%.3f",
+            )
+            ui.set_next_item_width(140)
+            _, manual_gripper_right_aperture = ui.slider_float(
+                "Right Open m",
+                manual_gripper_right_aperture,
+                0.0,
+                T3_GRIPPER_MAX_APERTURE_M,
+                "%.3f",
+            )
+            if ui.button("Open Both"):
+                manual_gripper_enabled = True
+                manual_gripper_left_aperture = T3_GRIPPER_MAX_APERTURE_M
+                manual_gripper_right_aperture = T3_GRIPPER_MAX_APERTURE_M
+            ui.same_line()
+            if ui.button("Close Both"):
+                manual_gripper_enabled = True
+                manual_gripper_left_aperture = 0.0
+                manual_gripper_right_aperture = 0.0
         if args.pick_object != "none" and ui.collapsing_header("Pick Object", flags=ui.TreeNodeFlags_.default_open):
             ui.text(f"Cube mass: {pick_object_mass_kg:.2f} kg")
             ui.text(f"Push limit: {pick_object_push_mass_limit_kg:.1f} kg")
@@ -2293,13 +3824,72 @@ def main() -> None:
         viewer.register_ui_callback(gui, position="free")
 
     builder = newton.ModelBuilder()
-    builder.add_ground_plane()
+    builder.add_ground_plane(height=float(floor_z))
     t3_urdf = LOCAL_T3_URDF if LOCAL_T3_URDF.exists() else DEFAULT_T3_URDF
+    t3_body_start = builder.body_count
+    t3_shape_start = builder.shape_count
+    t3_joint_start = len(builder.joint_enabled)
     builder.add_urdf(str(t3_urdf), floating=True, scale=1.0)
+    t3_body_end = builder.body_count
+    t3_shape_end = builder.shape_count
+    t3_joint_end = len(builder.joint_enabled)
     t3_shape_count = builder.shape_count
     pick_joint_name, pick_object_size = _add_pick_object(newton, wp, builder, args)
+    bottle_spawn_positions = _interactive_bottle_spawn_positions(background_obstacle_bounds)
+    pick_table_visual_count = _add_pick_table_visual_shapes(
+        newton,
+        wp,
+        builder,
+        pick_table_physics_enabled and not _is_table_bottle_preview(args.background_usd),
+    )
+    table_collider_count = _add_table_physics_colliders(newton, wp, builder, background_obstacle_bounds)
+    bottle_body_labels = _add_interactive_bottles(
+        newton,
+        wp,
+        builder,
+        pick_table_physics_enabled,
+        bottle_spawn_positions,
+    )
+    physics_scene_active = bool(args.physics_test_shapes or bottle_body_labels)
+    physics_test_shape_count = 0
+    hidden_robot_joint_name = None
+    hidden_soma_joint_name = None
+    hidden_gripper_joint_names: dict[str, str] = {}
+    hidden_t3_bottle_joint_names: dict[str, str] = {}
+    if physics_scene_active:
+        for body_idx in range(t3_body_start, t3_body_end):
+            builder.body_flags[body_idx] = int(newton.BodyFlags.KINEMATIC)
+        for joint_idx in range(t3_joint_start, t3_joint_end):
+            builder.joint_enabled[joint_idx] = False
+        _disable_shape_collision(newton, builder, t3_shape_start, t3_shape_end)
+        hidden_gripper_joint_start = len(builder.joint_enabled)
+        hidden_gripper_joint_names = _add_hidden_gripper_colliders(newton, wp, builder)
+        for joint_idx in range(hidden_gripper_joint_start, len(builder.joint_enabled)):
+            builder.joint_enabled[joint_idx] = False
+        hidden_t3_body_joint_start = len(builder.joint_enabled)
+        hidden_t3_bottle_joint_names = _add_hidden_t3_bottle_colliders(newton, wp, builder)
+        for joint_idx in range(hidden_t3_body_joint_start, len(builder.joint_enabled)):
+            builder.joint_enabled[joint_idx] = False
+    if args.physics_test_shapes:
+        hidden_joint_start = len(builder.joint_enabled)
+        hidden_robot_joint_name, hidden_soma_joint_name = _add_hidden_actor_colliders(newton, wp, builder, floor_z)
+        for joint_idx in range(hidden_joint_start, len(builder.joint_enabled)):
+            builder.joint_enabled[joint_idx] = False
+        physics_test_shape_count, _ = _add_physics_test_shapes(newton, wp, builder, floor_z)
     model = builder.finalize()
     state = model.state()
+    state_next = model.state()
+    control = model.control()
+    bottle_body_indices = [
+        body_idx
+        for label in bottle_body_labels
+        if (body_idx := _body_index_by_suffix(model, label)) is not None
+    ]
+    bottle_positions = [np.asarray(pos, dtype=np.float64) for pos in bottle_spawn_positions[: len(bottle_body_indices)]]
+    held_bottles: dict[int, dict] = {}
+    gripper_grasp_state: dict[str, dict] = {}
+    hidden_gripper_positions: dict[str, np.ndarray] = {}
+    hidden_t3_bottle_positions: dict[str, np.ndarray] = {}
     default_q = model.joint_q.numpy().copy()
     joint_q_start = {
         label.rsplit("/", 1)[-1]: int(start)
@@ -2312,6 +3902,25 @@ def main() -> None:
     _set_camera_by_name(viewer, wp, args.camera_preset)
     collision_pipeline = newton.CollisionPipeline(model)
     contacts = collision_pipeline.contacts()
+    physics_solver = newton.solvers.SolverXPBD(model, iterations=5) if physics_scene_active else None
+    physics_substeps = 8
+    t3_fk_body_filter = int(newton.BodyFlags.KINEMATIC) if physics_scene_active else None
+    if args.physics_test_shapes:
+        print(
+            "[ARDY Newton Viewer] physics test shapes: "
+            f"{physics_test_shape_count} dynamic objects, hidden robot/SOMA hard colliders on",
+            flush=True,
+        )
+    else:
+        print("[ARDY Newton Viewer] physics test shapes: disabled", flush=True)
+    if bottle_body_indices:
+        print(
+            "[ARDY Newton Viewer] interactive bottle physics: "
+            f"{len(bottle_body_indices)} dynamic bottles at {INTERACTIVE_BOTTLE_MASS_KG:.2f} kg each, "
+            f"{table_collider_count} hidden table collider(s), "
+            f"{pick_table_visual_count} pick-table visual shape(s), hidden robot/gripper colliders on",
+            flush=True,
+        )
 
     cpu_robot_mesh_renderer = None
     if CpuRobotMeshRenderer is not None and isinstance(viewer, newton.viewer.ViewerGL) and not viewer.device.is_cuda:
@@ -2329,8 +3938,8 @@ def main() -> None:
         queued_frames = frame_queue.qsize()
         soma_live_gizmo_tx = wp.transform_identity()
         t3_live_root_tx = wp.transform_identity()
-        incoming_frame = _get_next_frame(frame_queue, args.playback_mode)
-        if incoming_frame is None and file_playback_active and file_playback_frames:
+        incoming_frame = None
+        if file_playback_active and file_playback_frames:
             now_for_file = time.monotonic()
             if now_for_file >= file_playback_next_time:
                 incoming_frame = file_playback_frames[file_playback_index]
@@ -2344,12 +3953,18 @@ def main() -> None:
                     file_playback_status = (
                         f"file frame {file_playback_index}/{len(file_playback_frames) - 1}"
                     )
+            else:
+                _get_next_frame(frame_queue, args.playback_mode)
+        else:
+            incoming_frame = _get_next_frame(frame_queue, args.playback_mode)
         if incoming_frame is not None:
             latest_frame = incoming_frame
             if latest_frame.get("command") == "close":
                 requested_close = True
                 continue
             current_frame_idx = int(latest_frame.get("frame_idx", -1))
+            if "show_soma_mesh" in latest_frame:
+                show_human_mesh = bool(latest_frame["show_soma_mesh"])
             if "show_t3_robot" in latest_frame:
                 show_t3_robot = bool(latest_frame["show_t3_robot"])
             frame_vertices = np.asarray(latest_frame.get("soma_mesh_vertices"), dtype=np.float32)
@@ -2393,7 +4008,44 @@ def main() -> None:
                 pick_object_size,
                 pick_object_visible,
                 pick_object_pushable,
+                t3_fk_body_filter,
+                background_obstacle_bounds,
+                {
+                    "left": manual_gripper_left_aperture,
+                    "right": manual_gripper_right_aperture,
+                }
+                if manual_gripper_enabled
+                else None,
             )
+            if hidden_robot_joint_name:
+                t3_root_pos = _tx_position(t3_live_root_tx)
+                _set_kinematic_free_joint_pose(
+                    wp,
+                    newton,
+                    model,
+                    state,
+                    joint_q_start,
+                    hidden_robot_joint_name,
+                    (float(t3_root_pos[0]), float(t3_root_pos[1]), float(floor_z) + 0.85),
+                )
+            if hidden_soma_joint_name:
+                soma_points_for_collision = _soma_joint_points_for_newton(latest_frame, soma_offset_tx)
+                if soma_points_for_collision is not None and soma_points_for_collision.size:
+                    mins = np.min(soma_points_for_collision, axis=0)
+                    maxs = np.max(soma_points_for_collision, axis=0)
+                    _set_kinematic_free_joint_pose(
+                        wp,
+                        newton,
+                        model,
+                        state,
+                        joint_q_start,
+                        hidden_soma_joint_name,
+                        (
+                            float((mins[0] + maxs[0]) * 0.5),
+                            float((mins[1] + maxs[1]) * 0.5),
+                            float(floor_z) + 0.9,
+                        ),
+                    )
             _push_pick_object_from_bounds(
                 t3_bounds,
                 pick_object_position,
@@ -2402,6 +4054,38 @@ def main() -> None:
                 pick_object_pushable,
                 floor_z,
             )
+            for side, joint_name in hidden_gripper_joint_names.items():
+                gripper = _gripper_state(model, state, joint_q_start, side)
+                if gripper is not None:
+                    proxy_position = _limited_step_position(
+                        hidden_gripper_positions.get(side),
+                        np.asarray(gripper["center"], dtype=np.float64),
+                        INTERACTIVE_GRIPPER_PROXY_MAX_STEP_M,
+                    )
+                    hidden_gripper_positions[side] = proxy_position
+                    _set_kinematic_free_joint_pose(
+                        wp,
+                        newton,
+                        model,
+                        state,
+                        joint_q_start,
+                        joint_name,
+                        proxy_position,
+                    )
+            hidden_t3_poses = {}
+            for suffix, joint_name in hidden_t3_bottle_joint_names.items():
+                pose = _body_pose_by_suffix(model, state, suffix)
+                if pose is None:
+                    continue
+                center, quat = pose
+                proxy_position = _limited_step_position(
+                    hidden_t3_bottle_positions.get(suffix),
+                    center,
+                    INTERACTIVE_ROBOT_PROXY_MAX_STEP_M,
+                )
+                hidden_t3_bottle_positions[suffix] = proxy_position
+                hidden_t3_poses[joint_name] = (proxy_position, quat)
+            _set_kinematic_free_joint_poses(wp, newton, model, state, joint_q_start, hidden_t3_poses)
             if t3_bounds is not None:
                 mins, maxs = t3_bounds
                 recorder_target = np.array(
@@ -2412,6 +4096,32 @@ def main() -> None:
                     ],
                     dtype=np.float64,
                 )
+
+        if physics_solver is not None:
+            physics_dt = (1.0 / 100.0) / physics_substeps
+            for _ in range(physics_substeps):
+                state, state_next = _step_physics_test(
+                    newton,
+                    wp,
+                    viewer,
+                    physics_solver,
+                    collision_pipeline,
+                    contacts,
+                    state,
+                    state_next,
+                    control,
+                    physics_dt,
+                )
+        _update_interactive_bottles(
+            wp,
+            model,
+            state,
+            joint_q_start,
+            bottle_body_indices,
+            bottle_positions,
+            held_bottles,
+            gripper_grasp_state,
+        )
 
         recorder.begin_frame(recorder_target)
         viewer.begin_frame(time_s)
@@ -2429,6 +4139,7 @@ def main() -> None:
                 pick_object_size,
                 pick_object_visible,
                 pick_object_pushable,
+                background_obstacle_bounds,
                 soma_reconstructor,
             )
             if soma_vertices is not None:
@@ -2485,6 +4196,7 @@ def main() -> None:
             if show_contacts:
                 collision_pipeline.collide(state, contacts)
         _set_non_ground_instance_visibility(viewer, newton, show_t3_robot)
+        _set_ground_instance_visibility(viewer, newton, not bool(args.background_usd))
         viewer.log_state(state)
         if show_t3_robot and cpu_robot_mesh_renderer is not None:
             cpu_robot_mesh_renderer.draw(state)
@@ -2493,6 +4205,8 @@ def main() -> None:
         if first_end_frame:
             print("[ARDY Newton Viewer] first end_frame: entering", flush=True)
         viewer.end_frame()
+        for ovstream_bridge in ovstream_bridges:
+            ovstream_bridge.stream_latest()
         if first_end_frame:
             print("[ARDY Newton Viewer] first end_frame: complete", flush=True)
             first_end_frame = False
@@ -2525,7 +4239,8 @@ def main() -> None:
                 f"ws_bytes={ws_receiver.last_payload_bytes} "
                 f"soma_verts={soma_vertex_count} soma_tris={soma_triangle_count} "
                 f"mesh_logged={soma_mesh_logged} skeleton_logged={soma_skeleton_logged} "
-                f"soma_source={soma_mesh_source} soma_status='{soma_mesh_status}'"
+                f"soma_source={soma_mesh_source} soma_status='{soma_mesh_status}' "
+                f"ovstream='{'; '.join(bridge.status for bridge in ovstream_bridges)}'"
                 f"{skin_status_suffix}",
                 flush=True,
             )
@@ -2538,6 +4253,8 @@ def main() -> None:
                 time.sleep(min(sleep_time, frame_period))
 
     recorder.finalize()
+    for ovstream_bridge in ovstream_bridges:
+        ovstream_bridge.close()
     viewer.close()
 
 

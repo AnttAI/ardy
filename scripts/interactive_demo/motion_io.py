@@ -54,7 +54,11 @@ class MotionIOMixin:
     def _get_motion_cache_path(self, file_path: str, skeleton_name: str, fps: float) -> str:
         """Return a cache file path based on motion file identity, skeleton, and fps."""
         file_stat = os.stat(file_path)
-        cache_key = f"{os.path.abspath(file_path)}:{file_stat.st_size}:{file_stat.st_mtime_ns}:{skeleton_name}:{fps}"
+        cache_version = "v2_keep_high_fps_bvh_frames"
+        cache_key = (
+            f"{cache_version}:{os.path.abspath(file_path)}:"
+            f"{file_stat.st_size}:{file_stat.st_mtime_ns}:{skeleton_name}:{fps}"
+        )
         cache_hash = hashlib.sha256(cache_key.encode()).hexdigest()[:16]
         basename = os.path.splitext(os.path.basename(file_path))[0]
         return os.path.join(self._motion_cache_dir, f"{basename}_{skeleton_name}_{cache_hash}.pt")
@@ -122,12 +126,25 @@ class MotionIOMixin:
             from ardy.skeleton.bvh import parse_bvh_motion
 
             local_rot_mats, root_trans, parsed_fps = parse_bvh_motion(file_path)
-            duration = len(root_trans) / parsed_fps
-            target_frames = max(1, round(duration * fps))
-            frame_idx = torch.round(torch.arange(target_frames) * (parsed_fps / fps)).long()
-            frame_idx = torch.clamp(frame_idx, max=len(root_trans) - 1)
-            root_trans = root_trans[frame_idx]
-            local_rot_mats = local_rot_mats[frame_idx]
+            if parsed_fps <= fps:
+                duration = len(root_trans) / parsed_fps
+                target_frames = max(1, round(duration * fps))
+                frame_idx = torch.round(torch.arange(target_frames) * (parsed_fps / fps)).long()
+                frame_idx = torch.clamp(frame_idx, max=len(root_trans) - 1)
+                root_trans = root_trans[frame_idx]
+                local_rot_mats = local_rot_mats[frame_idx]
+                print(
+                    f"[Motion Load] Resampled BVH from {len(frame_idx)} frames at "
+                    f"{parsed_fps:.2f} FPS to model FPS {fps:.2f}"
+                )
+            else:
+                # Keep every source pose instead of dropping frames. The model
+                # plays these frames at its own FPS, so a 30 FPS BVH on a 20 FPS
+                # model becomes 1.5x slower and smoother without losing motion.
+                print(
+                    f"[Motion Load] Keeping all {len(root_trans)} BVH frames from "
+                    f"{parsed_fps:.2f} FPS source; playback/generation uses model FPS {fps:.2f}"
+                )
 
             import ardy as _ardy_pkg
 
@@ -260,6 +277,86 @@ class MotionIOMixin:
         print(f"Cached motion to {cache_path}")
         return local_rot_mats, root_trans
 
+    def _stretch_motion_frames(
+        self,
+        local_rot_mats: torch.Tensor,
+        root_trans: torch.Tensor,
+        stretch: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Time-stretch a motion while preserving first/last poses."""
+        stretch = float(stretch)
+        if stretch <= 1.0 or local_rot_mats.shape[0] <= 1:
+            return local_rot_mats, root_trans
+
+        source_frames = int(local_rot_mats.shape[0])
+        target_frames = max(source_frames, int(round((source_frames - 1) * stretch)) + 1)
+        sample_pos = torch.linspace(
+            0.0,
+            float(source_frames - 1),
+            target_frames,
+            device=local_rot_mats.device,
+            dtype=root_trans.dtype,
+        )
+        lower = torch.floor(sample_pos).long()
+        upper = torch.clamp(lower + 1, max=source_frames - 1)
+        alpha = (sample_pos - lower.to(sample_pos.dtype)).view(-1, 1)
+
+        stretched_root = root_trans[lower] * (1.0 - alpha) + root_trans[upper] * alpha
+
+        # The exact matrix slerp path would need a heavier dependency here.
+        # Projecting linear interpolation back to SO(3) gives smooth in-between
+        # rotations and keeps the original source poses at integer samples.
+        rot_alpha = alpha.view(-1, 1, 1, 1)
+        rot_interp = local_rot_mats[lower] * (1.0 - rot_alpha) + local_rot_mats[upper] * rot_alpha
+        u, _, vh = torch.linalg.svd(rot_interp)
+        stretched_rot = u @ vh
+        det = torch.linalg.det(stretched_rot)
+        if torch.any(det < 0):
+            u = u.clone()
+            u[det < 0, :, -1] *= -1
+            stretched_rot = u @ vh
+
+        print(
+            f"[Motion Load] Stretched motion from {source_frames} to {target_frames} frames "
+            f"({stretch:.2f}x duration)"
+        )
+        return stretched_rot.to(local_rot_mats.dtype), stretched_root.to(root_trans.dtype)
+
+    def _constraint_auto_stretch(self, session, source_frames: int) -> float:
+        """Compute stretch needed so auto-sampled keyframes can respect the GUI gap."""
+        if source_frames <= 1:
+            return 1.0
+
+        max_keyframes = int(
+            getattr(
+                getattr(session.gui_elements, "gui_max_keyframe_num", None),
+                "value",
+                1,
+            )
+        )
+        min_gap = int(
+            getattr(
+                getattr(session.gui_elements, "gui_min_keyframe_gap", None),
+                "value",
+                0,
+            )
+        )
+        if max_keyframes <= 1 or min_gap <= 0:
+            return 1.0
+
+        continue_from_current = bool(
+            getattr(
+                getattr(session.gui_elements, "gui_continue_from_current_checkbox", None),
+                "value",
+                False,
+            )
+        )
+        first_constraint_offset = round(2 * session.motion_rep.fps) if continue_from_current else 0
+        required_frames = first_constraint_offset + (max_keyframes - 1) * min_gap + 1
+        if required_frames <= source_frames:
+            return 1.0
+        return (required_frames - 1) / (source_frames - 1)
+
     def load_motion_from_file(self, file_path: str, session, crop_10s: bool = False) -> dict:
         """Load a motion sequence from a BVH or CSV file and convert to motion_rep features.
 
@@ -292,6 +389,25 @@ class MotionIOMixin:
                 start = np.random.randint(0, total_frames - max_frames + 1)
                 local_rot_mats = local_rot_mats[start : start + max_frames]
                 root_trans = root_trans[start : start + max_frames]
+
+        motion_stretch = float(
+            getattr(
+                getattr(session.gui_elements, "gui_motion_stretch", None),
+                "value",
+                1.0,
+            )
+        )
+        auto_stretch = self._constraint_auto_stretch(session, int(local_rot_mats.shape[0]))
+        motion_stretch_handle = getattr(session.gui_elements, "gui_motion_stretch", None)
+        max_motion_stretch = float(getattr(motion_stretch_handle, "max", 5.0))
+        auto_stretch = min(auto_stretch, max_motion_stretch)
+        if auto_stretch > motion_stretch:
+            print(
+                f"[Motion Load] Auto stretch {auto_stretch:.2f}x from "
+                "Max Keyframes / Min Keyframe Gap"
+            )
+        motion_stretch = max(motion_stretch, auto_stretch)
+        local_rot_mats, root_trans = self._stretch_motion_frames(local_rot_mats, root_trans, motion_stretch)
 
         # Convert to motion_rep features
         local_rot_mats = local_rot_mats.unsqueeze(0)  # [1, T, J, 3, 3]
@@ -512,6 +628,13 @@ class MotionIOMixin:
 
         # Get max keyframes from GUI
         max_keyframe_num = session.gui_elements.gui_max_keyframe_num.value
+        min_keyframe_gap = int(
+            getattr(
+                getattr(session.gui_elements, "gui_min_keyframe_gap", None),
+                "value",
+                round(1.5 * session.motion_rep.fps),
+            )
+        )
         deterministic_keyframe_indices = self._parse_constraint_frame_indices(
             getattr(session.gui_elements, "gui_constraint_frame_indices", None).value
             if getattr(session.gui_elements, "gui_constraint_frame_indices", None) is not None
@@ -543,12 +666,22 @@ class MotionIOMixin:
         def sample_keyframe_indices():
             if deterministic_keyframe_indices:
                 return list(deterministic_keyframe_indices)
-            if len(available_indices) <= max_keyframe_num:
-                sampled = list(available_indices)
+            print(
+                f"Sampling up to {max_keyframe_num} evenly spaced keyframes "
+                f"from {len(available_indices)} available indices, min gap={min_keyframe_gap}"
+            )
+            num_keyframes = min(max_keyframe_num, len(available_indices))
+            if min_keyframe_gap > 0:
+                span = available_indices[-1] - available_indices[0]
+                num_keyframes = min(num_keyframes, span // min_keyframe_gap + 1)
+            num_keyframes = max(1, int(num_keyframes))
+            if num_keyframes == 1:
+                sampled = [available_indices[-1]]
             else:
-                print(f"Sampling {max_keyframe_num} keyframes from {len(available_indices)} available indices")
-                num_keyframes = np.random.randint(1, max_keyframe_num + 1)
-                sampled = [int(idx) for idx in np.random.choice(available_indices, size=num_keyframes, replace=False)]
+                sampled = [
+                    int(round(x))
+                    for x in np.linspace(available_indices[0], available_indices[-1], num_keyframes)
+                ]
 
             final_idx = motion_len - 1
             if final_idx in available_indices and final_idx not in sampled:
@@ -630,6 +763,7 @@ class MotionIOMixin:
                             joint_names=joint_names,
                             end_effector_type=ee_type,
                             constrain_root=not hand_only_motion,
+                            constrain_rotations=not hand_only_motion,
                             exists_ok=True,
                         )
                         self.add_keyframe_to_timeline(

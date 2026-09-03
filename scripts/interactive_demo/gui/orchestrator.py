@@ -6,7 +6,7 @@
 from types import SimpleNamespace
 
 from ..common import *  # noqa: F401,F403
-from ..environments import DEFAULT_ENVIRONMENT_LABEL, ENVIRONMENT_OPTIONS
+from ..environments import DEFAULT_ENVIRONMENT_LABEL, ENVIRONMENT_OPTIONS, initial_environment_label
 from .instructions import INSTRUCTIONS_TAB_MD
 
 
@@ -129,10 +129,11 @@ class GuiMixin:
         self._build_io_tab(client, client_id, tab_group, g, timeline, default_prompt)
 
         with tab_group.add_tab("Environment", viser.Icon.SETTINGS):
+            initial_environment = initial_environment_label()
             environment_dropdown = client.gui.add_dropdown(
                 "Environment",
                 options=ENVIRONMENT_OPTIONS,
-                initial_value=DEFAULT_ENVIRONMENT_LABEL,
+                initial_value=initial_environment,
             )
             show_environment_checkbox = client.gui.add_checkbox("Show Environment", initial_value=True)
 

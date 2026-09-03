@@ -326,6 +326,8 @@ class GuiElements:
     gui_scene_translation_z: viser.GuiInputHandle[float]
     gui_waypoint_interval: viser.GuiInputHandle[int]
     gui_max_keyframe_num: viser.GuiInputHandle[int]
+    gui_min_keyframe_gap: viser.GuiInputHandle[int]
+    gui_motion_stretch: viser.GuiInputHandle[float]
     gui_constraint_frame_indices: viser.GuiInputHandle[str]
     gui_motion_file_path: viser.GuiInputHandle[str]
     gui_crop_motion_checkbox: viser.GuiInputHandle[bool]

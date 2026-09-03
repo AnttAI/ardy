@@ -105,6 +105,11 @@ class GenConstraintsMixin:
                     for i, constrain_root in enumerate(constraint_info.get("constrain_root", []))
                     if i in valid_idx
                 ]
+                constrain_rotations_lst = [
+                    constrain_rotations
+                    for i, constrain_rotations in enumerate(constraint_info.get("constrain_rotations", []))
+                    if i in valid_idx
+                ]
 
                 for idx, joint_names in enumerate(joint_names_lst):
                     frame_indices_el = frame_indices[idx : idx + 1]
@@ -126,6 +131,11 @@ class GenConstraintsMixin:
                                 constrain_root_lst[idx]
                                 if idx < len(constrain_root_lst)
                                 else ("Hips" in joint_names)
+                            ),
+                            constrain_rotations=(
+                                constrain_rotations_lst[idx]
+                                if idx < len(constrain_rotations_lst)
+                                else True
                             ),
                         )
                     )

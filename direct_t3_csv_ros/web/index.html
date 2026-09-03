@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>T3 CSV ROS Control</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="control">
+        <header class="topbar">
+          <div>
+            <h1>T3 CSV ROS Control</h1>
+            <p id="statusText">Load a CSV to begin.</p>
+          </div>
+          <span id="statePill" class="pill idle">Idle</span>
+        </header>
+
+        <form id="loadForm" class="panel">
+          <label class="field">
+            <span>Upload CSV</span>
+            <input id="csvFile" type="file" accept=".csv,text/csv" />
+          </label>
+          <div class="or">or</div>
+          <label class="field">
+            <span>CSV path on this machine</span>
+            <input id="csvPath" type="text" value="client_0_gen_23_full.csv" />
+          </label>
+          <div class="grid two">
+            <label class="field">
+              <span>Segment</span>
+              <input id="segment" type="number" min="0" value="0" />
+            </label>
+            <label class="field">
+              <span>Playback FPS</span>
+              <input id="fps" type="number" min="0" max="20" step="0.1" value="20" />
+            </label>
+          </div>
+          <button class="primary" type="submit">Load CSV</button>
+        </form>
+
+        <section class="actions">
+          <button data-mode="robot" class="play">Play Robot</button>
+          <button data-mode="robot_lift" class="play">Play Robot + Lift</button>
+          <button data-mode="base_lift" class="play blue">Play Base + Lift</button>
+          <button data-mode="full" class="play blue">Play Full T3</button>
+          <button id="pauseButton" class="pause">Pause</button>
+          <button id="stopButton" class="stop">Stop</button>
+        </section>
+
+        <section class="panel">
+          <div class="grid one">
+            <label class="field">
+              <span>Lift step frames</span>
+              <input id="liftStepFrames" type="number" min="1" value="10" />
+            </label>
+          </div>
+          <label class="toggle">
+            <input id="dryRun" type="checkbox" checked />
+            <span>Dry run</span>
+          </label>
+        </section>
+
+        <section class="panel topics">
+          <label class="field"><span>Right arm topic</span><input id="rightTopic" value="/right_arm/control/move_j" /></label>
+          <label class="field"><span>Left arm topic</span><input id="leftTopic" value="/left_arm/control/move_j" /></label>
+          <label class="field"><span>Gripper topic</span><input id="gripperTopic" value="/right_arm/control/joint_states" /></label>
+          <label class="field"><span>Base topic</span><input id="baseTopic" value="/base/cmd_wheel_rpm" /></label>
+          <label class="field"><span>Lift topic</span><input id="liftTopic" value="/control/lift_frame" /></label>
+        </section>
+      </section>
+
+      <aside class="monitor">
+        <section class="panel hero">
+          <div>
+            <span class="label">Current frame</span>
+            <strong id="frameNumber">-</strong>
+          </div>
+          <div>
+            <span class="label">Row</span>
+            <strong id="rowNumber">-</strong>
+          </div>
+          <div>
+            <span class="label">FPS</span>
+            <strong id="fpsValue">-</strong>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>CSV</h2>
+          <dl class="meta">
+            <dt>File</dt><dd id="csvName">-</dd>
+            <dt>Rows</dt><dd id="rowCount">-</dd>
+            <dt>Capabilities</dt><dd id="capabilities">-</dd>
+          </dl>
+        </section>
+
+        <section class="panel values">
+          <h2>Live Values</h2>
+          <div class="valueBlock">
+            <h3>Base</h3>
+            <pre id="baseValues">No base values</pre>
+          </div>
+          <div class="valueBlock">
+            <h3>Lift</h3>
+            <pre id="liftValues">No lift value</pre>
+          </div>
+          <div class="valueBlock">
+            <h3>Right Arm</h3>
+            <pre id="rightValues">No right arm values</pre>
+          </div>
+          <div class="valueBlock">
+            <h3>Left Arm</h3>
+            <pre id="leftValues">No left arm values</pre>
+          </div>
+          <div id="errorBox" class="error" hidden></div>
+        </section>
+      </aside>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

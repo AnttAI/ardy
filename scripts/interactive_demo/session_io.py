@@ -918,6 +918,8 @@ class SessionIOMixin:
                         "joints_rot": joints_rot,
                         "joint_names": keyframe_data["joint_names"],
                         "end_effector_type": keyframe_data["end_effector_type"],
+                        "constrain_root": keyframe_data.get("constrain_root", True),
+                        "constrain_rotations": keyframe_data.get("constrain_rotations", True),
                     }
 
                 constraints_data["End-Effectors"] = {
@@ -1188,6 +1190,8 @@ class SessionIOMixin:
                             joints_rot=joints_rot,
                             joint_names=joint_names,
                             end_effector_type=end_effector_type,
+                            constrain_root=keyframe_data.get("constrain_root", True),
+                            constrain_rotations=keyframe_data.get("constrain_rotations", True),
                             viz_label=True,
                         )
 

@@ -9,6 +9,7 @@ runtime. It still requires the Python dependencies used by Soma/Newton
 from __future__ import annotations
 
 import csv
+import os
 import sys
 from pathlib import Path
 
@@ -54,6 +55,46 @@ T3_CSV_HEADER = [
     "left_gripper_joint2_dof",
 ]
 
+T3_ARM_JOINT_LIMIT_DEG_S = {
+    **{f"{side}_joint{i}_dof": 180.0 for side in ("right", "left") for i in range(1, 4)},
+    **{f"{side}_joint{i}_dof": 225.0 for side in ("right", "left") for i in range(4, 8)},
+}
+
+
+def limit_t3_arm_joint_rates(
+    rows: list[list[float]],
+    header: list[str],
+    *,
+    fps: float,
+    speed_percent: float | None = None,
+) -> list[list[float]]:
+    """Clamp T3 arm joint deltas so generated CSV rows obey configured joint speed."""
+    if len(rows) < 2:
+        return rows
+    if speed_percent is None:
+        speed_percent = float(os.environ.get("ARDY_T3_ARM_SPEED_PERCENT", "20.0"))
+    speed_scale = max(float(speed_percent), 0.0) / 100.0
+    if speed_scale <= 0.0:
+        return rows
+
+    dt = 1.0 / max(float(fps), 1e-6)
+    column_indices = {
+        joint_name: header.index(joint_name)
+        for joint_name in T3_ARM_JOINT_LIMIT_DEG_S
+        if joint_name in header
+    }
+    limited = [list(rows[0])]
+    for target in rows[1:]:
+        previous = limited[-1]
+        current = list(target)
+        for joint_name, column_idx in column_indices.items():
+            max_delta = T3_ARM_JOINT_LIMIT_DEG_S[joint_name] * speed_scale * dt
+            delta = float(target[column_idx]) - float(previous[column_idx])
+            if abs(delta) > max_delta:
+                current[column_idx] = float(previous[column_idx]) + float(np.sign(delta)) * max_delta
+        limited.append(current)
+    return limited
+
 
 def ensure_vendored_soma_importable() -> None:
     """Put ARDY's vendored Soma runtime before any external Soma checkout."""
@@ -70,14 +111,17 @@ def _save_t3_csv_from_t2_buffer(path: Path, buffer) -> None:
     t2_config = csv_utils.get_csv_config("t2")
     t2_header = t2_config.csv_header
     t3_indices = [t2_header.index(column) for column in T3_CSV_HEADER]
+    rows = [
+        [float(t2_config.to_csv_row(frame_idx, buffer.get_data(frame_idx))[index]) for index in t3_indices]
+        for frame_idx in range(buffer.num_frames)
+    ]
+    rows = limit_t3_arm_joint_rates(rows, T3_CSV_HEADER, fps=float(buffer.sample_rate))
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(T3_CSV_HEADER)
-        for frame_idx in range(buffer.num_frames):
-            t2_row = t2_config.to_csv_row(frame_idx, buffer.get_data(frame_idx))
-            writer.writerow([t2_row[index] for index in t3_indices])
+        writer.writerows(rows)
 
 
 class SomaBvhT3UpperBodyRetargeter:

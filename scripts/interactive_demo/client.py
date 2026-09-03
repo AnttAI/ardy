@@ -8,7 +8,7 @@ import functools
 import mimetypes
 
 from .common import *  # noqa: F401,F403
-from .environments import DEFAULT_ENVIRONMENT_LABEL, add_environment_to_scene
+from .environments import DEFAULT_ENVIRONMENT_LABEL, add_environment_to_scene, initial_environment_label
 from .gui.instructions import QUICK_START_MD
 
 _ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
@@ -212,7 +212,7 @@ class ClientMixin:
         #     color2=(40, 40, 40),
         # )
 
-        self.set_client_environment(client, DEFAULT_ENVIRONMENT_LABEL, visible=True)
+        self.set_client_environment(client, initial_environment_label(), visible=True)
 
     def set_client_environment(self, client: viser.ClientHandle, label: str, visible: bool = True) -> None:
         """Replace the current per-client demo environment."""

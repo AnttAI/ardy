@@ -238,6 +238,8 @@ def main() -> None:
         os.environ["ARDY_NEWTON_WEBSOCKET_PAYLOAD"] = args.newton_websocket_payload
     if args.newton_websocket_delivery:
         os.environ["ARDY_NEWTON_WEBSOCKET_DELIVERY"] = args.newton_websocket_delivery
+    if args.newton_use_websocket and not os.environ.get("ARDY_DEFAULT_ENVIRONMENT"):
+        os.environ["ARDY_DEFAULT_ENVIRONMENT"] = "Pick Table"
 
     demo = InteractiveTimelineDemo(
         compile_model=not args.no_compile,

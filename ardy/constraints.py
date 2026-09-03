@@ -236,12 +236,14 @@ class EndEffectorConstraintSet:
         *,
         joint_names: list[str],
         constrain_root: bool | None = None,
+        constrain_rotations: bool = True,
         to_crop: bool = False,
     ) -> None:
         self.skeleton = skeleton
         self.frame_indices = frame_indices
         self.joint_names = joint_names
         self.constrain_root = "Hips" in joint_names if constrain_root is None else bool(constrain_root)
+        self.constrain_rotations = bool(constrain_rotations)
 
         # joint_names are constant for all the frames
         rot_joint_names, pos_joint_names = self.skeleton.expand_joint_names(self.joint_names)
@@ -293,17 +295,17 @@ class EndEffectorConstraintSet:
         data_dict["global_joints_positions"].append(self.global_joints_positions[tuple(pos_indices_crop.T)])
         index_dict["global_joints_positions"].append(pos_indices_real)
 
-        # constraint rotations
-        rot_indices_real = create_pairs(
-            self.frame_indices,
-            self.rot_indices,
-        )
-        rot_indices_crop = create_pairs(
-            crop_frames_indexing,
-            self.rot_indices,
-        )
-        data_dict["global_joints_rots"].append(self.global_joints_rots[tuple(rot_indices_crop.T)])
-        index_dict["global_joints_rots"].append(rot_indices_real)
+        if self.constrain_rotations:
+            rot_indices_real = create_pairs(
+                self.frame_indices,
+                self.rot_indices,
+            )
+            rot_indices_crop = create_pairs(
+                crop_frames_indexing,
+                self.rot_indices,
+            )
+            data_dict["global_joints_rots"].append(self.global_joints_rots[tuple(rot_indices_crop.T)])
+            index_dict["global_joints_rots"].append(rot_indices_real)
 
         if self.constrain_root:
             # Only EE constraints that request root conditioning should pin
@@ -326,6 +328,7 @@ class EndEffectorConstraintSet:
         if not hasattr(cls, "joint_names"):
             kwargs["joint_names"] = self.joint_names
         kwargs["constrain_root"] = self.constrain_root
+        kwargs["constrain_rotations"] = self.constrain_rotations
 
         return cls(
             self.skeleton,
@@ -353,6 +356,7 @@ class EndEffectorConstraintSet:
             # but not for children
             output["joint_names"] = self.joint_names
         output["constrain_root"] = self.constrain_root
+        output["constrain_rotations"] = self.constrain_rotations
         return output
 
     @classmethod
@@ -374,6 +378,8 @@ class EndEffectorConstraintSet:
             kwargs["joint_names"] = dico["joint_names"]
         if "constrain_root" in dico:
             kwargs["constrain_root"] = dico["constrain_root"]
+        if "constrain_rotations" in dico:
+            kwargs["constrain_rotations"] = dico["constrain_rotations"]
 
         return cls(
             skeleton,

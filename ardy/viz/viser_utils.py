@@ -1960,6 +1960,7 @@ class EEJointsKeyframeSet(ConstraintSet):
         joint_names: List[str],
         end_effector_type: str,
         constrain_root: bool = True,
+        constrain_rotations: bool = True,
         viz_label: bool = True,
         exists_ok: bool = False,
     ):
@@ -1986,6 +1987,9 @@ class EEJointsKeyframeSet(ConstraintSet):
                 joint_names.update(set(self.keyframes[frame_idx]["joint_names"]))
                 joint_names = list(joint_names)
                 constrain_root = bool(constrain_root or self.keyframes[frame_idx].get("constrain_root", True))
+                constrain_rotations = bool(
+                    constrain_rotations or self.keyframes[frame_idx].get("constrain_rotations", True)
+                )
                 end_effector_type.update(self.keyframes[frame_idx]["end_effector_type"])
                 # need to re-create viz elements
                 self.clear(frame_idx)
@@ -2041,6 +2045,7 @@ class EEJointsKeyframeSet(ConstraintSet):
             "joint_names": joint_names,
             "end_effector_type": end_effector_type,
             "constrain_root": bool(constrain_root),
+            "constrain_rotations": bool(constrain_rotations),
         }
 
         if frame_idx not in self.frame2keyid:
@@ -2148,6 +2153,7 @@ class EEJointsKeyframeSet(ConstraintSet):
         all_joints_names = []
         all_end_effector_type = []
         all_constrain_root = []
+        all_constrain_rotations = []
         for v in self.keyframes.values():
             joints_pos = to_torch(v["joints_pos"], device=device)
             joints_rot = to_torch(v["joints_rot"], device=device)
@@ -2162,6 +2168,7 @@ class EEJointsKeyframeSet(ConstraintSet):
             all_joints_names.append(v["joint_names"])
             all_end_effector_type.append(v["end_effector_type"])
             all_constrain_root.append(v.get("constrain_root", True))
+            all_constrain_rotations.append(v.get("constrain_rotations", True))
 
         all_joints_pos = torch.cat(all_joints_pos, dim=0) if len(all_joints_pos) > 0 else None
         all_joints_rot = torch.cat(all_joints_rot, dim=0) if len(all_joints_rot) > 0 else None
@@ -2173,6 +2180,7 @@ class EEJointsKeyframeSet(ConstraintSet):
             "joint_names": all_joints_names,
             "end_effector_type": all_end_effector_type,
             "constrain_root": all_constrain_root,
+            "constrain_rotations": all_constrain_rotations,
         }
 
     def set_keyframe_visibility(self, keyframe_idx: int, visible: bool, show_rotation_axes: bool = True):
