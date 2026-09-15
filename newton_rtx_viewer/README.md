@@ -12,6 +12,7 @@ For RTX rendering, Newton must be installed with its RTX viewer dependencies.
 Recommended command using the repo background asset:
 
 ```bash
+
 python newton_rtx_viewer/viewer_process.py \
   --viewer rtx \
   --background-usd newton_rtx_viewer/assets/robot-ovrtx.usda \
@@ -21,9 +22,11 @@ python newton_rtx_viewer/viewer_process.py \
   --websocket-port 8765 \
   --camera-preset saved_front \
   --playback-mode realtime \
+  --rtx-environment studio \
   --pick-table-physics-backend mujoco-cpu \
-  --physics-substeps 16 \
-  --debug-pick-fps 60 \
+  --physics-substeps 8 \
+  --debug-pick-fps 10 \
+  --debug-pick-physics-substeps 2 \
   --ovstream-webrtc \
   --ovstream-port 49104
 ```
