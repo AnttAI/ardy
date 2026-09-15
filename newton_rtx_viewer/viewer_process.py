@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -29,12 +30,9 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 
-REPO_ROOT = Path(os.environ.get("ARDY_REPO_ROOT", "/home/jony/Downloads/ardy")).expanduser().resolve()
+REPO_ROOT = Path(os.environ.get("ARDY_REPO_ROOT", Path(__file__).resolve().parent)).expanduser().resolve()
 ARDY_WORKSPACE_ROOT = REPO_ROOT.parent if REPO_ROOT.name == "newton_rtx_viewer" else REPO_ROOT
 DOWNLOADS_ROOT = Path.home() / "Downloads"
-SOMA_RETARGETER_ROOT = Path("/home/jony/Downloads/soma-retargeter")
-SOMA_RETARGETER_APP = SOMA_RETARGETER_ROOT / "app"
-DEFAULT_T3_URDF = Path("/home/jony/Downloads/kimodo/robot_demo_outputs/t3_robot/T3.urdf")
 LOCAL_T3_URDF = REPO_ROOT / "assets" / "t3_robot" / "T3.urdf"
 DEFAULT_ARDY_TORCH_PYTHON = Path("/home/jony/miniconda3/envs/ardy/bin/python")
 BVH_FRAME_HELPER = Path(__file__).resolve().parent / "bvh_frame_helper.py"
@@ -158,17 +156,43 @@ INTERACTIVE_BOTTLE_POSITIONS = (
     (0.0, -0.86, 0.0),
     (0.38, -0.86, 0.0),
 )
-INTERACTIVE_BOTTLE_RADIUS = 0.040
-INTERACTIVE_BOTTLE_HALF_HEIGHT = 0.145
-INTERACTIVE_BOTTLE_MASS_KG = 0.75
+INTERACTIVE_BOTTLE_RADIUS = 0.028
+INTERACTIVE_BOTTLE_HALF_HEIGHT = 0.090
+INTERACTIVE_BOTTLE_MASS_KG = 0.115
 INTERACTIVE_BOTTLE_INSERT_DISTANCE_M = 0.13
-INTERACTIVE_GRIPPER_PROXY_RADIUS = 0.045
-INTERACTIVE_GRIPPER_PROXY_MAX_STEP_M = 0.018
-INTERACTIVE_ROBOT_PROXY_MAX_STEP_M = 0.080
+INTERACTIVE_BOTTLE_APPROACH_DISTANCE_M = 0.24
+INTERACTIVE_TABLE_CONTACT_MARGIN_M = 0.012
+T3_GRIPPER_RUBBER_FRICTION = 1.2
+T3_GRIPPER_PAD_HALF_EXTENTS_M = (0.022, 0.030, 0.002)
 PICK_TABLE_SCENE_JSON = Path(__file__).resolve().parent / "assets" / "environment" / "pick_table_scene.json"
-T3_GRIPPER_OPEN_APERTURE_M = 0.075
-T3_GRIPPER_CLOSED_APERTURE_M = 0.045
+T3_DEMO_PICK_CACHE_JSON = Path(__file__).resolve().parent / "assets" / "t3_demo_pick_frames_10fps.json"
+T3_GRIPPER_OPEN_APERTURE_M = 0.095
+T3_GRIPPER_CLOSED_APERTURE_M = 0.0
+T3_GRIPPER_BOTTLE_GRASP_APERTURE_M = max(0.0, INTERACTIVE_BOTTLE_RADIUS * 2.0 - 0.012)
 T3_GRIPPER_SIDES = ("left", "right")
+T3_TABLE_GUARD_BODY_SUFFIXES = (
+    "left_link6",
+    "left_link7",
+    "left_link8",
+    "left_gripper_base",
+    "left_gripper_flange",
+    "left_gripper_link1",
+    "left_gripper_link2",
+    "right_link6",
+    "right_link7",
+    "right_link8",
+    "right_gripper_base",
+    "right_gripper_flange",
+    "right_gripper_link1",
+    "right_gripper_link2",
+)
+T3_PICK_CONTACT_BODY_SUFFIXES = {
+    "right_gripper_link1",
+    "right_gripper_link2",
+}
+T3_DEMO_LEFT_ARM_REST_POSE = {
+    "left_joint2": 1.20,
+}
 T3_BOTTLE_COLLIDER_RADIUS_BY_SUFFIX = {
     "waist_yaw_link": 0.10,
     "waist_roll_link": 0.10,
@@ -261,8 +285,21 @@ def _env_vec3(name: str, default: tuple[float, float, float]) -> tuple[float, fl
     return values if len(values) == 3 else default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    print(f"[ARDY Newton Viewer] ignored invalid {name}={raw!r}; using {default}", flush=True)
+    return bool(default)
+
+
 def _setup_paths() -> None:
-    for path in (REPO_ROOT, SOMA_RETARGETER_APP, SOMA_RETARGETER_ROOT):
+    for path in (REPO_ROOT, ARDY_WORKSPACE_ROOT):
         if path.exists() and str(path) not in sys.path:
             sys.path.insert(0, str(path))
 
@@ -308,6 +345,8 @@ class NativeWebSocketReceiver:
         self._clients: set[socket.socket] = set()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        self.pick_scene = {"type": "pick_scene", "ready": False, "error": "Wait for RTX scene and robot frames"}
+        self.pick_scene_time = 0.0
 
     def start(self) -> None:
         if self.enabled:
@@ -382,6 +421,11 @@ class NativeWebSocketReceiver:
                         frame = json.loads(payload.decode("utf-8"))
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         continue
+                    if frame.get("type") == "get_pick_scene":
+                        scene = dict(self.pick_scene)
+                        scene["age_s"] = time.monotonic() - self.pick_scene_time
+                        self._send_text_frame(client, json.dumps(scene).encode("utf-8"))
+                        continue
                     self.frames_received += 1
                     self.last_frame_idx = int(frame.get("frame_idx", -1))
                     self.last_payload_bytes = len(payload)
@@ -436,6 +480,18 @@ class NativeWebSocketReceiver:
             f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
         )
         client.sendall(response.encode("ascii"))
+
+    def _send_text_frame(self, client: socket.socket, payload: bytes) -> None:
+        length = len(payload)
+        header = bytearray([0x81])
+        if length < 126:
+            header.append(length)
+        elif length < 65536:
+            header.extend([126, (length >> 8) & 0xFF, length & 0xFF])
+        else:
+            header.extend([127])
+            header.extend(int(length).to_bytes(8, "big"))
+        client.sendall(bytes(header) + payload)
 
     def _read_frame(self, client: socket.socket) -> tuple[int, bytes]:
         first = client.recv(2)
@@ -963,6 +1019,245 @@ def _make_file_playback_frames(
     return frames, fps
 
 
+def _make_t3_demo_pick_frames(
+    newton,
+    wp,
+    bottle_position,
+    *,
+    fps: float = 60.0,
+    initial_joints=None,
+    root_pose=(0.0, 0.0, 0.0),
+    place_position=None,
+) -> tuple[list[dict], float]:
+    import newton.ik as ik
+
+    target_bottle = np.asarray(bottle_position, dtype=np.float32)
+    lift_seed = float(np.clip(target_bottle[2] - 0.82, T3_LIFT_MIN_M, T3_LIFT_MAX_M))
+
+    builder = newton.ModelBuilder()
+    builder.add_urdf(
+        str(LOCAL_T3_URDF),
+        floating=False,
+        collapse_fixed_joints=False,
+        enable_self_collisions=False,
+    )
+    arm_mask = np.zeros(builder.joint_dof_count, dtype=bool)
+    finger_coords: list[tuple[int, int, str]] = []
+    joint_names_by_coord: list[tuple[str, int]] = []
+    for joint_idx, label in enumerate(builder.joint_label):
+        name = str(label).rsplit("/", 1)[-1]
+        q_start = int(builder.joint_q_start[joint_idx])
+        qd_start = int(builder.joint_qd_start[joint_idx])
+        dof_dim = builder.joint_dof_dim[joint_idx]
+        try:
+            dof_count = int(sum(dof_dim))
+        except TypeError:
+            dof_count = int(dof_dim)
+        if q_start < len(builder.joint_q) and dof_count > 0:
+            joint_names_by_coord.append((name, q_start))
+        if initial_joints and name in initial_joints and q_start < len(builder.joint_q):
+            builder.joint_q[q_start] = initial_joints[name]
+        if name == "telescopic_lift_joint" and q_start < len(builder.joint_q):
+            builder.joint_q[q_start] = lift_seed
+        if name in T3_DEMO_LEFT_ARM_REST_POSE and q_start < len(builder.joint_q):
+            builder.joint_q[q_start] = T3_DEMO_LEFT_ARM_REST_POSE[name]
+        if name.startswith("right_joint") and name[-1:] in set("1234567"):
+            arm_mask[qd_start : qd_start + dof_count] = True
+        if name.startswith(("left_gripper_joint", "right_gripper_joint")) and q_start < len(builder.joint_q):
+            if name.startswith("right_"):
+                finger_coords.append((q_start, qd_start, name))
+
+    model = builder.finalize()
+    wrist = next(i for i, name in enumerate(model.body_label) if str(name).endswith("/right_gripper_base"))
+    grip_offset = wp.vec3(0.0, 0.0, 0.11)
+    q = wp.array(model.joint_q, shape=(1, model.joint_coord_count))
+    grasp_point = target_bottle.copy()
+    initial_state = model.state()
+    home = grasp_point - np.array([0.15, 0.0, 0.0], dtype=np.float32)
+    pregrasp = home.copy()
+    pos_obj = ik.IKObjectivePosition(wrist, grip_offset, wp.array([wp.vec3(home)], dtype=wp.vec3))
+    rot_obj = ik.IKObjectiveRotation(
+        wrist,
+        wp.quat_identity(),
+        wp.array([wp.vec4(0.0, np.sqrt(0.5), 0.0, np.sqrt(0.5))], dtype=wp.vec4),
+        weight=0.2,
+    )
+    ik_solver = ik.IKSolver(
+        model,
+        1,
+        [
+            pos_obj,
+            rot_obj,
+            ik.IKObjectiveJointLimit(model.joint_limit_lower, model.joint_limit_upper, weight=10.0),
+        ],
+        jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        joint_dof_mask=wp.array(arm_mask, dtype=wp.bool),
+    )
+    ik_solver.step(q, q, iterations=200)
+    initial_q = q.numpy().reshape(-1).copy()
+    lift = grasp_point + np.array([0.0, 0.0, 0.28], dtype=np.float32)
+    place_point = (
+        np.asarray(place_position, dtype=np.float32)
+        if place_position is not None
+        else grasp_point + np.array([0.0, 0.34, 0.0], dtype=np.float32)
+    )
+    place_point[2] = grasp_point[2]
+    above_place = place_point + np.array([0.0, 0.0, 0.30], dtype=np.float32)
+    # Follow the validated t3_pick_place timing: settle, reach, grasp, lift,
+    # transfer, lower, release, retract.
+    times = np.array([0, 1, 2, 3, 4, 6, 8, 9, 11, 13, 15], dtype=np.float32)
+    points = np.array(
+        [
+            home,
+            home,
+            pregrasp,
+            grasp_point,
+            grasp_point,
+            lift,
+            above_place,
+            place_point,
+            place_point,
+            above_place,
+            home,
+        ],
+        dtype=np.float32,
+    )
+
+    lower = model.joint_limit_lower.numpy()
+    upper = model.joint_limit_upper.numpy()
+    waypoint_q: list[np.ndarray] = []
+    for waypoint_index, target in enumerate(points):
+        if waypoint_index < 2:
+            waypoint_q.append(initial_q.copy())
+            continue
+        pos_obj.set_target_positions(wp.array([wp.vec3(target)], dtype=wp.vec3))
+        ik_solver.step(q, q, iterations=28)
+        if waypoint_index >= 3:
+            newton.eval_fk(model, q.flatten(), model.joint_qd, initial_state)
+            reached = np.asarray(wp.transform_point(wp.transform(*initial_state.body_q.numpy()[wrist]), grip_offset))
+            if np.linalg.norm(reached - target) > 0.025:
+                raise ValueError("Selected bottle or lift target is out of reach from the current base; select a closer bottle")
+        waypoint_q.append(q.numpy().reshape(-1).copy())
+
+    frame_count = int(np.ceil(float(times[-1]) * fps)) + 1
+    frames: list[dict] = []
+    for frame_idx in range(frame_count):
+        t = frame_idx / max(float(fps), 1.0e-6)
+        segment = min(max(int(np.searchsorted(times, t, side="right") - 1), 0), len(times) - 2)
+        span = max(float(times[segment + 1] - times[segment]), 1.0e-6)
+        u = float(np.clip((t - float(times[segment])) / span, 0.0, 1.0))
+        u = u * u * (3.0 - 2.0 * u)
+        q_np = ((1.0 - u) * waypoint_q[segment] + u * waypoint_q[segment + 1]).copy()
+        closure = np.clip(t - 3.0, 0.0, 1.0) if t < 9.3 else max(0.0, 1.0 - (t - 9.3))
+        for coord, dof, name in finger_coords:
+            sign = 1.0 if name.endswith("1") else -1.0
+            open_half = 0.05
+            closed_half = 0.0
+            opening = sign * (closed_half + (1.0 - closure) * (open_half - closed_half))
+            q_np[coord] = np.clip(opening, lower[dof], upper[dof])
+        row = {
+            "root_x_m": float(root_pose[0]),
+            "root_y_m": float(root_pose[1]),
+            "root_yaw_rad": float(root_pose[2]),
+            "fps": float(fps),
+            "frame_idx": int(frame_idx),
+            "debug_demo_pick": True,
+            "kinematic_t3_demo_pick": True,
+            "demo_place_position": place_point.astype(float).tolist(),
+            "joint_names": [],
+            "joint_cfg": [],
+        }
+        for name, coord in joint_names_by_coord:
+            value = float(q_np[coord])
+            row["joint_names"].append(name)
+            row["joint_cfg"].append(value)
+        frames.append(
+            {
+                "show_soma_mesh": False,
+                "show_t3_robot": True,
+                "t3_row": row,
+                "fps": float(fps),
+                "frame_idx": int(frame_idx),
+                "kinematic_t3_demo_pick": True,
+                "demo_place_position": place_point.astype(float).tolist(),
+                "status": f"T3 demo pick frame {frame_idx}/{frame_count - 1}",
+            }
+        )
+    print(
+        "[ARDY Newton Viewer] generated T3 demo pick playback: "
+        f"{len(frames)} frames, staged base pick and hold",
+        flush=True,
+    )
+    return frames, float(fps)
+
+
+def _densify_t3_demo_pick_frames(frames: list[dict], fps: float, repeat: int) -> tuple[list[dict], float]:
+    repeat = max(1, int(repeat))
+    if repeat <= 1 or not frames:
+        return frames, float(fps)
+    dense_frames: list[dict] = []
+    dense_fps = float(fps) * repeat
+    for frame in frames:
+        for _ in range(repeat):
+            frame_copy = dict(frame)
+            row = dict(frame_copy.get("t3_row", {})) if isinstance(frame_copy.get("t3_row"), dict) else {}
+            new_index = len(dense_frames)
+            row["fps"] = dense_fps
+            row["frame_idx"] = new_index
+            frame_copy["t3_row"] = row
+            frame_copy["fps"] = dense_fps
+            frame_copy["frame_idx"] = new_index
+            frame_copy["status"] = f"T3 demo pick frame {new_index}/{len(frames) * repeat - 1}"
+            dense_frames.append(frame_copy)
+    return dense_frames, dense_fps
+
+
+def _load_cached_t3_demo_pick_frames(bottle_position) -> tuple[list[dict], float] | None:
+    if not T3_DEMO_PICK_CACHE_JSON.exists():
+        return None
+    try:
+        payload = json.loads(T3_DEMO_PICK_CACHE_JSON.read_text())
+        frames_in = payload.get("frames") or []
+        demo_bottle = np.asarray(payload.get("demo_bottle", [0.50, -0.28, 0.86]), dtype=np.float64)
+        target_bottle = np.asarray(bottle_position, dtype=np.float64)
+        root_offset_xy = target_bottle[:2] - demo_bottle[:2]
+        lift_delta = float(target_bottle[2] - demo_bottle[2])
+        fps = float(payload.get("fps", 10.0))
+        frames: list[dict] = []
+        for frame in frames_in:
+            frame_copy = dict(frame)
+            row_in = frame_copy.get("t3_row") if isinstance(frame_copy.get("t3_row"), dict) else {}
+            row = dict(row_in)
+            row["root_x_m"] = float(row.get("root_x_m", 0.0)) + float(root_offset_xy[0])
+            row["root_y_m"] = float(row.get("root_y_m", 0.0)) + float(root_offset_xy[1])
+            row["fps"] = fps
+            row["debug_demo_pick"] = True
+            joint_names = [str(name) for name in row.get("joint_names", [])]
+            joint_cfg = [float(value) for value in row.get("joint_cfg", [])]
+            try:
+                lift_index = joint_names.index("telescopic_lift_joint")
+            except ValueError:
+                lift_index = -1
+            if 0 <= lift_index < len(joint_cfg):
+                joint_cfg[lift_index] = float(np.clip(joint_cfg[lift_index] + lift_delta, T3_LIFT_MIN_M, T3_LIFT_MAX_M))
+            row["joint_names"] = joint_names
+            row["joint_cfg"] = joint_cfg
+            frame_copy["t3_row"] = row
+            frame_copy["fps"] = fps
+            frame_copy["debug_demo_pick"] = True
+            frames.append(frame_copy)
+        print(
+            "[ARDY Newton Viewer] loaded cached T3 demo pick playback: "
+            f"{len(frames)} frames, root_offset=({root_offset_xy[0]:.3f},{root_offset_xy[1]:.3f}), "
+            f"lift_delta={lift_delta:.3f}",
+            flush=True,
+        )
+        return frames, fps
+    except Exception as exc:
+        print(f"[ARDY Newton Viewer] cached T3 demo pick unavailable: {exc}", flush=True)
+        return None
+
+
 def _ui_input_text(ui, label: str, value: str) -> str:
     try:
         changed, new_value = ui.input_text(label, value, 2048)
@@ -1056,9 +1351,52 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pick-table-physics",
+        dest="pick_table_physics",
         action="store_true",
-        default=os.environ.get("ARDY_NEWTON_PICK_TABLE_PHYSICS", "").strip().lower() in {"1", "true", "yes", "on"},
+        default=_env_bool("ARDY_NEWTON_PICK_TABLE_PHYSICS", True),
         help="Add shared pick-table table collider and dynamic bottle physics independent of the background USD.",
+    )
+    parser.add_argument(
+        "--no-pick-table-physics",
+        dest="pick_table_physics",
+        action="store_false",
+        help="Disable pick-table table collider and dynamic bottle physics.",
+    )
+    parser.add_argument(
+        "--pick-table-physics-backend",
+        choices=("mujoco", "mujoco-gpu", "mujoco-cpu", "xpbd"),
+        default=os.environ.get("ARDY_NEWTON_PICK_TABLE_PHYSICS_BACKEND", "mujoco-cpu").lower(),
+        help="Physics backend for pick-table bottles. MuJoCo matches the validated T3 pick-place demo.",
+    )
+    parser.add_argument(
+        "--physics-substeps",
+        type=int,
+        default=int(os.environ.get("ARDY_NEWTON_PHYSICS_SUBSTEPS", "16")),
+        help="Physics substeps per rendered frame for pick-table bottle simulation.",
+    )
+    parser.add_argument(
+        "--debug-pick-physics-substeps",
+        type=int,
+        default=int(os.environ.get("ARDY_NEWTON_DEBUG_PICK_PHYSICS_SUBSTEPS", "4")),
+        help="Physics substeps used only while the built-in T3 demo pick playback is active.",
+    )
+    parser.add_argument(
+        "--debug-pick-fps",
+        type=float,
+        default=float(os.environ.get("ARDY_NEWTON_DEBUG_PICK_FPS", "60")),
+        help="Command-frame rate for the built-in T3 demo pick playback. 60 FPS matches the validated T3 pick demo.",
+    )
+    parser.add_argument(
+        "--real-gripper-collision",
+        action="store_true",
+        default=_env_bool("ARDY_NEWTON_REAL_GRIPPER_COLLISION", False),
+        help="Keep real right-gripper collision shapes active for bottle grasp debugging. Costs more FPS.",
+    )
+    parser.add_argument(
+        "--no-real-gripper-collision",
+        dest="real_gripper_collision",
+        action="store_false",
+        help="Use hidden lightweight gripper proxies only.",
     )
     parser.add_argument(
         "--record-video",
@@ -1167,6 +1505,8 @@ def _parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     args.pick_object = "none"
+    if args.pick_table_physics_backend == "mujoco":
+        args.pick_table_physics_backend = "mujoco-cpu"
     args.ovstream_port = _resolve_repeated_ports(
         args.ovstream_port,
         os.environ.get("ARDY_NEWTON_OVSTREAM_PORT"),
@@ -2071,6 +2411,44 @@ def _robot_shape_bounds(
     return np.min(all_points, axis=0), np.max(all_points, axis=0)
 
 
+def _body_shape_bounds(
+    newton,
+    model,
+    state,
+    body_idx: int,
+    shape_count: int | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if body_idx < 0:
+        return None
+    body_q = state.body_q.numpy()
+    shape_body = model.shape_body.numpy() if hasattr(model.shape_body, "numpy") else model.shape_body
+    shape_transform = model.shape_transform.numpy() if hasattr(model.shape_transform, "numpy") else model.shape_transform
+    shape_scale = model.shape_scale.numpy() if hasattr(model.shape_scale, "numpy") else model.shape_scale
+    shape_type = model.shape_type.numpy() if hasattr(model.shape_type, "numpy") else model.shape_type
+
+    point_values = []
+    for shape_idx in range(model.shape_count if shape_count is None else min(shape_count, model.shape_count)):
+        if int(shape_body[shape_idx]) != int(body_idx):
+            continue
+        local_bounds = _shape_local_bounds(
+            newton,
+            int(shape_type[shape_idx]),
+            np.asarray(shape_scale[shape_idx], dtype=np.float64),
+            model.shape_source[shape_idx],
+        )
+        if local_bounds is None:
+            continue
+        shape_world_tx = _mul_transform_np(
+            np.asarray(body_q[body_idx], dtype=np.float64),
+            np.asarray(shape_transform[shape_idx], dtype=np.float64),
+        )
+        point_values.append(_transform_points_np(shape_world_tx, _bounds_corners(*local_bounds)))
+    if not point_values:
+        return None
+    all_points = np.concatenate(point_values, axis=0)
+    return np.min(all_points, axis=0), np.max(all_points, axis=0)
+
+
 def _bounds_overlap_xy(bounds: tuple[np.ndarray, np.ndarray], center: list[float], size: float) -> bool:
     mins, maxs = bounds
     half = float(size) * 0.5
@@ -2306,6 +2684,95 @@ def _interactive_bottle_spawn_positions(
     return [(float(x), float(y), z) for x, y, _ in INTERACTIVE_BOTTLE_POSITIONS]
 
 
+def _table_top_z(obstacle_bounds: list[tuple[np.ndarray, np.ndarray]] | None) -> float | None:
+    if not obstacle_bounds:
+        return None
+    try:
+        return max(float(maxs[2]) for _, maxs in obstacle_bounds)
+    except Exception:
+        return None
+
+
+def _clamp_bottle_position_to_table(position, table_top_z: float | None) -> np.ndarray:
+    pos = np.asarray(position, dtype=np.float64).copy()
+    if table_top_z is not None:
+        pos[2] = max(float(pos[2]), float(table_top_z) + INTERACTIVE_BOTTLE_HALF_HEIGHT)
+    return pos
+
+
+def _move_interactive_bottle(
+    wp,
+    model,
+    state,
+    state_next,
+    joint_q_start,
+    bottle_body_indices: list[int],
+    bottle_positions: list[np.ndarray],
+    held_bottles: dict[int, dict],
+    bottle_idx: int,
+    position,
+    table_top_z: float | None = None,
+) -> None:
+    if bottle_idx < 0 or bottle_idx >= len(bottle_body_indices):
+        return
+    position = _clamp_bottle_position_to_table(position, table_top_z)
+    bottle_positions[bottle_idx] = position
+    held_bottles.pop(bottle_idx, None)
+    _set_free_body_pose(wp, model, state, joint_q_start, bottle_body_indices[bottle_idx], position)
+    _set_free_body_pose(wp, model, state_next, joint_q_start, bottle_body_indices[bottle_idx], position)
+
+
+def _table_guard_lift_for_bounds(
+    actor_bounds: tuple[np.ndarray, np.ndarray] | None,
+    obstacle_bounds: list[tuple[np.ndarray, np.ndarray]] | None,
+) -> float:
+    if actor_bounds is None or not obstacle_bounds:
+        return 0.0
+    actor_mins, actor_maxs = actor_bounds
+    lift = 0.0
+    for obstacle_mins, obstacle_maxs in obstacle_bounds:
+        if (
+            actor_maxs[0] <= obstacle_mins[0]
+            or actor_mins[0] >= obstacle_maxs[0]
+            or actor_maxs[1] <= obstacle_mins[1]
+            or actor_mins[1] >= obstacle_maxs[1]
+            or actor_mins[2] >= obstacle_maxs[2]
+        ):
+            continue
+        lift = max(lift, float(obstacle_maxs[2] - actor_mins[2]) + INTERACTIVE_TABLE_CONTACT_MARGIN_M)
+    return lift
+
+
+def _guard_t3_hand_bodies_from_obstacles(
+    wp,
+    newton,
+    model,
+    state,
+    t3_shape_count: int,
+    obstacle_bounds: list[tuple[np.ndarray, np.ndarray]] | None,
+) -> int:
+    if not obstacle_bounds:
+        return 0
+    corrections = 0
+    for suffix in T3_TABLE_GUARD_BODY_SUFFIXES:
+        body_idx = _body_index_by_suffix(model, suffix)
+        if body_idx is None:
+            continue
+        body_bounds = _body_shape_bounds(newton, model, state, body_idx, t3_shape_count)
+        lift = _table_guard_lift_for_bounds(body_bounds, obstacle_bounds)
+        if lift <= 0.0:
+            continue
+        pose = _body_pose_by_suffix(model, state, suffix)
+        if pose is None:
+            continue
+        position, quat = pose
+        guarded_position = np.asarray(position, dtype=np.float64).copy()
+        guarded_position[2] += float(lift)
+        _set_body_pose(wp, state, body_idx, guarded_position, quat)
+        corrections += 1
+    return corrections
+
+
 def _add_table_physics_colliders(newton, wp, builder, obstacle_bounds: list[tuple[np.ndarray, np.ndarray]]) -> int:
     if not obstacle_bounds:
         return 0
@@ -2403,17 +2870,21 @@ def _add_interactive_bottles(newton, wp, builder, enabled: bool, bottle_position
         return []
     bottle_volume = (
         math.pi * INTERACTIVE_BOTTLE_RADIUS**2 * (INTERACTIVE_BOTTLE_HALF_HEIGHT * 2.0)
-        + math.pi * 0.030**2 * 0.070
+        + math.pi * 0.013**2 * 0.030
+        + math.pi * 0.015**2 * 0.008
     )
     cfg = newton.ModelBuilder.ShapeConfig(
-        density=INTERACTIVE_BOTTLE_MASS_KG / bottle_volume,
-        mu=1.1,
-        ke=1.8e4,
-        kd=3.0e3,
-        kf=2.0e3,
+        # Match /home/jony/Downloads/t3_pick_place/example.py: a light
+        # plastic bottle with stiff MuJoCo contacts. Softer contacts made the
+        # jaws visually penetrate before the solver produced a stable pinch.
+        density=250.0,
+        mu=1.2,
+        ke=1.0e5,
+        kd=1.0e3,
+        kf=1.0e3,
         restitution=0.0,
-        mu_torsional=0.10,
-        mu_rolling=0.08,
+        mu_torsional=0.01,
+        mu_rolling=0.005,
     )
     joint_names = []
     for index, pos in enumerate(bottle_positions, start=1):
@@ -2431,27 +2902,27 @@ def _add_interactive_bottles(newton, wp, builder, enabled: bool, bottle_position
         )
         builder.add_shape_cylinder(
             body,
-            xform=wp.transform(wp.vec3(0.0, 0.0, -0.030), wp.quat_identity()),
+            xform=wp.transform(wp.vec3(0.0, 0.0, -0.020), wp.quat_identity()),
             radius=INTERACTIVE_BOTTLE_RADIUS * 1.015,
-            half_height=0.040,
+            half_height=0.025,
             cfg=cfg,
             color=(0.03, 0.18, 0.42),
             label=f"interactive_water_bottle_{index}_label",
         )
         builder.add_shape_cylinder(
             body,
-            xform=wp.transform(wp.vec3(0.0, 0.0, INTERACTIVE_BOTTLE_HALF_HEIGHT + 0.035), wp.quat_identity()),
-            radius=0.030,
-            half_height=0.035,
+            xform=wp.transform(wp.vec3(0.0, 0.0, INTERACTIVE_BOTTLE_HALF_HEIGHT + 0.015), wp.quat_identity()),
+            radius=0.013,
+            half_height=0.015,
             cfg=cfg,
             color=(0.78, 0.92, 1.00),
             label=f"interactive_water_bottle_{index}_neck",
         )
         builder.add_shape_cylinder(
             body,
-            xform=wp.transform(wp.vec3(0.0, 0.0, INTERACTIVE_BOTTLE_HALF_HEIGHT + 0.088), wp.quat_identity()),
-            radius=0.028,
-            half_height=0.018,
+            xform=wp.transform(wp.vec3(0.0, 0.0, INTERACTIVE_BOTTLE_HALF_HEIGHT + 0.034), wp.quat_identity()),
+            radius=0.015,
+            half_height=0.004,
             cfg=cfg,
             color=(0.04, 0.34, 0.88),
             label=f"interactive_water_bottle_{index}_cap",
@@ -2497,16 +2968,28 @@ def _set_body_pose(wp, state, body_idx: int, position, quat=None, zero_velocity:
         wp.copy(state.body_qd, wp.array(body_qd, dtype=wp.spatial_vector), 0, 0, len(body_qd))
 
 
-def _limited_step_position(previous: np.ndarray | None, target: np.ndarray, max_step: float) -> np.ndarray:
-    target = np.asarray(target, dtype=np.float64)
-    if previous is None:
-        return target
-    previous = np.asarray(previous, dtype=np.float64)
-    delta = target - previous
-    distance = float(np.linalg.norm(delta))
-    if distance <= float(max_step) or distance <= 1.0e-8:
-        return target
-    return previous + delta * (float(max_step) / distance)
+def _set_free_body_pose(
+    wp,
+    model,
+    state,
+    joint_q_start,
+    body_idx: int,
+    position,
+    quat=None,
+    zero_velocity: bool = True,
+) -> None:
+    _set_body_pose(wp, state, body_idx, position, quat, zero_velocity)
+    if body_idx < 0:
+        return
+    body_label = str(model.body_label[body_idx]).rsplit("/", 1)[-1]
+    q_start = joint_q_start.get(f"{body_label}_free_joint")
+    if q_start is None:
+        return
+    pos = np.asarray(position, dtype=np.float64)
+    q = np.asarray(quat if quat is not None else [0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    joint_q = model.joint_q.numpy().copy()
+    joint_q[q_start : q_start + 7] = np.array([pos[0], pos[1], pos[2], q[0], q[1], q[2], q[3]], dtype=np.float32)
+    wp.copy(model.joint_q, wp.array(joint_q, dtype=wp.float32), 0, 0, len(joint_q))
 
 
 def _joint_scalar(model, joint_q_start, joint_name: str) -> float:
@@ -2514,6 +2997,16 @@ def _joint_scalar(model, joint_q_start, joint_name: str) -> float:
     if start is None:
         return 0.0
     return float(model.joint_q.numpy()[start])
+
+
+def _set_gripper_aperture_in_q(q: np.ndarray, joint_q_start, side: str, aperture: float) -> None:
+    aperture = float(np.clip(aperture, 0.0, T3_GRIPPER_MAX_APERTURE_M))
+    joint1_start = joint_q_start.get(f"{side}_gripper_joint1")
+    joint2_start = joint_q_start.get(f"{side}_gripper_joint2")
+    if joint1_start is not None:
+        q[joint1_start] = aperture * 0.5
+    if joint2_start is not None:
+        q[joint2_start] = -aperture * 0.5
 
 
 def _gripper_state(model, state, joint_q_start, side: str) -> dict | None:
@@ -2546,75 +3039,182 @@ def _bottle_inside_gripper(bottle_pos: np.ndarray, gripper: dict) -> bool:
     )
 
 
+def _gripper_aperture_min_for_bottles(
+    model,
+    state,
+    joint_q_start,
+    bottle_positions: list[np.ndarray],
+    held_bottles: dict[int, dict],
+) -> dict[str, float]:
+    aperture_min: dict[str, float] = {}
+    for side in T3_GRIPPER_SIDES:
+        gripper = _gripper_state(model, state, joint_q_start, side)
+        if gripper is None:
+            continue
+        if any(str(hold.get("side")) == side for hold in held_bottles.values()) or any(
+            _bottle_inside_gripper(np.asarray(position, dtype=np.float64), gripper)
+            for position in bottle_positions
+        ):
+            aperture_min[side] = T3_GRIPPER_BOTTLE_GRASP_APERTURE_M
+    return aperture_min
+
+
+def _enforce_gripper_bottle_aperture(
+    wp,
+    newton,
+    model,
+    state,
+    joint_q_start,
+    bottle_positions: list[np.ndarray],
+    held_bottles: dict[int, dict],
+    body_flag_filter=None,
+) -> bool:
+    aperture_min = _gripper_aperture_min_for_bottles(
+        model,
+        state,
+        joint_q_start,
+        bottle_positions,
+        held_bottles,
+    )
+    if not aperture_min:
+        return False
+    q = model.joint_q.numpy().copy()
+    changed = False
+    for side, aperture in aperture_min.items():
+        joint1_start = joint_q_start.get(f"{side}_gripper_joint1")
+        joint2_start = joint_q_start.get(f"{side}_gripper_joint2")
+        current_aperture = 0.0
+        if joint1_start is not None:
+            current_aperture += abs(float(q[joint1_start]))
+        if joint2_start is not None:
+            current_aperture += abs(float(q[joint2_start]))
+        if current_aperture < T3_GRIPPER_OPEN_APERTURE_M and current_aperture < float(aperture):
+            _set_gripper_aperture_in_q(q, joint_q_start, side, float(aperture))
+            changed = True
+    if not changed:
+        return False
+    wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
+    if body_flag_filter is None:
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
+    else:
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=body_flag_filter)
+    return True
+
+
+def _auto_pick_gripper_apertures(
+    model,
+    state,
+    joint_q_start,
+    bottle_positions: list[np.ndarray],
+    held_bottles: dict[int, dict],
+) -> dict[str, float]:
+    apertures: dict[str, float] = {}
+    for side in T3_GRIPPER_SIDES:
+        gripper = _gripper_state(model, state, joint_q_start, side)
+        if gripper is None:
+            continue
+        center = np.asarray(gripper["center"], dtype=np.float64)
+        if any(str(hold.get("side")) == side for hold in held_bottles.values()):
+            apertures[side] = T3_GRIPPER_BOTTLE_GRASP_APERTURE_M
+            continue
+        bottle_distances = [
+            (
+                float(np.linalg.norm((np.asarray(position, dtype=np.float64) - center)[:2])),
+                abs(float(np.asarray(position, dtype=np.float64)[2] - center[2])),
+                np.asarray(position, dtype=np.float64),
+            )
+            for position in bottle_positions
+        ]
+        if any(_bottle_inside_gripper(position, gripper) for _, _, position in bottle_distances):
+            apertures[side] = T3_GRIPPER_BOTTLE_GRASP_APERTURE_M
+        elif any(
+            xy_distance <= INTERACTIVE_BOTTLE_APPROACH_DISTANCE_M and z_distance <= 0.28
+            for xy_distance, z_distance, _ in bottle_distances
+        ):
+            apertures[side] = T3_GRIPPER_MAX_APERTURE_M
+    return apertures
+
+
+def _table_pick_gripper_apertures(table_pick: dict | None, frame_idx: int) -> dict[str, float]:
+    if not isinstance(table_pick, dict):
+        return {}
+    phases = table_pick.get("phases")
+    if not isinstance(phases, dict):
+        return {}
+    try:
+        pregrasp = int(phases.get("pregrasp", phases.get("reach", 0)))
+        open_frame = int(phases.get("open", pregrasp))
+        close_start = int(phases["gripper_close_start"])
+        close_end = int(phases["gripper_close_end"])
+        closed = float(table_pick.get("closed_aperture", T3_GRIPPER_CLOSED_APERTURE_M))
+    except Exception:
+        return {}
+
+    def smooth(a: int, b: int) -> float:
+        span = max(1, int(b) - int(a))
+        u = float(np.clip((int(frame_idx) - int(a)) / span, 0.0, 1.0))
+        return u * u * (3.0 - 2.0 * u)
+
+    maximum = T3_GRIPPER_MAX_APERTURE_M
+    if int(frame_idx) < close_start:
+        aperture = maximum * smooth(pregrasp, open_frame)
+    else:
+        aperture = maximum + (closed - maximum) * smooth(close_start, close_end)
+    return {"right": float(np.clip(aperture, 0.0, T3_GRIPPER_MAX_APERTURE_M))}
+
+
+def _apply_gripper_apertures(
+    wp,
+    newton,
+    model,
+    state,
+    joint_q_start,
+    apertures: dict[str, float],
+    body_flag_filter=None,
+) -> bool:
+    if not apertures:
+        return False
+    q = model.joint_q.numpy().copy()
+    for side, aperture in apertures.items():
+        _set_gripper_aperture_in_q(q, joint_q_start, side, aperture)
+    wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
+    if body_flag_filter is None:
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
+    else:
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=body_flag_filter)
+    return True
+
+
 def _update_interactive_bottles(
     wp,
     model,
     state,
+    state_next,
     joint_q_start,
     bottle_body_indices: list[int],
     bottle_positions: list[np.ndarray],
     held_bottles: dict[int, dict],
     gripper_grasp_state: dict[str, dict],
+    table_top_z: float | None = None,
 ) -> None:
+    # Bottle poses and velocities belong exclusively to the physics solver.
+    # The gripper influences bottles only through contact geometry, friction,
+    # and the configured physics backend. No motion-playback latch/attachment.
+    held_bottles.clear()
+    gripper_grasp_state.clear()
     if not bottle_body_indices:
         return
     body_q = state.body_q.numpy()
     for bottle_idx, body_idx in enumerate(bottle_body_indices):
-        if bottle_idx not in held_bottles:
-            bottle_positions[bottle_idx] = np.asarray(body_q[body_idx][0:3], dtype=np.float64)
-    grippers = [g for side in T3_GRIPPER_SIDES if (g := _gripper_state(model, state, joint_q_start, side)) is not None]
-    for gripper in grippers:
-        side_state = gripper_grasp_state.setdefault(
-            str(gripper["side"]),
-            {"was_open": False, "prev_aperture": float(gripper["aperture"])},
-        )
-        aperture = float(gripper["aperture"])
-        if aperture >= T3_GRIPPER_OPEN_APERTURE_M:
-            side_state["was_open"] = True
-        side_state["closing"] = aperture < float(side_state["prev_aperture"]) - 0.002
-        side_state["closed"] = aperture <= T3_GRIPPER_CLOSED_APERTURE_M
-        side_state["prev_aperture"] = aperture
-
-    for bottle_idx, bottle_pos in enumerate(bottle_positions):
-        if bottle_idx not in held_bottles:
-            for gripper in grippers:
-                side_state = gripper_grasp_state[str(gripper["side"])]
-                if (
-                    bool(side_state["was_open"])
-                    and bool(side_state["closing"])
-                    and bool(side_state["closed"])
-                    and _bottle_inside_gripper(bottle_pos, gripper)
-                ):
-                    held_bottles[bottle_idx] = {
-                        "side": str(gripper["side"]),
-                        "offset": bottle_pos - np.asarray(gripper["center"], dtype=np.float64),
-                    }
-                    side_state["was_open"] = False
-                    print(
-                        f"[ARDY Newton Viewer] {gripper['side']} gripper grasped bottle {bottle_idx + 1}",
-                        flush=True,
-                    )
-                    break
-        if bottle_idx in held_bottles:
-            hold = held_bottles[bottle_idx]
-            gripper = next((g for g in grippers if str(g["side"]) == hold["side"]), None)
-            if gripper is not None:
-                aperture = float(gripper["aperture"])
-                if aperture >= T3_GRIPPER_OPEN_APERTURE_M:
-                    print(
-                        f"[ARDY Newton Viewer] {gripper['side']} gripper released bottle {bottle_idx + 1}",
-                        flush=True,
-                    )
-                    del held_bottles[bottle_idx]
-                else:
-                    bottle_positions[bottle_idx] = np.asarray(gripper["center"], dtype=np.float64) + hold["offset"]
-                    _set_body_pose(wp, state, bottle_body_indices[bottle_idx], bottle_positions[bottle_idx])
+        bottle_positions[bottle_idx] = np.array(body_q[body_idx][0:3], dtype=np.float64, copy=True)
 
 
 def _reset_interactive_bottles(
     wp,
+    model,
     state,
     state_next,
+    joint_q_start,
     bottle_body_indices: list[int],
     spawn_positions,
     bottle_positions: list[np.ndarray],
@@ -2628,9 +3228,71 @@ def _reset_interactive_bottles(
             break
         position = np.asarray(spawn_positions[bottle_idx], dtype=np.float64)
         bottle_positions[bottle_idx] = position
-        _set_body_pose(wp, state, body_idx, position)
-        _set_body_pose(wp, state_next, body_idx, position)
+        _set_free_body_pose(wp, model, state, joint_q_start, body_idx, position)
+        _set_free_body_pose(wp, model, state_next, joint_q_start, body_idx, position)
     print(f"[ARDY Newton Viewer] reset {len(bottle_body_indices)} bottle position(s)", flush=True)
+
+
+def _copy_t3_joint_targets_from_q(model, control, q: np.ndarray) -> None:
+    if control is None or not hasattr(control, "joint_target_q"):
+        return
+    try:
+        targets = control.joint_target_q.numpy()
+        q_starts = model.joint_q_start.numpy()
+        target_starts = model.joint_target_q_start.numpy()
+    except Exception:
+        return
+    joint_count = len(q_starts)
+    for joint_idx in range(joint_count):
+        q_start = int(q_starts[joint_idx])
+        q_end = int(q_starts[joint_idx + 1]) if joint_idx + 1 < joint_count else len(q)
+        q_count = max(0, q_end - q_start)
+        target_start = int(target_starts[joint_idx])
+        if q_count <= 0 or target_start < 0:
+            continue
+        # Floating/free roots have 7 q coords but no matching 7-slot position
+        # target in the legacy MuJoCo target layout. The base is locked as a
+        # kinematic body and is updated from joint_q, so skip it here.
+        if q_count > 1:
+            continue
+        if target_start >= len(targets) or q_start >= len(q):
+            continue
+        targets[target_start] = float(q[q_start])
+    control.joint_target_q.assign(targets)
+
+
+def _row_uses_normalized_grippers(row: dict) -> bool:
+    mode = str(row.get("gripper_mode") or row.get("gripper_range") or "").strip().lower()
+    return mode in {
+        "normalized",
+        "normalized_0_closed_1_open",
+        "0_closed_1_open",
+        "0close_1open",
+    }
+
+
+def _row_uses_aperture_grippers(row: dict) -> bool:
+    mode = str(row.get("gripper_mode") or row.get("gripper_range") or "").strip().lower()
+    return mode in {
+        "aperture",
+        "aperture_m",
+        "aperture_m_0_closed_0p1_open",
+        "0_closed_0p1_open",
+        "0close_0p1open",
+    }
+
+
+def _normalized_gripper_value_to_joint(joint_name: str, value: float) -> float:
+    normalized = float(np.clip(value, 0.0, 1.0))
+    half_open = T3_GRIPPER_MAX_APERTURE_M * 0.5
+    sign = -1.0 if joint_name.endswith("joint2") else 1.0
+    return sign * normalized * half_open
+
+
+def _aperture_gripper_value_to_joint(joint_name: str, value: float) -> float:
+    aperture = float(np.clip(value, 0.0, T3_GRIPPER_MAX_APERTURE_M))
+    sign = -1.0 if joint_name.endswith("joint2") else 1.0
+    return sign * aperture * 0.5
 
 
 def _apply_t3_row(
@@ -2650,9 +3312,20 @@ def _apply_t3_row(
     pick_pushable,
     body_flag_filter=None,
     obstacle_bounds: list[tuple[np.ndarray, np.ndarray]] | None = None,
+    table_guard_enabled: bool = True,
     gripper_override: dict[str, float] | None = None,
+    gripper_aperture_min: dict[str, float] | None = None,
+    control=None,
+    target_only: bool = False,
 ):
-    q = default_q.copy()
+    # Start from the live model coordinates so dynamic/free bodies such as
+    # moved bottles keep their current poses. The T3 row then overwrites only
+    # robot root/joint coordinates. Starting from default_q reset bottles to
+    # their spawn positions whenever Play T3 Demo Pick applied frame 0.
+    try:
+        q = model.joint_q.numpy().copy()
+    except Exception:
+        q = default_q.copy()
     live_root_pos = np.zeros(3, dtype=np.float64)
     live_root_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
     live_root_yaw_rad = 0.0
@@ -2689,6 +3362,8 @@ def _apply_t3_row(
                 if start is not None:
                     q[start] = float(value)
         else:
+            normalized_grippers = _row_uses_normalized_grippers(row)
+            aperture_grippers = _row_uses_aperture_grippers(row)
             for row_key, joint_name in T3_ROW_TO_JOINT.items():
                 if joint_name in T3_STIFF_POSTURE_JOINTS:
                     continue
@@ -2698,6 +3373,10 @@ def _apply_t3_row(
                 value = float(row[row_key])
                 if joint_name == "telescopic_lift_joint":
                     value = _lift_csv_value_to_extension_m(value)
+                elif normalized_grippers and "gripper_joint" in joint_name:
+                    value = _normalized_gripper_value_to_joint(joint_name, value)
+                elif aperture_grippers and "gripper_joint" in joint_name:
+                    value = _aperture_gripper_value_to_joint(joint_name, value)
                 q[start] = value if joint_name in T3_LINEAR_JOINTS else math.radians(value)
             for row_key, joint_name in (
                 ("left_wheel_angle_rad", "left_wheel_joint"),
@@ -2721,22 +3400,56 @@ def _apply_t3_row(
                     T3_GRIPPER_MAX_APERTURE_M,
                 )
             )
+            _set_gripper_aperture_in_q(q, joint_q_start, side, aperture)
+
+    if gripper_aperture_min:
+        for side, aperture_min in gripper_aperture_min.items():
             joint1_start = joint_q_start.get(f"{side}_gripper_joint1")
             joint2_start = joint_q_start.get(f"{side}_gripper_joint2")
+            current_aperture = 0.0
             if joint1_start is not None:
-                q[joint1_start] = aperture * 0.5
+                current_aperture += abs(float(q[joint1_start]))
             if joint2_start is not None:
-                q[joint2_start] = -aperture * 0.5
+                current_aperture += abs(float(q[joint2_start]))
+            if current_aperture < T3_GRIPPER_OPEN_APERTURE_M and current_aperture < float(aperture_min):
+                _set_gripper_aperture_in_q(q, joint_q_start, side, float(aperture_min))
 
     live_root_tx = _make_tx(wp, live_root_pos, live_root_quat)
     root_tx = wp.mul(offset_tx, live_root_tx)
     q[0:7] = _tx_to_numpy(root_tx)
     q[2] = float(floor_z)
+    if control is not None:
+        _copy_t3_joint_targets_from_q(model, control, q)
+    if target_only:
+        current_q = model.joint_q.numpy().copy()
+        current_q[0:7] = q[0:7]
+        wp.copy(model.joint_q, wp.array(current_q, dtype=wp.float32), 0, 0, len(current_q))
+        if body_flag_filter is None:
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
+        else:
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=body_flag_filter)
+        return _make_tx(wp, q[0:3], q[3:7]), _robot_shape_bounds(newton, model, state, t3_shape_count)
     wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
     if body_flag_filter is None:
         newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
     else:
         newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=body_flag_filter)
+    if table_guard_enabled and obstacle_bounds:
+        guard_bounds = _robot_shape_bounds(
+            newton,
+            model,
+            state,
+            t3_shape_count,
+            body_suffixes=T3_TABLE_GUARD_BODY_SUFFIXES,
+        )
+        table_lift = _table_guard_lift_for_bounds(guard_bounds, obstacle_bounds)
+        if table_lift > 0.0:
+            q[2] = float(floor_z) + min(table_lift, 0.45)
+            wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
+            if body_flag_filter is None:
+                newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
+            else:
+                newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=body_flag_filter)
     bounds = _robot_shape_bounds(newton, model, state, t3_shape_count)
     support_bounds = _robot_shape_bounds(
         newton,
@@ -2751,7 +3464,6 @@ def _apply_t3_row(
     if np.any(correction):
         q[0] += correction[0]
         q[1] += correction[1]
-        q[2] = float(floor_z)
         wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
     if body_flag_filter is None:
         newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
@@ -2804,10 +3516,77 @@ def _hidden_collider_cfg(newton):
     )
 
 
+def _hidden_gripper_rubber_cfg(newton):
+    return newton.ModelBuilder.ShapeConfig(
+        density=0.0,
+        mu=T3_GRIPPER_RUBBER_FRICTION,
+        ke=1.0e5,
+        kd=1.0e3,
+        kf=1.0e3,
+        restitution=0.0,
+        mu_torsional=0.01,
+        mu_rolling=0.005,
+        is_visible=False,
+        has_shape_collision=True,
+    )
+
+
+def _visible_gripper_rubber_cfg(newton):
+    return newton.ModelBuilder.ShapeConfig(
+        density=0.0,
+        mu=T3_GRIPPER_RUBBER_FRICTION,
+        ke=1.0e5,
+        kd=1.0e3,
+        kf=1.0e3,
+        restitution=0.0,
+        mu_torsional=0.01,
+        mu_rolling=0.005,
+        is_visible=True,
+        has_shape_collision=True,
+    )
+
+
+def _is_gripper_contact_suffix(suffix: str) -> bool:
+    return "gripper" in str(suffix)
+
+
 def _disable_shape_collision(newton, builder, start: int, end: int) -> None:
     collide_bit = int(newton.ShapeFlags.COLLIDE_SHAPES)
     for shape_idx in range(start, end):
         builder.shape_flags[shape_idx] = int(builder.shape_flags[shape_idx]) & ~collide_bit
+
+
+def _disable_shape_collision_except_body_suffixes(
+    newton,
+    builder,
+    start: int,
+    end: int,
+    keep_suffixes: set[str],
+) -> None:
+    collide_bit = int(newton.ShapeFlags.COLLIDE_SHAPES)
+    for shape_idx in range(start, end):
+        body_idx = int(builder.shape_body[shape_idx])
+        body_suffix = str(builder.body_label[body_idx]).rsplit("/", 1)[-1] if body_idx >= 0 else ""
+        if body_suffix in keep_suffixes:
+            builder.shape_flags[shape_idx] = int(builder.shape_flags[shape_idx]) | collide_bit
+        else:
+            builder.shape_flags[shape_idx] = int(builder.shape_flags[shape_idx]) & ~collide_bit
+
+
+def _disable_shape_collision_except_shape_labels(
+    newton,
+    builder,
+    start: int,
+    end: int,
+    keep_labels: set[str],
+) -> None:
+    collide_bit = int(newton.ShapeFlags.COLLIDE_SHAPES)
+    for shape_idx in range(start, end):
+        shape_label = str(builder.shape_label[shape_idx]).rsplit("/", 1)[-1]
+        if shape_label in keep_labels:
+            builder.shape_flags[shape_idx] = int(builder.shape_flags[shape_idx]) | collide_bit
+        else:
+            builder.shape_flags[shape_idx] = int(builder.shape_flags[shape_idx]) & ~collide_bit
 
 
 def _add_hidden_actor_colliders(newton, wp, builder, floor_z: float) -> tuple[str, list[str]]:
@@ -2843,75 +3622,125 @@ def _add_hidden_actor_colliders(newton, wp, builder, floor_z: float) -> tuple[st
     return "hidden_robot_solid_free_joint", "hidden_soma_solid_free_joint"
 
 
-def _add_hidden_gripper_colliders(newton, wp, builder) -> dict[str, str]:
-    cfg = _hidden_collider_cfg(newton)
-    joint_names: dict[str, str] = {}
-    for side in T3_GRIPPER_SIDES:
-        body = builder.add_body(
-            xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
-            mass=2.0,
-            is_kinematic=True,
-            label=f"hidden_{side}_gripper_contact",
-        )
-        builder.add_shape_sphere(
-            body,
-            radius=INTERACTIVE_GRIPPER_PROXY_RADIUS,
+def _add_visible_t3_gripper_rubber_pads(newton, wp, builder, body_start: int, body_end: int) -> int:
+    cfg = _visible_gripper_rubber_cfg(newton)
+    count = 0
+    for body_idx in range(int(body_start), int(body_end)):
+        suffix = str(builder.body_label[body_idx]).rsplit("/", 1)[-1]
+        if suffix not in {"left_gripper_link1", "left_gripper_link2", "right_gripper_link1", "right_gripper_link2"}:
+            continue
+        builder.add_shape_box(
+            body_idx,
+            xform=wp.transform(wp.vec3(0.0, -0.032, 0.0), wp.quat_identity()),
+            hx=T3_GRIPPER_PAD_HALF_EXTENTS_M[0],
+            hy=T3_GRIPPER_PAD_HALF_EXTENTS_M[1],
+            hz=T3_GRIPPER_PAD_HALF_EXTENTS_M[2],
             cfg=cfg,
-            label=f"hidden_{side}_gripper_contact_sphere",
+            color=(0.10, 0.12, 0.14),
+            label=f"{suffix}_visible_rubber_pad",
         )
-        joint_names[side] = f"hidden_{side}_gripper_contact_free_joint"
-    return joint_names
+        count += 1
+    return count
 
 
 def _add_hidden_t3_bottle_colliders(newton, wp, builder) -> dict[str, str]:
-    cfg = _hidden_collider_cfg(newton)
+    """Add only the right fingertip contact pads needed for bottle picking.
+
+    Earlier versions mirrored the whole robot as hidden contact proxies. That
+    produced a storm of table/robot constraints in MuJoCo (`nefc overflow`) and
+    made the T3 pose unstable. The validated t3_pick_place demo relies on the
+    two slim right jaw pads, so keep this path equally small and predictable.
+    """
+    gripper_cfg = _hidden_gripper_rubber_cfg(newton)
     joint_names: dict[str, str] = {}
-    for suffix, shapes in T3_BOTTLE_COLLIDER_BOX_BY_SUFFIX.items():
+    for suffix in ("right_gripper_link1", "right_gripper_link2"):
         body = builder.add_body(
             xform=wp.transform(wp.vec3(0.0, 0.0, -100.0), wp.quat_identity()),
-            mass=8.0,
+            mass=0.2,
             is_kinematic=True,
             label=f"hidden_t3_bottle_collision_{suffix}",
         )
-        for shape_index, (offset, half_extents) in enumerate(shapes, start=1):
-            builder.add_shape_box(
-                body,
-                xform=wp.transform(
-                    wp.vec3(float(offset[0]), float(offset[1]), float(offset[2])),
-                    wp.quat_identity(),
-                ),
-                hx=float(half_extents[0]),
-                hy=float(half_extents[1]),
-                hz=float(half_extents[2]),
-                cfg=cfg,
-                label=f"hidden_t3_bottle_collision_{suffix}_box_{shape_index}",
-            )
-        companion_radius = T3_BOTTLE_COLLIDER_RADIUS_BY_SUFFIX.get(suffix)
-        if companion_radius is not None:
-            builder.add_shape_sphere(
-                body,
-                radius=float(companion_radius),
-                cfg=cfg,
-                label=f"hidden_t3_bottle_collision_{suffix}_sphere",
-            )
-        joint_names[suffix] = f"hidden_t3_bottle_collision_{suffix}_free_joint"
-    for suffix, radius in T3_BOTTLE_COLLIDER_RADIUS_BY_SUFFIX.items():
-        if suffix in T3_BOTTLE_COLLIDER_BOX_BY_SUFFIX:
-            continue
-        body = builder.add_body(
-            xform=wp.transform(wp.vec3(0.0, 0.0, -100.0), wp.quat_identity()),
-            mass=3.0,
-            is_kinematic=True,
-            label=f"hidden_t3_bottle_collision_{suffix}",
-        )
-        builder.add_shape_sphere(
+        builder.add_shape_box(
             body,
-            radius=float(radius),
-            cfg=cfg,
-            label=f"hidden_t3_bottle_collision_{suffix}_sphere",
+            xform=wp.transform(wp.vec3(0.0, -0.032, 0.0), wp.quat_identity()),
+            hx=T3_GRIPPER_PAD_HALF_EXTENTS_M[0],
+            hy=T3_GRIPPER_PAD_HALF_EXTENTS_M[1],
+            hz=T3_GRIPPER_PAD_HALF_EXTENTS_M[2],
+            cfg=gripper_cfg,
+            color=(0.10, 0.12, 0.14),
+            label=f"hidden_t3_bottle_collision_{suffix}_rubber_pad",
         )
         joint_names[suffix] = f"hidden_t3_bottle_collision_{suffix}_free_joint"
     return joint_names
+
+
+def _configure_mujoco_pick_contacts(builder, bottle_body_labels: list[str]) -> None:
+    condim = getattr(builder, "custom_attributes", {}).get("mujoco:condim")
+    if condim is None:
+        return
+    bottle_labels = set(bottle_body_labels)
+    values = dict(getattr(condim, "values", {}) or {})
+    for shape_idx, body_idx in enumerate(builder.shape_body):
+        if body_idx < 0:
+            continue
+        label = str(builder.body_label[body_idx]).rsplit("/", 1)[-1]
+        if "gripper" in label or label in bottle_labels:
+            values[shape_idx] = 6
+    condim.values = values
+
+
+def _configure_t3_pick_actuators(newton, builder, joint_start: int, joint_end: int) -> None:
+    for joint_idx in range(int(joint_start), int(joint_end)):
+        label = str(builder.joint_label[joint_idx]).rsplit("/", 1)[-1]
+        qd_start = int(builder.joint_qd_start[joint_idx])
+        dof_dim = builder.joint_dof_dim[joint_idx]
+        try:
+            dof_count = int(sum(dof_dim))
+        except TypeError:
+            dof_count = int(dof_dim)
+        qd_end = qd_start + dof_count
+        q_start = int(builder.joint_q_start[joint_idx])
+        for dof in range(qd_start, qd_end):
+            builder.joint_target_mode[dof] = int(newton.JointTargetMode.POSITION)
+            builder.joint_target_ke[dof] = 2000.0
+            builder.joint_target_kd[dof] = 80.0
+            builder.joint_effort_limit[dof] = 100.0
+            builder.joint_velocity_limit[dof] = 3.0
+        if label == "telescopic_lift_joint":
+            for dof in range(qd_start, qd_end):
+                builder.joint_target_ke[dof] = 100000.0
+                builder.joint_target_kd[dof] = 2000.0
+                builder.joint_effort_limit[dof] = 1000.0
+                builder.joint_velocity_limit[dof] = 0.25
+        if label.startswith(("left_gripper_joint", "right_gripper_joint")):
+            for dof in range(qd_start, qd_end):
+                builder.joint_target_ke[dof] = 1000.0
+                builder.joint_target_kd[dof] = 20.0
+                builder.joint_effort_limit[dof] = 10.0
+                builder.joint_velocity_limit[dof] = 0.25
+            if q_start < len(builder.joint_q):
+                builder.joint_q[q_start] = 0.05 if label.endswith("1") else -0.05
+
+
+def _ensure_positive_joint_effort_limits(builder, joint_start: int, joint_end: int, minimum: float = 1.0) -> None:
+    for joint_idx in range(int(joint_start), int(joint_end)):
+        qd_start = int(builder.joint_qd_start[joint_idx])
+        dof_dim = builder.joint_dof_dim[joint_idx]
+        try:
+            dof_count = int(sum(dof_dim))
+        except TypeError:
+            dof_count = int(dof_dim)
+        for dof in range(qd_start, qd_start + dof_count):
+            if dof < len(builder.joint_effort_limit) and float(builder.joint_effort_limit[dof]) <= 0.0:
+                builder.joint_effort_limit[dof] = float(minimum)
+
+
+def _reset_physics_solver_state(physics_solver, state) -> None:
+    if physics_solver is None:
+        return
+    reset = getattr(physics_solver, "reset", None)
+    if callable(reset):
+        reset(state)
 
 
 def _add_physics_test_shapes(newton, wp, builder, floor_z: float) -> tuple[int, int]:
@@ -3000,33 +3829,224 @@ def _set_kinematic_free_joint_pose(wp, newton, model, state, joint_q_start, join
     newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=int(newton.BodyFlags.KINEMATIC))
 
 
+def _quat_conjugate_np(quat: np.ndarray) -> np.ndarray:
+    q = np.asarray(quat, dtype=np.float64)
+    return np.array([-q[0], -q[1], -q[2], q[3]], dtype=np.float64)
+
+
+def _quat_multiply_np(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    ax, ay, az, aw = np.asarray(a, dtype=np.float64)
+    bx, by, bz, bw = np.asarray(b, dtype=np.float64)
+    return np.array(
+        [
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ],
+        dtype=np.float64,
+    )
+
+
+def _quat_angular_velocity_np(prev_quat: np.ndarray, quat: np.ndarray, dt: float) -> np.ndarray:
+    if dt <= 1.0e-6:
+        return np.zeros(3, dtype=np.float64)
+    q0 = np.asarray(prev_quat, dtype=np.float64)
+    q1 = np.asarray(quat, dtype=np.float64)
+    if float(np.dot(q0, q1)) < 0.0:
+        q1 = -q1
+    delta = _quat_multiply_np(q1, _quat_conjugate_np(q0))
+    norm = float(np.linalg.norm(delta))
+    if norm > 1.0e-8:
+        delta = delta / norm
+    angle = 2.0 * math.atan2(float(np.linalg.norm(delta[:3])), float(np.clip(delta[3], -1.0, 1.0)))
+    if angle > math.pi:
+        angle -= 2.0 * math.pi
+    axis_norm = float(np.linalg.norm(delta[:3]))
+    if axis_norm <= 1.0e-8:
+        return np.zeros(3, dtype=np.float64)
+    return delta[:3] / axis_norm * (angle / dt)
+
+
+def _pose_position_quat_np(pose: object) -> tuple[np.ndarray, np.ndarray]:
+    if isinstance(pose, tuple) and len(pose) == 2:
+        pos = np.asarray(pose[0], dtype=np.float64)
+        quat = np.asarray(pose[1], dtype=np.float64)
+    else:
+        pos = np.asarray(pose, dtype=np.float64)
+        quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    return pos, quat
+
+
 def _set_kinematic_free_joint_poses(wp, newton, model, state, joint_q_start, poses: dict[str, object]) -> None:
     if not poses:
         return
     q = model.joint_q.numpy().copy()
+    body_q = state.body_q.numpy().copy()
     changed = False
+    body_changed = False
     for joint_name, pose in poses.items():
+        pos, quat = _pose_position_quat_np(pose)
+        pose_q = np.array([pos[0], pos[1], pos[2], quat[0], quat[1], quat[2], quat[3]], dtype=np.float32)
         start = joint_q_start.get(joint_name)
-        if start is None:
-            continue
-        if isinstance(pose, tuple) and len(pose) == 2:
-            pos = np.asarray(pose[0], dtype=np.float64)
-            quat = np.asarray(pose[1], dtype=np.float64)
-        else:
-            pos = np.asarray(pose, dtype=np.float64)
-            quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
-        q[start : start + 7] = np.array([pos[0], pos[1], pos[2], quat[0], quat[1], quat[2], quat[3]], dtype=np.float32)
-        changed = True
+        if start is not None:
+            q[start : start + 7] = pose_q
+            changed = True
+        body_suffix = str(joint_name).removesuffix("_free_joint")
+        body_idx = _body_index_by_suffix(model, body_suffix)
+        if body_idx is not None:
+            # Hidden proxy joints are disabled in the assembled viewer model.
+            # Write body_q directly so contact shapes are definitely co-located
+            # with the rendered gripper/robot before collision detection.
+            body_q[body_idx] = pose_q
+            body_changed = True
     if changed:
         wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
         newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=int(newton.BodyFlags.KINEMATIC))
+    if body_changed:
+        wp.copy(state.body_q, wp.array(body_q, dtype=wp.transform), 0, 0, len(body_q))
+
+
+def _set_kinematic_body_velocities_for_poses(
+    wp,
+    model,
+    state,
+    poses: dict[str, object],
+    previous_poses: dict[str, tuple[np.ndarray, np.ndarray]],
+    dt: float,
+) -> None:
+    if not poses or dt <= 1.0e-6 or getattr(state, "body_qd", None) is None:
+        previous_poses.clear()
+        for joint_name, pose in poses.items():
+            previous_poses[joint_name] = _pose_position_quat_np(pose)
+        return
+    body_qd = state.body_qd.numpy().copy()
+    changed = False
+    for joint_name, pose in poses.items():
+        body_suffix = str(joint_name).removesuffix("_free_joint")
+        body_idx = _body_index_by_suffix(model, body_suffix)
+        pos, quat = _pose_position_quat_np(pose)
+        previous = previous_poses.get(joint_name)
+        previous_poses[joint_name] = (pos.copy(), quat.copy())
+        if body_idx is None or previous is None:
+            continue
+        prev_pos, prev_quat = previous
+        linear = (pos - prev_pos) / float(dt)
+        angular = _quat_angular_velocity_np(prev_quat, quat, float(dt))
+        linear = np.clip(linear, -4.0, 4.0)
+        angular = np.clip(angular, -12.0, 12.0)
+        body_qd[body_idx] = np.array(
+            [angular[0], angular[1], angular[2], linear[0], linear[1], linear[2]],
+            dtype=np.float32,
+        )
+        changed = True
+    if changed:
+        wp.copy(state.body_qd, wp.array(body_qd, dtype=wp.spatial_vector), 0, 0, len(body_qd))
+
+
+def _set_kinematic_body_velocities_for_suffixes(
+    wp,
+    model,
+    state,
+    suffixes: tuple[str, ...],
+    previous_poses: dict[str, tuple[np.ndarray, np.ndarray]],
+    dt: float,
+) -> None:
+    if not suffixes or dt <= 1.0e-6 or getattr(state, "body_qd", None) is None:
+        previous_poses.clear()
+        for suffix in suffixes:
+            pose = _body_pose_by_suffix(model, state, suffix)
+            if pose is not None:
+                previous_poses[suffix] = (pose[0].copy(), pose[1].copy())
+        return
+    body_qd = state.body_qd.numpy().copy()
+    changed = False
+    for suffix in suffixes:
+        body_idx = _body_index_by_suffix(model, suffix)
+        pose = _body_pose_by_suffix(model, state, suffix)
+        if body_idx is None or pose is None:
+            continue
+        pos, quat = pose
+        previous = previous_poses.get(suffix)
+        previous_poses[suffix] = (pos.copy(), quat.copy())
+        if previous is None:
+            continue
+        prev_pos, prev_quat = previous
+        linear = np.clip((pos - prev_pos) / float(dt), -4.0, 4.0)
+        angular = np.clip(_quat_angular_velocity_np(prev_quat, quat, float(dt)), -12.0, 12.0)
+        body_qd[body_idx] = np.array(
+            [angular[0], angular[1], angular[2], linear[0], linear[1], linear[2]],
+            dtype=np.float32,
+        )
+        changed = True
+    if changed:
+        wp.copy(state.body_qd, wp.array(body_qd, dtype=wp.spatial_vector), 0, 0, len(body_qd))
+
+
+def _contact_count_for_bottle_gripper(model, contacts, bottle_body_indices: list[int], bottle_index: int = 0) -> int:
+    if not bottle_body_indices or contacts is None:
+        return 0
+    try:
+        target_body = int(bottle_body_indices[min(max(0, int(bottle_index)), len(bottle_body_indices) - 1)])
+        shape_body = model.shape_body.numpy() if hasattr(model.shape_body, "numpy") else model.shape_body
+        shape_labels = [str(label) for label in getattr(model, "shape_label", [])]
+        contact_shape0 = contacts.shape0.numpy()
+        contact_shape1 = contacts.shape1.numpy()
+    except Exception:
+        return 0
+    count = 0
+    for shape0, shape1 in zip(contact_shape0, contact_shape1):
+        s0 = int(shape0)
+        s1 = int(shape1)
+        if s0 < 0 or s1 < 0 or s0 >= len(shape_body) or s1 >= len(shape_body):
+            continue
+        b0 = int(shape_body[s0])
+        b1 = int(shape_body[s1])
+        if b0 != target_body and b1 != target_body:
+            continue
+        other_shape = s1 if b0 == target_body else s0
+        other_label = shape_labels[other_shape] if other_shape < len(shape_labels) else ""
+        if "hidden_t3_bottle_collision_right_gripper" in other_label or "rubber_pad" in other_label:
+            count += 1
+    return count
+
+
+def _mujoco_contact_count_for_bottle_gripper(solver, bottle_index: int = 0) -> int:
+    try:
+        mj_model = solver.mj_model
+        mj_data = solver.mj_data
+        body_names = [mj_model.body(i).name for i in range(mj_model.nbody)]
+        target_body_name = f"interactive_water_bottle_{min(max(0, int(bottle_index)), 999) + 1}"
+    except Exception:
+        return 0
+    count = 0
+    for contact_idx in range(int(getattr(mj_data, "ncon", 0))):
+        try:
+            geom0, geom1 = mj_data.contact[contact_idx].geom
+            body0 = int(mj_model.geom_bodyid[int(geom0)])
+            body1 = int(mj_model.geom_bodyid[int(geom1)])
+            name0 = body_names[body0]
+            name1 = body_names[body1]
+        except Exception:
+            continue
+        bottle0 = name0 == target_body_name
+        bottle1 = name1 == target_body_name
+        if not (bottle0 or bottle1):
+            continue
+        other = name1 if bottle0 else name0
+        if "right_gripper_link" in other or "hidden_t3_bottle_collision_right_gripper" in other:
+            count += 1
+    return count
 
 
 def _step_physics_test(newton, wp, viewer, solver, collision_pipeline, contacts, state, state_next, control, dt: float):
     state.clear_forces()
     viewer.apply_forces(state)
-    collision_pipeline.collide(state, contacts)
-    solver.step(state, state_next, control, contacts, dt)
+    if solver.__class__.__name__ == "SolverMuJoCo":
+        solver.step(state, state_next, control, None, dt)
+    else:
+        collision_pipeline.collide(state, contacts)
+        solver.step(state, state_next, control, contacts, dt)
     return state_next, state
 
 
@@ -3041,6 +4061,21 @@ def _set_pick_object_pose(wp, newton, model, state, joint_q_start, pick_joint_na
     q[start : start + 7] = np.array([pos[0], pos[1], pos[2], 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
     wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
     newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
+
+
+def _warm_rtx_frame(viewer, ovstream_bridges, state, time_s: float) -> None:
+    if not hasattr(viewer, "_render_product_path"):
+        return
+    try:
+        for warm_idx in range(2):
+            viewer.begin_frame(time_s)
+            viewer.log_state(state)
+            viewer.end_frame()
+            for ovstream_bridge in ovstream_bridges:
+                ovstream_bridge.stream_latest()
+            print(f"[ARDY Newton Viewer] RTX warm frame {warm_idx + 1}/2 complete", flush=True)
+    except Exception as exc:
+        print(f"[ARDY Newton Viewer] RTX warm frame failed: {exc}", flush=True)
 
 
 def _set_non_ground_instance_visibility(viewer, newton, visible: bool) -> None:
@@ -3456,14 +4491,21 @@ def main() -> None:
     show_human_mesh = True
     show_t3_robot = True
     show_gizmos = args.viewer != "rtx"
-    latest_frame = None
-    latest_status = "waiting for live SOMA frame"
+    latest_frame = {
+        "show_soma_mesh": False,
+        "show_t3_robot": True,
+        "fps": 60.0,
+        "frame_idx": 0,
+        "status": "T3 ready",
+    }
+    latest_status = "T3 ready"
     floor_z = _resolve_floor_z(args)
     pick_table_physics_enabled = _use_pick_table_physics(args)
     background_obstacle_bounds = _background_table_blockers(
         args.background_usd,
         force_pick_table=pick_table_physics_enabled,
     )
+    table_top_z_value = _table_top_z(background_obstacle_bounds)
     if background_obstacle_bounds:
         print("[ARDY Newton Viewer] background table blocker active for robot base/wheels", flush=True)
     show_contacts = False
@@ -3476,6 +4518,9 @@ def main() -> None:
     manual_gripper_enabled = False
     manual_gripper_left_aperture = T3_GRIPPER_DEFAULT_APERTURE_M
     manual_gripper_right_aperture = T3_GRIPPER_DEFAULT_APERTURE_M
+    auto_gripper_enabled = pick_table_physics_enabled
+    selected_bottle_index = 2  # Right bottle is the default target for the right arm.
+    hand_guard_corrections = 0
     soma_offset_tx = wp.transform_identity()
     t3_offset_tx = wp.transform_identity()
     t3_live_root_tx = wp.transform_identity()
@@ -3490,6 +4535,9 @@ def main() -> None:
     file_playback_next_time = time.monotonic()
     file_playback_active = False
     file_playback_status = "file playback idle"
+    demo_pick_job_token = 0
+    demo_pick_requested = False
+    physics_solver = None
     websocket_enabled = bool(args.websocket_server)
     soma_mesh_status = "SOMA mesh not registered"
     soma_skin_status = "SOMA local skin not initialized"
@@ -3497,7 +4545,7 @@ def main() -> None:
     soma_triangle_count = 0
     soma_mesh_logged = False
     soma_skeleton_logged = False
-    current_frame_idx = -1
+    current_frame_idx = 0
     queued_frames = 0
     current_source_fps = 0.0
     current_render_fps = 0.0
@@ -3530,6 +4578,144 @@ def main() -> None:
             )
             soma_mesh_status = f"SOMA live mesh prim ready: {soma_triangle_count} tris"
 
+    def start_t3_demo_pick_playback(requested_bottle_index=None, *, source: str = "ui") -> bool:
+        nonlocal file_playback_frames, file_playback_index, file_playback_next_time
+        nonlocal file_playback_active, file_playback_status, show_human_mesh, show_t3_robot
+        nonlocal manual_gripper_enabled, selected_bottle_index, demo_pick_job_token
+        nonlocal latest_frame, current_frame_idx, current_source_fps
+        if not bottle_body_indices:
+            file_playback_status = "T3 demo pick failed: no interactive bottles"
+            print(f"[ARDY Newton Viewer] {file_playback_status}", flush=True)
+            return False
+        try:
+            if requested_bottle_index is not None:
+                selected_bottle_index = int(requested_bottle_index)
+            selected_bottle_index = min(max(0, int(selected_bottle_index)), len(bottle_body_indices) - 1)
+            # Read the live pose; starting a motion must never reset a bottle.
+            target_bottle_pos = state.body_q.numpy()[bottle_body_indices[selected_bottle_index], :3].copy()
+            target_in_robot_space = np.asarray(
+                wp.transform_point(wp.transform_inverse(t3_offset_tx), wp.vec3(target_bottle_pos)),
+                dtype=np.float64,
+            )
+            # Stage the selected live bottle into the same local arm workspace used by
+            # /home/jony/Downloads/t3_pick_place/example.py.  The previous value put
+            # bottle 3 too far to the robot's right side, so IK rejected the motion
+            # before playback could start.
+            desired_local_target = np.array(
+                [0.50, -0.28, max(0.45, float(target_in_robot_space[2]) - float(floor_z))],
+                dtype=np.float64,
+            )
+            target_heading = math.atan2(float(target_in_robot_space[1]), float(target_in_robot_space[0]))
+            local_pick_heading = math.atan2(float(desired_local_target[1]), float(desired_local_target[0]))
+            job_yaw = target_heading - local_pick_heading
+            cos_yaw = math.cos(job_yaw)
+            sin_yaw = math.sin(job_yaw)
+            staged_local_xy = np.array(
+                [
+                    cos_yaw * desired_local_target[0] - sin_yaw * desired_local_target[1],
+                    sin_yaw * desired_local_target[0] + cos_yaw * desired_local_target[1],
+                ],
+                dtype=np.float64,
+            )
+            job_root = (
+                float(target_in_robot_space[0] - staged_local_xy[0]),
+                float(target_in_robot_space[1] - staged_local_xy[1]),
+                float(job_yaw),
+            )
+            job_joints = {}
+            demo_pick_job_token += 1
+            job_token = demo_pick_job_token
+            job_bottle_index = selected_bottle_index
+            job_target = desired_local_target.copy()
+            place_sign = -1.0 if float(desired_local_target[1]) > 0.0 else 1.0
+            job_place = desired_local_target + np.array([0.0, 0.34 * place_sign, 0.0], dtype=np.float64)
+            # The reference t3_pick_place demo uses smooth 60 Hz command
+            # updates. Coarse 10 Hz kinematic grasp commands create large
+            # MuJoCo contact impulses, so MuJoCo pick playback is generated at
+            # least at 60 Hz even if the debug CLI flag is lower.
+            job_fps = max(60.0 if physics_backend_status.startswith("mujoco") else 5.0, float(args.debug_pick_fps))
+            file_playback_active = False
+            file_playback_index = 0
+            show_human_mesh = False
+            show_t3_robot = True
+            manual_gripper_enabled = False
+            file_playback_status = (
+                f"generating T3 demo pick from {source}: bottle {job_bottle_index + 1} at {job_fps:.1f} FPS"
+            )
+            print(f"[ARDY Newton Viewer] {file_playback_status}", flush=True)
+            frames, demo_fps = _make_t3_demo_pick_frames(
+                newton,
+                wp,
+                job_target,
+                fps=job_fps,
+                initial_joints=job_joints,
+                root_pose=job_root,
+                place_position=job_place,
+            )
+            for frame in frames:
+                frame["demo_bottle_index"] = job_bottle_index
+                row = frame.get("t3_row") if isinstance(frame.get("t3_row"), dict) else None
+                if row is not None:
+                    row["demo_bottle_index"] = job_bottle_index
+            file_playback_frames = frames
+            latest_frame = frames[0] if frames else None
+            current_frame_idx = int(latest_frame.get("frame_idx", 0)) if latest_frame is not None else -1
+            current_source_fps = float(demo_fps)
+            first_row = latest_frame.get("t3_row") if isinstance(latest_frame, dict) else None
+            if isinstance(first_row, dict):
+                _apply_t3_row(
+                    wp,
+                    newton,
+                    model,
+                    state,
+                    default_q,
+                    joint_q_start,
+                    first_row,
+                    t3_offset_tx,
+                    floor_z,
+                    t3_shape_count,
+                    pick_object_position,
+                    pick_object_size,
+                    pick_object_visible,
+                    pick_object_pushable,
+                    None,
+                    background_obstacle_bounds,
+                    False,
+                )
+                _apply_t3_row(
+                    wp,
+                    newton,
+                    model,
+                    state_next,
+                    default_q,
+                    joint_q_start,
+                    first_row,
+                    t3_offset_tx,
+                    floor_z,
+                    t3_shape_count,
+                    pick_object_position,
+                    pick_object_size,
+                    pick_object_visible,
+                    pick_object_pushable,
+                    None,
+                    background_obstacle_bounds,
+                    False,
+                )
+            file_playback_index = 1 if len(frames) > 1 else 0
+            file_playback_next_time = time.monotonic()
+            file_playback_active = len(frames) > 1
+            file_playback_status = (
+                f"playing T3 demo pick: bottle {job_bottle_index + 1}, "
+                f"{len(file_playback_frames)} frames at {demo_fps:.1f} FPS"
+            )
+            print(f"[ARDY Newton Viewer] {file_playback_status}", flush=True)
+            return True
+        except Exception as exc:
+            file_playback_active = False
+            file_playback_status = f"T3 demo pick failed: {exc}"
+            print(f"[ARDY Newton Viewer] {file_playback_status}", flush=True)
+            return False
+
     def gui(ui):
         nonlocal show_human_mesh, show_t3_robot, show_gizmos, soma_offset_tx, t3_offset_tx
         nonlocal floor_z
@@ -3538,6 +4724,10 @@ def main() -> None:
         nonlocal file_playback_next_time, file_playback_active, file_playback_status
         nonlocal websocket_enabled
         nonlocal manual_gripper_enabled, manual_gripper_left_aperture, manual_gripper_right_aperture
+        nonlocal auto_gripper_enabled
+        nonlocal selected_bottle_index
+        nonlocal hand_guard_corrections
+        nonlocal demo_pick_requested
         ui.set_next_window_pos(ui.ImVec2(16, 16))
         ui.set_next_window_size(ui.ImVec2(340, 560))
         ui.set_next_window_bg_alpha(0.82)
@@ -3756,23 +4946,133 @@ def main() -> None:
         ui.separator()
         if ui.collapsing_header("Placement", flags=ui.TreeNodeFlags_.default_open):
             ui.text(f"Floor Z: {floor_z:.3f}")
+            if background_obstacle_bounds:
+                ui.text(f"Hand/table guards: {hand_guard_corrections}")
         ui.separator()
         if bottle_body_indices and ui.collapsing_header("Bottle Physics", flags=ui.TreeNodeFlags_.default_open):
             ui.text(f"Bottles: {len(bottle_body_indices)}")
+            _, show_contacts = ui.checkbox("Show Contacts", show_contacts)
+            selected_bottle_index = min(max(0, int(selected_bottle_index)), len(bottle_body_indices) - 1)
+            ui.text(f"Selected: Bottle {selected_bottle_index + 1}")
+            if ui.button("Prev Bottle"):
+                selected_bottle_index = (selected_bottle_index - 1) % len(bottle_body_indices)
+            ui.same_line()
+            if ui.button("Next Bottle"):
+                selected_bottle_index = (selected_bottle_index + 1) % len(bottle_body_indices)
+            current_bottle_pos = bottle_positions[selected_bottle_index].copy()
+            edited_bottle_pos = current_bottle_pos.copy()
+            ui.set_next_item_width(96)
+            _, edited_bottle_pos[0] = ui.slider_float("Bottle X", float(edited_bottle_pos[0]), -1.25, 1.25, "%.3f")
+            ui.set_next_item_width(96)
+            _, edited_bottle_pos[1] = ui.slider_float("Bottle Y", float(edited_bottle_pos[1]), -1.45, 0.15, "%.3f")
+            ui.set_next_item_width(96)
+            z_min = float(table_top_z_value) + INTERACTIVE_BOTTLE_HALF_HEIGHT if table_top_z_value is not None else -0.25
+            _, edited_bottle_pos[2] = ui.slider_float("Bottle Z", float(edited_bottle_pos[2]), z_min, 1.45, "%.3f")
+            if not np.allclose(edited_bottle_pos, current_bottle_pos, atol=1.0e-5):
+                _move_interactive_bottle(
+                    wp,
+                    model,
+                    state,
+                    state_next,
+                    joint_q_start,
+                    bottle_body_indices,
+                    bottle_positions,
+                    held_bottles,
+                    selected_bottle_index,
+                    edited_bottle_pos,
+                    table_top_z_value,
+                )
+                _reset_physics_solver_state(physics_solver, state)
+            if ui.button("-X"):
+                edited_bottle_pos[0] -= 0.01
+                _move_interactive_bottle(
+                    wp,
+                    model,
+                    state,
+                    state_next,
+                    joint_q_start,
+                    bottle_body_indices,
+                    bottle_positions,
+                    held_bottles,
+                    selected_bottle_index,
+                    edited_bottle_pos,
+                    table_top_z_value,
+                )
+                _reset_physics_solver_state(physics_solver, state)
+            ui.same_line()
+            if ui.button("+X"):
+                edited_bottle_pos[0] += 0.01
+                _move_interactive_bottle(
+                    wp,
+                    model,
+                    state,
+                    state_next,
+                    joint_q_start,
+                    bottle_body_indices,
+                    bottle_positions,
+                    held_bottles,
+                    selected_bottle_index,
+                    edited_bottle_pos,
+                    table_top_z_value,
+                )
+                _reset_physics_solver_state(physics_solver, state)
+            ui.same_line()
+            if ui.button("-Y"):
+                edited_bottle_pos[1] -= 0.01
+                _move_interactive_bottle(
+                    wp,
+                    model,
+                    state,
+                    state_next,
+                    joint_q_start,
+                    bottle_body_indices,
+                    bottle_positions,
+                    held_bottles,
+                    selected_bottle_index,
+                    edited_bottle_pos,
+                    table_top_z_value,
+                )
+                _reset_physics_solver_state(physics_solver, state)
+            ui.same_line()
+            if ui.button("+Y"):
+                edited_bottle_pos[1] += 0.01
+                _move_interactive_bottle(
+                    wp,
+                    model,
+                    state,
+                    state_next,
+                    joint_q_start,
+                    bottle_body_indices,
+                    bottle_positions,
+                    held_bottles,
+                    selected_bottle_index,
+                    edited_bottle_pos,
+                    table_top_z_value,
+                )
+                _reset_physics_solver_state(physics_solver, state)
+            ui.text("Bottles move through gravity and contact only.")
             if ui.button("Reset Bottles"):
                 _reset_interactive_bottles(
                     wp,
+                    model,
                     state,
                     state_next,
+                    joint_q_start,
                     bottle_body_indices,
                     bottle_spawn_positions,
                     bottle_positions,
                     held_bottles,
                     gripper_grasp_state,
                 )
+                _reset_physics_solver_state(physics_solver, state)
+            if ui.button("Play T3 Demo Pick"):
+                demo_pick_requested = True
+                file_playback_status = "T3 demo pick requested"
+                print("[ARDY Newton Viewer] T3 demo pick requested from ui", flush=True)
         ui.separator()
         if ui.collapsing_header("Manual Grippers", flags=ui.TreeNodeFlags_.default_open):
             _, manual_gripper_enabled = ui.checkbox("Override Grippers", manual_gripper_enabled)
+            _, auto_gripper_enabled = ui.checkbox("Auto Pick Grippers", auto_gripper_enabled)
             ui.set_next_item_width(140)
             _, manual_gripper_left_aperture = ui.slider_float(
                 "Left Open m",
@@ -3824,15 +5124,25 @@ def main() -> None:
         viewer.register_ui_callback(gui, position="free")
 
     builder = newton.ModelBuilder()
+    if str(args.pick_table_physics_backend).startswith("mujoco"):
+        try:
+            newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
+        except Exception as exc:
+            print(f"[ARDY Newton Viewer] MuJoCo contact attributes unavailable: {exc}", flush=True)
     builder.add_ground_plane(height=float(floor_z))
-    t3_urdf = LOCAL_T3_URDF if LOCAL_T3_URDF.exists() else DEFAULT_T3_URDF
+    t3_urdf = LOCAL_T3_URDF
+    if not t3_urdf.exists():
+        raise FileNotFoundError(f"Local T3 URDF not found: {t3_urdf}")
     t3_body_start = builder.body_count
     t3_shape_start = builder.shape_count
     t3_joint_start = len(builder.joint_enabled)
     builder.add_urdf(str(t3_urdf), floating=True, scale=1.0)
     t3_body_end = builder.body_count
+    visible_gripper_pad_count = _add_visible_t3_gripper_rubber_pads(newton, wp, builder, t3_body_start, t3_body_end)
     t3_shape_end = builder.shape_count
     t3_joint_end = len(builder.joint_enabled)
+    if str(args.pick_table_physics_backend).startswith("mujoco"):
+        _ensure_positive_joint_effort_limits(builder, t3_joint_start, t3_joint_end, minimum=1.0)
     t3_shape_count = builder.shape_count
     pick_joint_name, pick_object_size = _add_pick_object(newton, wp, builder, args)
     bottle_spawn_positions = _interactive_bottle_spawn_positions(background_obstacle_bounds)
@@ -3854,22 +5164,39 @@ def main() -> None:
     physics_test_shape_count = 0
     hidden_robot_joint_name = None
     hidden_soma_joint_name = None
-    hidden_gripper_joint_names: dict[str, str] = {}
     hidden_t3_bottle_joint_names: dict[str, str] = {}
+    t3_contact_shape_labels = {
+        "right_gripper_link1_visible_rubber_pad",
+        "right_gripper_link2_visible_rubber_pad",
+    }
     if physics_scene_active:
         for body_idx in range(t3_body_start, t3_body_end):
             builder.body_flags[body_idx] = int(newton.BodyFlags.KINEMATIC)
         for joint_idx in range(t3_joint_start, t3_joint_end):
             builder.joint_enabled[joint_idx] = False
-        _disable_shape_collision(newton, builder, t3_shape_start, t3_shape_end)
-        hidden_gripper_joint_start = len(builder.joint_enabled)
-        hidden_gripper_joint_names = _add_hidden_gripper_colliders(newton, wp, builder)
-        for joint_idx in range(hidden_gripper_joint_start, len(builder.joint_enabled)):
-            builder.joint_enabled[joint_idx] = False
-        hidden_t3_body_joint_start = len(builder.joint_enabled)
-        hidden_t3_bottle_joint_names = _add_hidden_t3_bottle_colliders(newton, wp, builder)
-        for joint_idx in range(hidden_t3_body_joint_start, len(builder.joint_enabled)):
-            builder.joint_enabled[joint_idx] = False
+        if args.real_gripper_collision:
+            _disable_shape_collision_except_body_suffixes(
+                newton,
+                builder,
+                t3_shape_start,
+                t3_shape_end,
+                T3_PICK_CONTACT_BODY_SUFFIXES,
+            )
+        else:
+            # Keep the two visible right-hand rubber pads as the physical
+            # contact geometry. This makes what the user sees match what
+            # MuJoCo solves, and avoids the old invisible-proxy mismatch where
+            # the rendered rubber could pass through the bottle with zero
+            # reported grip contacts.
+            _disable_shape_collision_except_shape_labels(
+                newton,
+                builder,
+                t3_shape_start,
+                t3_shape_end,
+                t3_contact_shape_labels,
+            )
+    if str(args.pick_table_physics_backend).startswith("mujoco"):
+        _configure_mujoco_pick_contacts(builder, bottle_body_labels)
     if args.physics_test_shapes:
         hidden_joint_start = len(builder.joint_enabled)
         hidden_robot_joint_name, hidden_soma_joint_name = _add_hidden_actor_colliders(newton, wp, builder, floor_z)
@@ -3880,6 +5207,8 @@ def main() -> None:
     state = model.state()
     state_next = model.state()
     control = model.control()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state_next, None)
     bottle_body_indices = [
         body_idx
         for label in bottle_body_labels
@@ -3888,8 +5217,8 @@ def main() -> None:
     bottle_positions = [np.asarray(pos, dtype=np.float64) for pos in bottle_spawn_positions[: len(bottle_body_indices)]]
     held_bottles: dict[int, dict] = {}
     gripper_grasp_state: dict[str, dict] = {}
-    hidden_gripper_positions: dict[str, np.ndarray] = {}
-    hidden_t3_bottle_positions: dict[str, np.ndarray] = {}
+    hidden_t3_previous_poses: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    visible_t3_gripper_previous_poses: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     default_q = model.joint_q.numpy().copy()
     joint_q_start = {
         label.rsplit("/", 1)[-1]: int(start)
@@ -3902,9 +5231,43 @@ def main() -> None:
     _set_camera_by_name(viewer, wp, args.camera_preset)
     collision_pipeline = newton.CollisionPipeline(model)
     contacts = collision_pipeline.contacts()
-    physics_solver = newton.solvers.SolverXPBD(model, iterations=5) if physics_scene_active else None
-    physics_substeps = 8
+    physics_solver = None
+    physics_backend_status = "disabled"
+    if physics_scene_active:
+        backend = str(args.pick_table_physics_backend)
+        if backend.startswith("mujoco"):
+            try:
+                physics_solver = newton.solvers.SolverMuJoCo(
+                    model,
+                    njmax=2048,
+                    nconmax=512,
+                    use_mujoco_cpu=backend == "mujoco-cpu",
+                    use_mujoco_contacts=True,
+                    solver="newton",
+                    integrator="implicitfast",
+                    cone="elliptic",
+                    iterations=100,
+                    ls_iterations=50,
+                    impratio=100,
+                    enable_multiccd=True,
+                )
+                physics_solver.reset(state)
+                physics_backend_status = backend
+            except Exception as exc:
+                detail = traceback.format_exc(limit=6)
+                raise RuntimeError(
+                    "MuJoCo pick physics was requested but could not start. "
+                    "The viewer will not fall back to XPBD because XPBD is too slow and less realistic for this pick scene.\n"
+                    f"{detail}"
+                ) from exc
+        else:
+            physics_solver = newton.solvers.SolverXPBD(model, iterations=12)
+            physics_backend_status = "xpbd"
+    physics_substeps = max(1, int(args.physics_substeps))
+    if physics_backend_status.startswith("mujoco") and bottle_body_labels:
+        physics_substeps = max(16, physics_substeps)
     t3_fk_body_filter = int(newton.BodyFlags.KINEMATIC) if physics_scene_active else None
+    mujoco_actuated_t3 = False
     if args.physics_test_shapes:
         print(
             "[ARDY Newton Viewer] physics test shapes: "
@@ -3918,7 +5281,9 @@ def main() -> None:
             "[ARDY Newton Viewer] interactive bottle physics: "
             f"{len(bottle_body_indices)} dynamic bottles at {INTERACTIVE_BOTTLE_MASS_KG:.2f} kg each, "
             f"{table_collider_count} hidden table collider(s), "
-            f"{pick_table_visual_count} pick-table visual shape(s), hidden robot/gripper colliders on",
+            f"{pick_table_visual_count} pick-table visual shape(s), {visible_gripper_pad_count} visible rubber pad(s), "
+            "visible right rubber pads are MuJoCo contact geometry, "
+            f"backend={physics_backend_status}, substeps={physics_substeps}",
             flush=True,
         )
 
@@ -3932,12 +5297,27 @@ def main() -> None:
     next_frame_time = time.monotonic()
     last_perf_report = next_frame_time
     rendered_frames = 0
+    perf_physics_s = 0.0
+    perf_render_s = 0.0
+    perf_stream_s = 0.0
+    perf_last_substeps = physics_substeps
+    perf_bottle_gripper_contacts = 0
+    if args.viewer == "rtx":
+        _warm_rtx_frame(viewer, ovstream_bridges, state, time_s)
+        first_end_frame = False
+        next_frame_time = time.monotonic()
+        last_perf_report = next_frame_time
     print("[ARDY Newton Viewer] ready for live frames", flush=True)
     while viewer.is_running() and not requested_close:
         loop_start = time.monotonic()
         queued_frames = frame_queue.qsize()
         soma_live_gizmo_tx = wp.transform_identity()
         t3_live_root_tx = wp.transform_identity()
+        if demo_pick_requested:
+            demo_pick_requested = False
+            print("[ARDY Newton Viewer] starting in-scene T3 pick from main loop", flush=True)
+            start_t3_demo_pick_playback(source="ui")
+            next_frame_time = time.monotonic()
         incoming_frame = None
         if file_playback_active and file_playback_frames:
             now_for_file = time.monotonic()
@@ -3954,13 +5334,18 @@ def main() -> None:
                         f"file frame {file_playback_index}/{len(file_playback_frames) - 1}"
                     )
             else:
-                _get_next_frame(frame_queue, args.playback_mode)
+                pass
         else:
             incoming_frame = _get_next_frame(frame_queue, args.playback_mode)
         if incoming_frame is not None:
             latest_frame = incoming_frame
-            if latest_frame.get("command") == "close":
+            command = str(latest_frame.get("command") or latest_frame.get("type") or "").strip().lower()
+            if command == "close":
                 requested_close = True
+                continue
+            if command in {"play_t3_demo_pick", "play_t3_pick_demo", "debug_t3_pick"}:
+                print("[ARDY Newton Viewer] starting in-scene T3 pick from websocket", flush=True)
+                start_t3_demo_pick_playback(source="websocket")
                 continue
             current_frame_idx = int(latest_frame.get("frame_idx", -1))
             if "show_soma_mesh" in latest_frame:
@@ -3981,9 +5366,44 @@ def main() -> None:
             else:
                 latest_status = f"live Newton frame {int(latest_frame.get('frame_idx', 0))}"
 
+        t3_row_payload = None
+        debug_demo_pick = False
+        kinematic_t3_demo_pick = False
+        actuated_t3_demo = False
+        table_pick_gripper_override = None
+
         if latest_frame is not None:
             t3_bounds = None
             soma_live_gizmo_tx = _soma_live_floor_transform_for_newton(wp, latest_frame)
+            table_pick = latest_frame.get("table_pick")
+            t3_row_payload = latest_frame.get("t3_row") if isinstance(latest_frame.get("t3_row"), dict) else None
+            debug_demo_pick = bool(
+                latest_frame.get("debug_demo_pick")
+                or (isinstance(t3_row_payload, dict) and t3_row_payload.get("debug_demo_pick"))
+            )
+            kinematic_t3_demo_pick = bool(
+                latest_frame.get("kinematic_t3_demo_pick")
+                or (isinstance(t3_row_payload, dict) and t3_row_payload.get("kinematic_t3_demo_pick"))
+            )
+            actuated_t3_demo = bool(
+                debug_demo_pick
+                and not kinematic_t3_demo_pick
+                and mujoco_actuated_t3
+                and t3_row_payload is not None
+            )
+            row_frame_idx = (
+                int(t3_row_payload.get("frame_idx", current_frame_idx))
+                if isinstance(t3_row_payload, dict)
+                else int(current_frame_idx)
+            )
+            demo_gripper_aperture_min = (
+                None
+                if actuated_t3_demo
+                else {"right": T3_GRIPPER_BOTTLE_GRASP_APERTURE_M}
+                if debug_demo_pick
+                else None
+            )
+            table_pick_gripper_override = _table_pick_gripper_apertures(table_pick, current_frame_idx)
             if latest_frame.get("soma_mesh_faces") is not None:
                 soma_faces = np.asarray(latest_frame["soma_mesh_faces"], dtype=np.int32).reshape(-1)
                 soma_indices_wp = wp.array(soma_faces, dtype=wp.int32)
@@ -4000,7 +5420,7 @@ def main() -> None:
                 state,
                 default_q,
                 joint_q_start,
-                latest_frame.get("t3_row"),
+                t3_row_payload,
                 t3_offset_tx,
                 floor_z,
                 t3_shape_count,
@@ -4008,14 +5428,72 @@ def main() -> None:
                 pick_object_size,
                 pick_object_visible,
                 pick_object_pushable,
-                t3_fk_body_filter,
+                t3_fk_body_filter if actuated_t3_demo else None,
                 background_obstacle_bounds,
+                False,
                 {
                     "left": manual_gripper_left_aperture,
                     "right": manual_gripper_right_aperture,
                 }
                 if manual_gripper_enabled
+                else table_pick_gripper_override
+                if table_pick_gripper_override
                 else None,
+                demo_gripper_aperture_min,
+                control if actuated_t3_demo else None,
+                actuated_t3_demo and row_frame_idx > 0,
+            )
+            if (
+                auto_gripper_enabled
+                and not manual_gripper_enabled
+                and not table_pick_gripper_override
+                and not debug_demo_pick
+            ):
+                _apply_gripper_apertures(
+                    wp,
+                    newton,
+                    model,
+                    state,
+                    joint_q_start,
+                    _auto_pick_gripper_apertures(
+                        model,
+                        state,
+                        joint_q_start,
+                        bottle_positions,
+                        held_bottles,
+                    ),
+                    t3_fk_body_filter,
+                )
+            _update_interactive_bottles(
+                wp,
+                model,
+                state,
+                state_next,
+                joint_q_start,
+                bottle_body_indices,
+                bottle_positions,
+                held_bottles,
+                gripper_grasp_state,
+                table_top_z_value,
+            )
+            if not table_pick_gripper_override and not debug_demo_pick:
+                _enforce_gripper_bottle_aperture(
+                    wp,
+                    newton,
+                    model,
+                    state,
+                    joint_q_start,
+                    bottle_positions,
+                    held_bottles,
+                    t3_fk_body_filter,
+                )
+            hand_guard_corrections = _guard_t3_hand_bodies_from_obstacles(
+                wp,
+                newton,
+                model,
+                state,
+                t3_shape_count,
+                background_obstacle_bounds,
             )
             if hidden_robot_joint_name:
                 t3_root_pos = _tx_position(t3_live_root_tx)
@@ -4026,7 +5504,7 @@ def main() -> None:
                     state,
                     joint_q_start,
                     hidden_robot_joint_name,
-                    (float(t3_root_pos[0]), float(t3_root_pos[1]), float(floor_z) + 0.85),
+                    (float(t3_root_pos[0]), float(t3_root_pos[1]), float(t3_root_pos[2]) + 0.85),
                 )
             if hidden_soma_joint_name:
                 soma_points_for_collision = _soma_joint_points_for_newton(latest_frame, soma_offset_tx)
@@ -4054,38 +5532,36 @@ def main() -> None:
                 pick_object_pushable,
                 floor_z,
             )
-            for side, joint_name in hidden_gripper_joint_names.items():
-                gripper = _gripper_state(model, state, joint_q_start, side)
-                if gripper is not None:
-                    proxy_position = _limited_step_position(
-                        hidden_gripper_positions.get(side),
-                        np.asarray(gripper["center"], dtype=np.float64),
-                        INTERACTIVE_GRIPPER_PROXY_MAX_STEP_M,
-                    )
-                    hidden_gripper_positions[side] = proxy_position
-                    _set_kinematic_free_joint_pose(
-                        wp,
-                        newton,
-                        model,
-                        state,
-                        joint_q_start,
-                        joint_name,
-                        proxy_position,
-                    )
             hidden_t3_poses = {}
             for suffix, joint_name in hidden_t3_bottle_joint_names.items():
                 pose = _body_pose_by_suffix(model, state, suffix)
                 if pose is None:
                     continue
                 center, quat = pose
-                proxy_position = _limited_step_position(
-                    hidden_t3_bottle_positions.get(suffix),
-                    center,
-                    INTERACTIVE_ROBOT_PROXY_MAX_STEP_M,
-                )
-                hidden_t3_bottle_positions[suffix] = proxy_position
-                hidden_t3_poses[joint_name] = (proxy_position, quat)
+                # Keep contact geometry aligned with the rendered robot, including
+                # open fingers. Lagging proxies can support objects in empty space.
+                hidden_t3_poses[joint_name] = (center, quat)
             _set_kinematic_free_joint_poses(wp, newton, model, state, joint_q_start, hidden_t3_poses)
+            hidden_t3_dt = 1.0 / max(
+                float(latest_frame.get("fps", current_source_fps or 60.0)) if latest_frame is not None else 60.0,
+                1.0e-3,
+            )
+            _set_kinematic_body_velocities_for_poses(
+                wp,
+                model,
+                state,
+                hidden_t3_poses,
+                hidden_t3_previous_poses,
+                hidden_t3_dt,
+            )
+            _set_kinematic_body_velocities_for_suffixes(
+                wp,
+                model,
+                state,
+                tuple(T3_PICK_CONTACT_BODY_SUFFIXES),
+                visible_t3_gripper_previous_poses,
+                hidden_t3_dt,
+            )
             if t3_bounds is not None:
                 mins, maxs = t3_bounds
                 recorder_target = np.array(
@@ -4097,9 +5573,18 @@ def main() -> None:
                     dtype=np.float64,
                 )
 
-        if physics_solver is not None:
-            physics_dt = (1.0 / 100.0) / physics_substeps
-            for _ in range(physics_substeps):
+        run_physics_step = (
+            physics_solver is not None
+            and (t3_row_payload is None or debug_demo_pick)
+        )
+        if run_physics_step:
+            physics_t0 = time.perf_counter()
+            physics_frame_fps = float(latest_frame.get("fps", current_source_fps or 60.0)) if latest_frame is not None else 60.0
+            active_physics_substeps = physics_substeps
+            frame_t3_row = latest_frame.get("t3_row") if isinstance(latest_frame.get("t3_row"), dict) else None
+            perf_last_substeps = active_physics_substeps
+            physics_dt = (1.0 / max(physics_frame_fps, 1.0e-3)) / active_physics_substeps
+            for _ in range(active_physics_substeps):
                 state, state_next = _step_physics_test(
                     newton,
                     wp,
@@ -4112,16 +5597,127 @@ def main() -> None:
                     control,
                     physics_dt,
                 )
+            if physics_solver.__class__.__name__ == "SolverMuJoCo":
+                contact_bottle_index = (
+                    int(frame_t3_row.get("demo_bottle_index", selected_bottle_index))
+                    if isinstance(frame_t3_row, dict)
+                    else selected_bottle_index
+                )
+                perf_bottle_gripper_contacts = _mujoco_contact_count_for_bottle_gripper(
+                    physics_solver, contact_bottle_index
+                )
+            else:
+                contact_bottle_index = (
+                    int(frame_t3_row.get("demo_bottle_index", selected_bottle_index))
+                    if isinstance(frame_t3_row, dict)
+                    else selected_bottle_index
+                )
+                perf_bottle_gripper_contacts = _contact_count_for_bottle_gripper(
+                    model, contacts, bottle_body_indices, contact_bottle_index
+                )
+            perf_physics_s += time.perf_counter() - physics_t0
+        if latest_frame is not None and t3_row_payload is not None and not actuated_t3_demo:
+            # Physics advances bottle/table contacts, but the demo robot is
+            # kinematic. Re-apply the current T3 row after the solver so the
+            # rendered robot matches the playing frame instead of a stale/home
+            # pose written by the physics backend.
+            t3_live_root_tx, t3_bounds = _apply_t3_row(
+                wp,
+                newton,
+                model,
+                state,
+                default_q,
+                joint_q_start,
+                t3_row_payload,
+                t3_offset_tx,
+                floor_z,
+                t3_shape_count,
+                pick_object_position,
+                pick_object_size,
+                pick_object_visible,
+                pick_object_pushable,
+                None,
+                background_obstacle_bounds,
+                False,
+                {
+                    "left": manual_gripper_left_aperture,
+                    "right": manual_gripper_right_aperture,
+                }
+                if manual_gripper_enabled
+                else table_pick_gripper_override
+                if table_pick_gripper_override
+                else None,
+                demo_gripper_aperture_min,
+            )
+            _apply_t3_row(
+                wp,
+                newton,
+                model,
+                state_next,
+                default_q,
+                joint_q_start,
+                t3_row_payload,
+                t3_offset_tx,
+                floor_z,
+                t3_shape_count,
+                pick_object_position,
+                pick_object_size,
+                pick_object_visible,
+                pick_object_pushable,
+                None,
+                background_obstacle_bounds,
+                False,
+                {
+                    "left": manual_gripper_left_aperture,
+                    "right": manual_gripper_right_aperture,
+                }
+                if manual_gripper_enabled
+                else table_pick_gripper_override
+                if table_pick_gripper_override
+                else None,
+                demo_gripper_aperture_min,
+            )
         _update_interactive_bottles(
             wp,
             model,
             state,
+            state_next,
             joint_q_start,
             bottle_body_indices,
             bottle_positions,
             held_bottles,
             gripper_grasp_state,
+            table_top_z_value,
         )
+
+        grip = _gripper_state(model, state, joint_q_start, "right")
+        if grip is not None and table_top_z_value is not None and latest_frame is not None:
+            table_bounds = next(
+                (bounds for bounds in background_obstacle_bounds if abs(float(bounds[1][2]) - table_top_z_value) < 0.001),
+                None,
+            )
+            if table_bounds is not None:
+                ws_receiver.pick_scene = {
+                    "type": "pick_scene",
+                    "ready": True,
+                    "frame_idx": current_frame_idx,
+                    "bottles": [
+                        {
+                            "index": i,
+                            "position": np.asarray(position, dtype=float).tolist(),
+                            "radius": INTERACTIVE_BOTTLE_RADIUS * 1.015,
+                        }
+                        for i, position in enumerate(bottle_positions)
+                    ],
+                    "table_bounds": [np.asarray(x, dtype=float).tolist() for x in table_bounds],
+                    "right_gripper": {
+                        key: value.tolist() if isinstance(value, np.ndarray) else value
+                        for key, value in grip.items()
+                    },
+                    "robot_offset": _tx_to_numpy(t3_offset_tx).tolist(),
+                    "blocked": "",
+                }
+                ws_receiver.pick_scene_time = time.monotonic()
 
         recorder.begin_frame(recorder_target)
         viewer.begin_frame(time_s)
@@ -4198,15 +5794,19 @@ def main() -> None:
         _set_non_ground_instance_visibility(viewer, newton, show_t3_robot)
         _set_ground_instance_visibility(viewer, newton, not bool(args.background_usd))
         viewer.log_state(state)
-        if show_t3_robot and cpu_robot_mesh_renderer is not None:
+        if show_t3_robot and cpu_robot_mesh_renderer is not None and t3_row_payload is None:
             cpu_robot_mesh_renderer.draw(state)
         if show_contacts and latest_frame is not None:
             viewer.log_contacts(contacts, state)
         if first_end_frame:
             print("[ARDY Newton Viewer] first end_frame: entering", flush=True)
+        render_t0 = time.perf_counter()
         viewer.end_frame()
+        perf_render_s += time.perf_counter() - render_t0
+        stream_t0 = time.perf_counter()
         for ovstream_bridge in ovstream_bridges:
             ovstream_bridge.stream_latest()
+        perf_stream_s += time.perf_counter() - stream_t0
         if first_end_frame:
             print("[ARDY Newton Viewer] first end_frame: complete", flush=True)
             first_end_frame = False
@@ -4237,6 +5837,11 @@ def main() -> None:
                 f"current_frame={current_frame_idx} queued={frame_queue.qsize()} lag_frames={lag_frames} "
                 f"ws_frames={ws_receiver.frames_received} ws_last={ws_receiver.last_frame_idx} "
                 f"ws_bytes={ws_receiver.last_payload_bytes} "
+                f"physics_backend={physics_backend_status} substeps={perf_last_substeps}/{physics_substeps} "
+                f"physics_ms={perf_physics_s * 1000.0 / max(rendered_frames, 1):.1f} "
+                f"grip_contacts={perf_bottle_gripper_contacts} "
+                f"render_ms={perf_render_s * 1000.0 / max(rendered_frames, 1):.1f} "
+                f"stream_ms={perf_stream_s * 1000.0 / max(rendered_frames, 1):.1f} "
                 f"soma_verts={soma_vertex_count} soma_tris={soma_triangle_count} "
                 f"mesh_logged={soma_mesh_logged} skeleton_logged={soma_skeleton_logged} "
                 f"soma_source={soma_mesh_source} soma_status='{soma_mesh_status}' "
@@ -4245,6 +5850,9 @@ def main() -> None:
                 flush=True,
             )
             rendered_frames = 0
+            perf_physics_s = 0.0
+            perf_render_s = 0.0
+            perf_stream_s = 0.0
             last_perf_report = now
         next_frame_time = max(next_frame_time + frame_period, loop_start + frame_period)
         if frame_queue.empty():
