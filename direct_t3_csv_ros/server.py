@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import errno
 import json
 import os
 import queue
@@ -260,8 +261,10 @@ def start_playback(options: dict[str, object]) -> dict[str, object]:
         str(options.get("right_topic", "/right_arm/control/move_j")),
         "--left-topic",
         str(options.get("left_topic", "/left_arm/control/move_j")),
-        "--gripper-topic",
-        str(options.get("gripper_topic", "/right_arm/control/joint_states")),
+        "--right-gripper-topic",
+        str(options.get("right_gripper_topic", options.get("gripper_topic", "/right_arm/control/joint_states"))),
+        "--left-gripper-topic",
+        str(options.get("left_gripper_topic", "/left_arm/control/joint_states")),
         "--base-topic",
         str(options.get("base_topic", "/base/cmd_wheel_rpm")),
         "--lift-topic",
@@ -533,7 +536,19 @@ def main(argv: list[str] | None = None) -> int:
             with STATE.lock:
                 STATE.error = str(exc)
                 STATE.status = "Default CSV failed to load"
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            print(
+                f"Port {args.port} is already in use. Another T3 CSV ROS UI may already be running.\n"
+                f"Open http://{args.host}:{args.port} if you started it earlier, or run on another port:\n"
+                f"  python server.py --port {args.port + 1}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+        raise
     print(f"T3 CSV ROS UI: http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()

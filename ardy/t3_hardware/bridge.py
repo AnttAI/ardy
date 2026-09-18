@@ -32,6 +32,7 @@ class T3HardwareBridge:
     process: subprocess.Popen[str] | None = None
     last_output: list[str] = field(default_factory=list)
     last_payload: dict[str, object] | None = None
+    latest_feedback: dict[str, object] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _ready_event: threading.Event = field(default_factory=threading.Event)
     _startup_error: str | None = None
@@ -66,6 +67,7 @@ class T3HardwareBridge:
             self.process = process
             self.last_output.clear()
             self.last_payload = None
+            self.latest_feedback = None
             self._startup_error = None
             self._ready_event.clear()
 
@@ -73,6 +75,14 @@ class T3HardwareBridge:
             if process.stdout is not None:
                 for line in process.stdout:
                     clean = line.rstrip()
+                    if clean.startswith("[FEEDBACK]"):
+                        try:
+                            payload = json.loads(clean[len("[FEEDBACK]") :].strip())
+                            if isinstance(payload, dict):
+                                with self._lock:
+                                    self.latest_feedback = payload
+                        except json.JSONDecodeError:
+                            pass
                     self.last_output.append(clean)
                     self.last_output[:] = self.last_output[-20:]
                     print(f"[ARDY T3 HARDWARE] {clean}", flush=True)

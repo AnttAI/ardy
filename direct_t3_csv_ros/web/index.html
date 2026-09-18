@@ -34,7 +34,7 @@
             </label>
             <label class="field">
               <span>Playback FPS</span>
-              <input id="fps" type="number" min="0" max="20" step="0.1" value="20" />
+              <input id="fps" type="number" min="0" max="80" step="0.1" value="20" />
             </label>
           </div>
           <button class="primary" type="submit">Load CSV</button>
@@ -65,7 +65,8 @@
         <section class="panel topics">
           <label class="field"><span>Right arm topic</span><input id="rightTopic" value="/right_arm/control/move_j" /></label>
           <label class="field"><span>Left arm topic</span><input id="leftTopic" value="/left_arm/control/move_j" /></label>
-          <label class="field"><span>Gripper topic</span><input id="gripperTopic" value="/right_arm/control/joint_states" /></label>
+          <label class="field"><span>Right gripper topic</span><input id="rightGripperTopic" value="/right_arm/control/joint_states" /></label>
+          <label class="field"><span>Left gripper topic</span><input id="leftGripperTopic" value="/left_arm/control/joint_states" /></label>
           <label class="field"><span>Base topic</span><input id="baseTopic" value="/base/cmd_wheel_rpm" /></label>
           <label class="field"><span>Lift topic</span><input id="liftTopic" value="/control/lift_frame" /></label>
         </section>
@@ -113,6 +114,10 @@
           <div class="valueBlock">
             <h3>Left Arm</h3>
             <pre id="leftValues">No left arm values</pre>
+          </div>
+          <div class="valueBlock">
+            <h3>Grippers</h3>
+            <pre id="gripperValues">No gripper values</pre>
           </div>
           <div id="errorBox" class="error" hidden></div>
         </section>

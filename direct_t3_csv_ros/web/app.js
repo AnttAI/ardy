@@ -8,7 +8,8 @@ const els = {
   dryRun: document.querySelector("#dryRun"),
   rightTopic: document.querySelector("#rightTopic"),
   leftTopic: document.querySelector("#leftTopic"),
-  gripperTopic: document.querySelector("#gripperTopic"),
+  rightGripperTopic: document.querySelector("#rightGripperTopic"),
+  leftGripperTopic: document.querySelector("#leftGripperTopic"),
   baseTopic: document.querySelector("#baseTopic"),
   liftTopic: document.querySelector("#liftTopic"),
   statusText: document.querySelector("#statusText"),
@@ -23,6 +24,7 @@ const els = {
   liftValues: document.querySelector("#liftValues"),
   rightValues: document.querySelector("#rightValues"),
   leftValues: document.querySelector("#leftValues"),
+  gripperValues: document.querySelector("#gripperValues"),
   errorBox: document.querySelector("#errorBox"),
   pauseButton: document.querySelector("#pauseButton"),
   stopButton: document.querySelector("#stopButton"),
@@ -62,7 +64,8 @@ function playOptions(mode) {
     require_lift_subscriber: false,
     right_topic: els.rightTopic.value,
     left_topic: els.leftTopic.value,
-    gripper_topic: els.gripperTopic.value,
+    right_gripper_topic: els.rightGripperTopic.value,
+    left_gripper_topic: els.leftGripperTopic.value,
     base_topic: els.baseTopic.value,
     lift_topic: els.liftTopic.value,
   };
@@ -129,6 +132,12 @@ function render(state) {
     : "No lift value";
   els.rightValues.textContent = formatArray("right arm", ["j1", "j2", "j3", "j4", "j5", "j6", "j7"], payload.right, "rad");
   els.leftValues.textContent = formatArray("left arm", ["j1", "j2", "j3", "j4", "j5", "j6", "j7"], payload.left, "rad");
+  const rightGripper = payload.right_gripper ?? payload.gripper;
+  const leftGripper = payload.left_gripper;
+  els.gripperValues.textContent =
+    rightGripper !== undefined || leftGripper !== undefined
+      ? `right     ${rightGripper !== undefined ? Number(rightGripper).toFixed(4) : "none"} m\nleft      ${leftGripper !== undefined ? Number(leftGripper).toFixed(4) : "none"} m`
+      : "No gripper values";
 
   els.errorBox.hidden = !state.error;
   els.errorBox.textContent = state.error || "";

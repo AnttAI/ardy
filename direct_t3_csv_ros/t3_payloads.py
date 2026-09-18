@@ -28,6 +28,8 @@ class T3FramePayload:
     arm_frame: ArmFrame | None = None
     base_wheel_rpm: tuple[int, int] | None = None
     gripper: float | None = None
+    right_gripper: float | None = None
+    left_gripper: float | None = None
     lift: float | None = None
     lift_frame_index: int | None = None
     t3_row: dict[str, object] | None = None
@@ -39,6 +41,12 @@ class T3FramePayload:
             data["left"] = [float(value) for value in self.arm_frame.left]
         if self.gripper is not None:
             data["gripper"] = float(self.gripper)
+            data["gripper_effort"] = 1.0
+        if self.right_gripper is not None:
+            data["right_gripper"] = float(self.right_gripper)
+            data["gripper_effort"] = 1.0
+        if self.left_gripper is not None:
+            data["left_gripper"] = float(self.left_gripper)
             data["gripper_effort"] = 1.0
         if self.lift is not None:
             data["lift"] = float(self.lift)
@@ -79,19 +87,25 @@ def _arm_frame_from_t3_row(row: dict[str, object], frame_idx: int) -> ArmFrame:
     )
 
 
-def _gripper_from_t3_row(row: dict[str, object]) -> float | None:
+def _validate_gripper_width(width: float, side: str) -> float:
+    if not math.isfinite(width):
+        raise ValueError(f"{side} gripper width must be finite")
+    if width < 0.0 or width > 0.1:
+        raise ValueError(f"{side} gripper width {width:.6f} is outside the AGX gripper range 0.0..0.1 m")
+    return float(width)
+
+
+def _gripper_from_t3_row(row: dict[str, object], side: str) -> float | None:
     values = []
     for column in (
-        "left_gripper_joint1_dof",
-        "left_gripper_joint2_dof",
-        "right_gripper_joint1_dof",
-        "right_gripper_joint2_dof",
+        f"{side}_gripper_joint1_dof",
+        f"{side}_gripper_joint2_dof",
     ):
         if column in row and _csv_has_values(row, [column]):
             values.append(_float_from_row(row, column))
     if not values:
         return None
-    return float(sum(abs(value) for value in values) / len(values))
+    return _validate_gripper_width(float(sum(abs(value) for value in values)), side)
 
 
 def _base_rpm_from_t3_row(
@@ -171,7 +185,8 @@ def build_t3_csv_frame_payload(
         mode=f"csv_{mode}",
         arm_frame=arm_frame,
         base_wheel_rpm=base_wheel_rpm,
-        gripper=_gripper_from_t3_row(row) if stream_robot else None,
+        right_gripper=_gripper_from_t3_row(row, "right") if stream_robot else None,
+        left_gripper=_gripper_from_t3_row(row, "left") if stream_robot else None,
         lift=lift,
         lift_frame_index=lift_frame_index,
         t3_row=dict(row),

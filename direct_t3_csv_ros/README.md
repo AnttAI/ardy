@@ -121,6 +121,7 @@ Default topics:
 /right_arm/control/move_j
 /left_arm/control/move_j
 /right_arm/control/joint_states
+/left_arm/control/joint_states
 /base/cmd_wheel_rpm
 /control/lift_frame
 ```
@@ -128,9 +129,19 @@ Default topics:
 Message types:
 
 - arms: `sensor_msgs/JointState`
-- gripper: `sensor_msgs/JointState`
+- grippers: `sensor_msgs/JointState`
 - base: `std_msgs/Float64MultiArray`
 - lift: `std_msgs/Float64MultiArray`
+
+For AGX grippers, launch each arm driver with `effector_type:=agx_gripper`. The gripper command is published as a `JointState` containing only:
+
+```text
+name: ["gripper"]
+position: [opening_width_m]
+effort: [1.0]
+```
+
+The CSV columns `right_gripper_joint1_dof` and `right_gripper_joint2_dof` are converted to one right gripper opening width by adding their absolute values. The left gripper uses `left_gripper_joint1_dof` and `left_gripper_joint2_dof` the same way. Valid AGX gripper width is `0.0` to `0.1` metres.
 
 ### `stream_t3_robot_sync.sh`
 
@@ -271,6 +282,7 @@ Publishes:
 /right_arm/control/move_j
 /left_arm/control/move_j
 /right_arm/control/joint_states
+/left_arm/control/joint_states
 ```
 
 ### Play Robot + Lift
@@ -350,6 +362,15 @@ or:
 ```text
 base_left_rpm
 base_right_rpm
+```
+
+Gripper playback is optional with robot playback. If these columns exist, they are sent through the right and left arm `/control/joint_states` topics:
+
+```text
+right_gripper_joint1_dof
+right_gripper_joint2_dof
+left_gripper_joint1_dof
+left_gripper_joint2_dof
 ```
 
 ## Pause And Stop

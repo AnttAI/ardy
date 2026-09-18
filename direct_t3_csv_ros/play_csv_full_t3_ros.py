@@ -145,13 +145,13 @@ def publish_arm_pair(node, joint_state_cls, right_pub, left_pub, right: list[flo
     left_pub.publish(left_msg)
 
 
-def gripper_msg(joint_state_cls, stamp, right: list[float], gripper: float, effort: float):
+def gripper_msg(joint_state_cls, stamp, gripper: float, effort: float):
     msg = joint_state_cls()
     msg.header.stamp = stamp
-    msg.name = [*ROBOT_JOINT_NAMES, "gripper"]
-    msg.position = [*right, gripper]
+    msg.name = ["gripper"]
+    msg.position = [gripper]
     msg.velocity = []
-    msg.effort = [0.0] * len(ROBOT_JOINT_NAMES) + [effort]
+    msg.effort = [effort]
     return msg
 
 
@@ -160,6 +160,8 @@ def payload_preview(payload) -> str:
     return (
         f"frame={data.get('frame_index')} "
         f"arms={'yes' if 'right' in data and 'left' in data else 'no'} "
+        f"right_gripper={data.get('right_gripper', data.get('gripper', 'none'))} "
+        f"left_gripper={data.get('left_gripper', 'none')} "
         f"base={data.get('base_wheel_rpm', 'none')} "
         f"lift={data.get('lift', 'none')}"
     )
@@ -179,7 +181,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--lift-step-frames", type=int, default=10, help="Publish lift once every N CSV rows")
     parser.add_argument("--right-topic", default="/right_arm/control/move_j")
     parser.add_argument("--left-topic", default="/left_arm/control/move_j")
-    parser.add_argument("--gripper-topic", default="/right_arm/control/joint_states")
+    parser.add_argument(
+        "--right-gripper-topic",
+        "--gripper-topic",
+        dest="right_gripper_topic",
+        default="/right_arm/control/joint_states",
+    )
+    parser.add_argument("--left-gripper-topic", default="/left_arm/control/joint_states")
     parser.add_argument("--base-topic", default="/base/cmd_wheel_rpm")
     parser.add_argument("--lift-topic", default="/control/lift_frame")
     parser.add_argument("--rpm-scale", type=float, default=1.0)
@@ -242,7 +250,8 @@ def main(argv: list[str] | None = None) -> int:
     node = Node("ardy_play_csv_full_t3")
     right_pub = node.create_publisher(JointState, args.right_topic, 10)
     left_pub = node.create_publisher(JointState, args.left_topic, 10)
-    gripper_pub = node.create_publisher(JointState, args.gripper_topic, 10)
+    right_gripper_pub = node.create_publisher(JointState, args.right_gripper_topic, 10)
+    left_gripper_pub = node.create_publisher(JointState, args.left_gripper_topic, 10)
     base_pub = node.create_publisher(Float64MultiArray, args.base_topic, 10)
     lift_pub = node.create_publisher(Float64MultiArray, args.lift_topic, 10)
     dt = 1.0 / max(float(fps), 1.0e-6)
@@ -286,8 +295,12 @@ def main(argv: list[str] | None = None) -> int:
                 lift_pub.publish(lift_msg)
             if "right" in data and "left" in data:
                 publish_arm_pair(node, JointState, right_pub, left_pub, data["right"], data["left"])
-            if "gripper" in data and "right" in data:
-                gripper_pub.publish(gripper_msg(JointState, now, data["right"], float(data["gripper"]), 1.0))
+            if "right_gripper" in data:
+                right_gripper_pub.publish(gripper_msg(JointState, now, float(data["right_gripper"]), 1.0))
+            elif "gripper" in data:
+                right_gripper_pub.publish(gripper_msg(JointState, now, float(data["gripper"]), 1.0))
+            if "left_gripper" in data:
+                left_gripper_pub.publish(gripper_msg(JointState, now, float(data["left_gripper"]), 1.0))
 
             if row_index % 10 == 0 or row_index == len(rows) - 1:
                 print("[ROS] " + payload_preview(payload), flush=True)

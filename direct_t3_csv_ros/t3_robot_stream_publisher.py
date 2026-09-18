@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from typing import Iterator
@@ -82,7 +83,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--right-topic", default="/right_arm/control/move_j")
     parser.add_argument("--left-topic", default="/left_arm/control/move_j")
-    parser.add_argument("--gripper-topic", default="/right_arm/control/joint_states")
+    parser.add_argument(
+        "--right-gripper-topic",
+        "--gripper-topic",
+        dest="right_gripper_topic",
+        default="/right_arm/control/joint_states",
+    )
+    parser.add_argument("--left-gripper-topic", default="/left_arm/control/joint_states")
     parser.add_argument("--base-topic", default="/base/cmd_wheel_rpm")
     parser.add_argument("--lift-topic", default="/control/lift_frame")
     parser.add_argument(
@@ -126,12 +133,22 @@ def _validate_positions(value: object, label: str) -> list[float]:
     return [float(item) for item in value]
 
 
+def _optional_gripper(payload: dict[str, object], key: str) -> float | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    width = float(value)
+    if not math.isfinite(width) or width < 0.0 or width > 0.1:
+        raise ValueError(f"{key} must be in the AGX gripper range 0.0..0.1 m")
+    return width
+
+
 def _iter_stream_frames() -> Iterator[
     tuple[
         int,
         list[float] | None,
         list[float] | None,
-        float | None,
+        dict[str, float],
         float,
         tuple[float, float] | None,
         float | None,
@@ -155,8 +172,16 @@ def _iter_stream_frames() -> Iterator[
             right = _validate_positions(right_value, "right")
             left = _validate_positions(left_value, "left")
 
-        gripper_value = payload.get("gripper")
-        gripper = None if gripper_value is None else float(gripper_value)
+        grippers: dict[str, float] = {}
+        right_gripper = _optional_gripper(payload, "right_gripper")
+        left_gripper = _optional_gripper(payload, "left_gripper")
+        legacy_gripper = _optional_gripper(payload, "gripper")
+        if right_gripper is not None:
+            grippers["right"] = right_gripper
+        elif legacy_gripper is not None:
+            grippers["right"] = legacy_gripper
+        if left_gripper is not None:
+            grippers["left"] = left_gripper
         effort = float(payload.get("gripper_effort", 1.0))
         base_value = payload.get("base_wheel_rpm")
         if base_value is None:
@@ -169,20 +194,20 @@ def _iter_stream_frames() -> Iterator[
         lift = None if lift_value is None else float(lift_value)
         lift_frame_value = payload.get("lift_frame_index", frame_index)
         lift_frame_index = None if lift is None else int(lift_frame_value)
-        yield frame_index, right, left, gripper, effort, base_wheel_rpm, lift, lift_frame_index
+        yield frame_index, right, left, grippers, effort, base_wheel_rpm, lift, lift_frame_index
 
 
 def _format_positions(values: list[float]) -> str:
     return ", ".join(f"{name}={value:.4f}" for name, value in zip(ROBOT_JOINT_NAMES, values))
 
 
-def _combined_right_gripper_msg(joint_state_cls, stamp, right: list[float], gripper: float, effort: float):
+def _gripper_msg(joint_state_cls, stamp, gripper: float, effort: float):
     msg = joint_state_cls()
     msg.header.stamp = stamp
-    msg.name = [*ROBOT_JOINT_NAMES, "gripper"]
-    msg.position = [*right, gripper]
+    msg.name = ["gripper"]
+    msg.position = [gripper]
     msg.velocity = []
-    msg.effort = [0.0] * len(ROBOT_JOINT_NAMES) + [effort]
+    msg.effort = [effort]
     return msg
 
 
@@ -207,19 +232,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print("[READY] Dry-running streamed ARDY T3 frames", flush=True)
         try:
-            for frame_index, right, left, gripper, effort, base_wheel_rpm, lift, lift_frame_index in _iter_stream_frames():
+            for frame_index, right, left, grippers, effort, base_wheel_rpm, lift, lift_frame_index in _iter_stream_frames():
                 print(f"[DRY-RUN] frame={frame_index}", flush=True)
                 if right is not None and left is not None:
                     print(f"[DRY-RUN]   right: {_format_positions(right)}", flush=True)
                     print(f"[DRY-RUN]   left:  {_format_positions(left)}", flush=True)
-                if gripper is not None and right is not None:
-                    print(
-                        "[DRY-RUN]   combined gripper msg: "
-                        f"name={[*ROBOT_JOINT_NAMES, 'gripper']} "
-                        f"position={[*right, gripper]} "
-                        f"effort={[0.0] * len(ROBOT_JOINT_NAMES) + [effort]}",
-                        flush=True,
-                    )
+                for side in ("right", "left"):
+                    if side in grippers:
+                        print(
+                            f"[DRY-RUN]   {side} gripper msg: "
+                            f"name={['gripper']} position={[grippers[side]]} effort={[effort]}",
+                            flush=True,
+                        )
                 if base_wheel_rpm is not None:
                     print(f"[DRY-RUN]   base wheel RPM: {list(base_wheel_rpm)}", flush=True)
                 if lift is not None:
@@ -249,7 +273,8 @@ def main(argv: list[str] | None = None) -> int:
     node = Node("ardy_t3_robot_stream_publisher")
     right_pub = node.create_publisher(JointState, args.right_topic, 10)
     left_pub = node.create_publisher(JointState, args.left_topic, 10)
-    gripper_pub = node.create_publisher(JointState, args.gripper_topic, 10)
+    right_gripper_pub = node.create_publisher(JointState, args.right_gripper_topic, 10)
+    left_gripper_pub = node.create_publisher(JointState, args.left_gripper_topic, 10)
     base_pub = node.create_publisher(Float64MultiArray, args.base_topic, 10)
     lift_pub = node.create_publisher(Float64MultiArray, args.lift_topic, 10)
 
@@ -267,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(
             f"[READY] Streaming ARDY T3 frames to {args.right_topic}, {args.left_topic}, "
-            f"gripper commands to {args.gripper_topic}, base RPM to {args.base_topic}, "
+            f"gripper commands to {args.right_gripper_topic} and {args.left_gripper_topic}, base RPM to {args.base_topic}, "
             f"and lift to {args.lift_topic}; arm_smooth_rate={float(args.arm_smooth_rate):.1f} Hz",
             flush=True,
         )
@@ -275,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
         last_right = None
         last_left = None
         last_arm_time = None
-        for _frame_index, right, left, gripper, effort, base_wheel_rpm, lift, lift_frame_index in _iter_stream_frames():
+        for _frame_index, right, left, grippers, effort, base_wheel_rpm, lift, lift_frame_index in _iter_stream_frames():
             now = node.get_clock().now().to_msg()
 
             if base_wheel_rpm is not None:
@@ -316,8 +341,10 @@ def main(argv: list[str] | None = None) -> int:
                 last_right = right
                 last_left = left
                 last_arm_time = time.monotonic()
-            if gripper is not None and right is not None:
-                gripper_pub.publish(_combined_right_gripper_msg(JointState, now, right, gripper, effort))
+            if "right" in grippers:
+                right_gripper_pub.publish(_gripper_msg(JointState, now, grippers["right"], effort))
+            if "left" in grippers:
+                left_gripper_pub.publish(_gripper_msg(JointState, now, grippers["left"], effort))
             rclpy.spin_once(node, timeout_sec=0.0)
     except KeyboardInterrupt:
         print("\n[INFO] Stopped by user.", flush=True)
