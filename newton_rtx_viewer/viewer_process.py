@@ -69,6 +69,9 @@ T3_FEEDBACK_MOVE_EPS_RAD = 1.0e-4
 T3_FEEDBACK_ACTIVE_SECONDS = 1.2
 T3_GRIPPER_MAX_APERTURE_M = 0.10
 T3_GRIPPER_DEFAULT_APERTURE_M = 0.0
+RENDER_SOURCE_WEBSOCKET = "websocket"
+RENDER_SOURCE_SIMULATION = "simulation"
+RENDER_SOURCE_LABELS = ("WebSocket Live", "Simulation / IK Picks")
 T3_STIFF_POSTURE_JOINTS = {
     "waist_yaw_joint",
     "waist_roll_joint",
@@ -1978,6 +1981,16 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("ARDY_NEWTON_WEBSOCKET_PORT", "8765")),
         help="Port for --websocket-server.",
+    )
+    parser.add_argument(
+        "--render-source",
+        choices=("auto", RENDER_SOURCE_WEBSOCKET, RENDER_SOURCE_SIMULATION),
+        default=os.environ.get("ARDY_NEWTON_RENDER_SOURCE", "auto").strip().lower(),
+        help=(
+            "Initial viewer data source. 'websocket' renders live received frames; "
+            "'simulation' renders local IK picks and CSV/BVH playback; 'auto' uses "
+            "websocket when --websocket-server is enabled."
+        ),
     )
     parser.add_argument(
         "--ros-enabled",
@@ -4011,6 +4024,8 @@ def _apply_t3_row(
     target_only: bool = False,
     root_q_start: int = 0,
     apply_stiff_posture: bool = True,
+    calculate_bounds: bool = True,
+    preserve_body_indices: list[int] | tuple[int, ...] | None = None,
 ):
     # Start from the live model coordinates so dynamic/free bodies such as
     # moved bottles keep their current poses. The T3 row then overwrites only
@@ -4020,6 +4035,32 @@ def _apply_t3_row(
         q = model.joint_q.numpy().copy()
     except Exception:
         q = default_q.copy()
+    preserved_body_indices = [int(index) for index in (preserve_body_indices or ()) if int(index) >= 0]
+    preserved_body_q = None
+    preserved_body_qd = None
+    if preserved_body_indices:
+        body_q = state.body_q.numpy()
+        preserved_body_q = np.array(body_q[preserved_body_indices], dtype=np.float32, copy=True)
+        if getattr(state, "body_qd", None) is not None:
+            body_qd = state.body_qd.numpy()
+            preserved_body_qd = np.array(body_qd[preserved_body_indices], dtype=np.float32, copy=True)
+
+    def eval_robot_fk() -> None:
+        if body_flag_filter is None:
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
+        else:
+            newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=body_flag_filter)
+        # Robot FK operates on the assembled model and can otherwise overwrite
+        # dynamic scene bodies with stale joint coordinates. Bottle transforms
+        # and velocities belong to the live physics state and must survive IK.
+        if preserved_body_q is not None:
+            body_q = state.body_q.numpy().copy()
+            body_q[preserved_body_indices] = preserved_body_q
+            wp.copy(state.body_q, wp.array(body_q, dtype=wp.transform), 0, 0, len(body_q))
+        if preserved_body_qd is not None:
+            body_qd = state.body_qd.numpy().copy()
+            body_qd[preserved_body_indices] = preserved_body_qd
+            wp.copy(state.body_qd, wp.array(body_qd, dtype=wp.spatial_vector), 0, 0, len(body_qd))
     live_root_pos = np.zeros(3, dtype=np.float64)
     live_root_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
     live_root_yaw_rad = 0.0
@@ -4120,16 +4161,10 @@ def _apply_t3_row(
         current_q = model.joint_q.numpy().copy()
         current_q[root_q_start : root_q_start + 7] = q[root_q_start : root_q_start + 7]
         wp.copy(model.joint_q, wp.array(current_q, dtype=wp.float32), 0, 0, len(current_q))
-        if body_flag_filter is None:
-            newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
-        else:
-            newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=body_flag_filter)
+        eval_robot_fk()
         return _make_tx(wp, q[root_q_start : root_q_start + 3], q[root_q_start + 3 : root_q_start + 7]), _robot_shape_bounds(newton, model, state, t3_shape_count)
     wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
-    if body_flag_filter is None:
-        newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
-    else:
-        newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=body_flag_filter)
+    eval_robot_fk()
     if table_guard_enabled and obstacle_bounds:
         guard_bounds = _robot_shape_bounds(
             newton,
@@ -4142,20 +4177,17 @@ def _apply_t3_row(
         if table_lift > 0.0:
             q[root_q_start + 2] = float(floor_z) + min(table_lift, 0.45)
             wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
-            if body_flag_filter is None:
-                newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
-            else:
-                newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=body_flag_filter)
-    bounds = _robot_shape_bounds(newton, model, state, t3_shape_count)
-    support_bounds = _robot_shape_bounds(
-        newton,
-        model,
-        state,
-        t3_shape_count,
-        body_suffixes=T3_GROUND_SUPPORT_BODY_SUFFIXES,
-    )
+            eval_robot_fk()
+    bounds = _robot_shape_bounds(newton, model, state, t3_shape_count) if calculate_bounds or table_guard_enabled else None
     correction = np.zeros(2, dtype=np.float64)
     if table_guard_enabled:
+        support_bounds = _robot_shape_bounds(
+            newton,
+            model,
+            state,
+            t3_shape_count,
+            body_suffixes=T3_GROUND_SUPPORT_BODY_SUFFIXES,
+        )
         correction += _actor_separation_from_pick_object(bounds, pick_position, pick_size, pick_visible, pick_pushable)
         for obstacle in obstacle_bounds or []:
             correction += _actor_separation_from_aabb(support_bounds, obstacle, margin=0.0, check_z=False)
@@ -4163,11 +4195,9 @@ def _apply_t3_row(
         q[root_q_start] += correction[0]
         q[root_q_start + 1] += correction[1]
         wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
-    if body_flag_filter is None:
-        newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
-    else:
-        newton.eval_fk(model, model.joint_q, model.joint_qd, state, None, body_flag_filter=body_flag_filter)
-    return _make_tx(wp, q[root_q_start : root_q_start + 3], q[root_q_start + 3 : root_q_start + 7]), _robot_shape_bounds(newton, model, state, t3_shape_count)
+        eval_robot_fk()
+        bounds = _robot_shape_bounds(newton, model, state, t3_shape_count)
+    return _make_tx(wp, q[root_q_start : root_q_start + 3], q[root_q_start + 3 : root_q_start + 7]), bounds
 
 
 def _t3_initial_joints_from_feedback(row: dict | None) -> dict[str, float]:
@@ -4200,13 +4230,39 @@ def _feedback_row_on_fixed_loaded_t3(feedback_row: dict) -> dict:
     return row
 
 
-def _hide_t3_feedback_ghost(wp, newton, model, state, root_q_start: int) -> None:
+def _hide_t3_feedback_ghost(
+    wp,
+    newton,
+    model,
+    state,
+    root_q_start: int,
+    preserve_body_indices: list[int] | tuple[int, ...] | None = None,
+) -> None:
     try:
+        preserved_indices = [int(index) for index in (preserve_body_indices or ()) if int(index) >= 0]
+        preserved_q = (
+            np.array(state.body_q.numpy()[preserved_indices], dtype=np.float32, copy=True)
+            if preserved_indices
+            else None
+        )
+        preserved_qd = (
+            np.array(state.body_qd.numpy()[preserved_indices], dtype=np.float32, copy=True)
+            if preserved_indices and getattr(state, "body_qd", None) is not None
+            else None
+        )
         q = model.joint_q.numpy().copy()
         root_q_start = int(root_q_start)
         q[root_q_start : root_q_start + 7] = np.array([0.0, 0.0, -100.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         wp.copy(model.joint_q, wp.array(q, dtype=wp.float32), 0, 0, len(q))
         newton.eval_fk(model, model.joint_q, model.joint_qd, state, None)
+        if preserved_q is not None:
+            body_q = state.body_q.numpy().copy()
+            body_q[preserved_indices] = preserved_q
+            wp.copy(state.body_q, wp.array(body_q, dtype=wp.transform), 0, 0, len(body_q))
+        if preserved_qd is not None:
+            body_qd = state.body_qd.numpy().copy()
+            body_qd[preserved_indices] = preserved_qd
+            wp.copy(state.body_qd, wp.array(body_qd, dtype=wp.spatial_vector), 0, 0, len(body_qd))
     except Exception:
         return
 
@@ -5588,6 +5644,7 @@ def main() -> None:
     )
     table_top_z_value = _table_top_z(background_obstacle_bounds)
     place_box_position = _default_place_box_position(table_top_z_value)
+    place_box_spawn_position = place_box_position.copy()
     if background_obstacle_bounds:
         print("[ARDY Newton Viewer] background table blocker active for robot base/wheels", flush=True)
     show_contacts = False
@@ -5622,6 +5679,13 @@ def main() -> None:
     pick_motion_fps = T3_DEMO_PICK_FPS
     physics_solver = None
     websocket_enabled = bool(args.websocket_server)
+    render_source = (
+        RENDER_SOURCE_WEBSOCKET
+        if args.render_source == "auto" and websocket_enabled
+        else RENDER_SOURCE_SIMULATION
+        if args.render_source == "auto"
+        else str(args.render_source)
+    )
     soma_mesh_status = "SOMA mesh not registered"
     soma_skin_status = "SOMA local skin not initialized"
     soma_vertex_count = 0
@@ -5707,6 +5771,7 @@ def main() -> None:
         nonlocal file_playback_active, file_playback_status, show_human_mesh, show_t3_robot
         nonlocal manual_gripper_enabled, selected_bottle_index, demo_pick_job_token
         nonlocal latest_frame, latest_t3_feedback_row, current_frame_idx, current_source_fps
+        nonlocal render_source
         if not bottle_body_indices:
             file_playback_status = "T3 demo pick failed: no interactive bottles"
             print(f"[ARDY Newton Viewer] {file_playback_status}", flush=True)
@@ -5779,6 +5844,7 @@ def main() -> None:
             demo_pick_job_token += 1
             job_token = demo_pick_job_token
             job_fps = pick_motion_fps
+            render_source = RENDER_SOURCE_SIMULATION
             file_playback_active = False
             file_playback_index = 0
             show_human_mesh = False
@@ -5890,6 +5956,8 @@ def main() -> None:
                     None,
                     background_obstacle_bounds,
                     False,
+                    calculate_bounds=False,
+                    preserve_body_indices=bottle_body_indices,
                 )
                 _apply_t3_row(
                     wp,
@@ -5909,6 +5977,8 @@ def main() -> None:
                     None,
                     background_obstacle_bounds,
                     False,
+                    calculate_bounds=False,
+                    preserve_body_indices=bottle_body_indices,
                 )
                 _copy_t3_joint_targets_from_q(model, control, model.joint_q.numpy())
                 _reset_physics_solver_state(physics_solver, state)
@@ -5937,6 +6007,7 @@ def main() -> None:
         nonlocal file_csv_path, file_bvh_path, file_playback_frames, file_playback_index
         nonlocal file_playback_next_time, file_playback_active, file_playback_status
         nonlocal websocket_enabled
+        nonlocal render_source
         nonlocal manual_gripper_enabled, manual_gripper_left_aperture, manual_gripper_right_aperture
         nonlocal auto_gripper_enabled
         nonlocal selected_bottle_index
@@ -5948,6 +6019,36 @@ def main() -> None:
         flags = ui.WindowFlags_.no_collapse.value | ui.WindowFlags_.no_resize.value
         ui.begin("ARDY Newton Retarget", flags=flags)
         ui.text("SOMA mesh -> Newton IK -> T3 robot")
+        render_source_index = 0 if render_source == RENDER_SOURCE_WEBSOCKET else 1
+        ui.set_next_item_width(190)
+        source_changed, render_source_index = ui.combo(
+            "Render Source",
+            render_source_index,
+            RENDER_SOURCE_LABELS,
+        )
+        if source_changed:
+            render_source = (
+                RENDER_SOURCE_WEBSOCKET
+                if render_source_index == 0
+                else RENDER_SOURCE_SIMULATION
+            )
+            if render_source == RENDER_SOURCE_WEBSOCKET:
+                if not websocket_enabled:
+                    websocket_enabled = True
+                    ws_receiver.start()
+                file_playback_active = False
+                file_playback_status = "simulation paused; rendering WebSocket frames"
+            else:
+                while True:
+                    try:
+                        frame_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                file_playback_status = "simulation selected; choose an IK pick or file motion"
+        if render_source == RENDER_SOURCE_WEBSOCKET:
+            ui.text("Live WebSocket SOMA/T3 frames are rendered.")
+        else:
+            ui.text("All local IK picks and motion playback are rendered.")
         _, show_human_mesh = ui.checkbox("Show SOMA Mesh", show_human_mesh)
         _, show_t3_robot = ui.checkbox("Show T3 Robot", show_t3_robot)
         _, show_t3_feedback_ghost = ui.checkbox("Show Feedback Hands", show_t3_feedback_ghost)
@@ -6018,7 +6119,9 @@ def main() -> None:
                 nonlocal file_csv_path, file_bvh_path
                 nonlocal file_playback_frames, file_playback_index, file_playback_next_time
                 nonlocal file_playback_active, file_playback_status
+                nonlocal render_source
                 try:
+                    render_source = RENDER_SOURCE_SIMULATION
                     file_playback_status = f"loading {mode}"
                     file_csv_path = str(_resolve_playback_path(file_csv_path, (".csv",))) if file_csv_path else ""
                     file_bvh_path = (
@@ -6074,6 +6177,8 @@ def main() -> None:
                     ws_receiver.stop()
             ui.text(f"URL: ws://{args.websocket_host}:{int(args.websocket_port)}")
             ui.text(ws_receiver.status[:180])
+            if websocket_enabled and render_source != RENDER_SOURCE_WEBSOCKET:
+                ui.text("Connected; live frames are ignored in Simulation mode.")
         ui.separator()
         if ui.collapsing_header("ROS Control", flags=ui.TreeNodeFlags_.default_open):
             changed, ros_enabled = ui.checkbox("Send T3 to ROS", bool(t3_ros_route.enabled))
@@ -6246,7 +6351,7 @@ def main() -> None:
                         newton,
                         model,
                         state,
-                        joint_q_start,
+                        scene_joint_q_start,
                         place_box_joint_name,
                         place_box_position,
                     )
@@ -6255,7 +6360,7 @@ def main() -> None:
                         newton,
                         model,
                         state_next,
-                        joint_q_start,
+                        scene_joint_q_start,
                         place_box_joint_name,
                         place_box_position,
                     )
@@ -6288,7 +6393,7 @@ def main() -> None:
                     model,
                     state,
                     state_next,
-                    joint_q_start,
+                    scene_joint_q_start,
                     bottle_body_indices,
                     bottle_positions,
                     held_bottles,
@@ -6304,7 +6409,7 @@ def main() -> None:
                     model,
                     state,
                     state_next,
-                    joint_q_start,
+                    scene_joint_q_start,
                     bottle_body_indices,
                     bottle_positions,
                     held_bottles,
@@ -6321,7 +6426,7 @@ def main() -> None:
                     model,
                     state,
                     state_next,
-                    joint_q_start,
+                    scene_joint_q_start,
                     bottle_body_indices,
                     bottle_positions,
                     held_bottles,
@@ -6338,7 +6443,7 @@ def main() -> None:
                     model,
                     state,
                     state_next,
-                    joint_q_start,
+                    scene_joint_q_start,
                     bottle_body_indices,
                     bottle_positions,
                     held_bottles,
@@ -6355,7 +6460,7 @@ def main() -> None:
                     model,
                     state,
                     state_next,
-                    joint_q_start,
+                    scene_joint_q_start,
                     bottle_body_indices,
                     bottle_positions,
                     held_bottles,
@@ -6365,18 +6470,37 @@ def main() -> None:
                 )
                 _reset_physics_solver_state(physics_solver, state)
             ui.text("Bottles move through gravity and contact only.")
-            if ui.button("Reset Bottles"):
+            if ui.button("Reset Bottles + Box"):
                 _reset_interactive_bottles(
                     wp,
                     model,
                     state,
                     state_next,
-                    joint_q_start,
+                    scene_joint_q_start,
                     bottle_body_indices,
                     bottle_spawn_positions,
                     bottle_positions,
                     held_bottles,
                     gripper_grasp_state,
+                )
+                place_box_position[:] = place_box_spawn_position
+                _set_kinematic_free_joint_pose(
+                    wp,
+                    newton,
+                    model,
+                    state,
+                    scene_joint_q_start,
+                    place_box_joint_name,
+                    place_box_position,
+                )
+                _set_kinematic_free_joint_pose(
+                    wp,
+                    newton,
+                    model,
+                    state_next,
+                    scene_joint_q_start,
+                    place_box_joint_name,
+                    place_box_position,
                 )
                 _reset_physics_solver_state(physics_solver, state)
             _, pick_motion_fps = ui.slider_float("Pick FPS", pick_motion_fps, 60.0, 120.0, "%.0f")
@@ -6582,6 +6706,7 @@ def main() -> None:
     visible_t3_gripper_previous_poses: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     default_q = model.joint_q.numpy().copy()
     joint_q_start = _joint_q_start_map_for_range(model, t3_joint_start, t3_joint_end)
+    scene_joint_q_start = _joint_q_start_map_for_range(model, 0, len(model.joint_label))
     t3_feedback_joint_q_start = _joint_q_start_map_for_range(
         model,
         t3_feedback_joint_start,
@@ -6662,6 +6787,7 @@ def main() -> None:
     next_frame_time = time.monotonic()
     last_perf_report = next_frame_time
     rendered_frames = 0
+    perf_prepare_s = 0.0
     perf_physics_s = 0.0
     perf_render_s = 0.0
     perf_stream_s = 0.0
@@ -6670,6 +6796,8 @@ def main() -> None:
     last_feedback_values: np.ndarray | None = None
     last_feedback_motion_s = 0.0
     last_feedback_ghost_color: tuple[float, float, float] | None = None
+    feedback_ghost_was_active: bool | None = None
+    last_t3_pose_key: tuple | None = None
     if args.viewer == "rtx":
         _warm_rtx_frame(viewer, ovstream_bridges, state, time_s)
         first_end_frame = False
@@ -6678,9 +6806,9 @@ def main() -> None:
     print("[ARDY Newton Viewer] ready for live frames", flush=True)
     while viewer.is_running() and not requested_close:
         loop_start = time.monotonic()
+        prepare_t0 = time.perf_counter()
         queued_frames = frame_queue.qsize()
         soma_live_gizmo_tx = wp.transform_identity()
-        t3_live_root_tx = wp.transform_identity()
         if isinstance(t3_feedback_listener.latest_row, dict):
             latest_t3_feedback_row = t3_feedback_listener.latest_row
         if demo_pick_requested:
@@ -6689,7 +6817,19 @@ def main() -> None:
             start_t3_demo_pick_playback(source="ui", hand_side="auto")
             next_frame_time = time.monotonic()
         incoming_frame = None
-        if file_playback_active and file_playback_frames:
+        if render_source == RENDER_SOURCE_SIMULATION:
+            # Keep live senders responsive without allowing queued live frames
+            # to replace the currently selected local simulation motion.
+            while True:
+                try:
+                    frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+        if (
+            render_source == RENDER_SOURCE_SIMULATION
+            and file_playback_active
+            and file_playback_frames
+        ):
             now_for_file = time.monotonic()
             if now_for_file >= file_playback_next_time:
                 incoming_frame = file_playback_frames[file_playback_index]
@@ -6705,7 +6845,7 @@ def main() -> None:
                     )
             else:
                 pass
-        else:
+        elif render_source == RENDER_SOURCE_WEBSOCKET:
             incoming_frame = _get_next_frame(frame_queue, args.playback_mode)
         if incoming_frame is not None:
             latest_frame = incoming_frame
@@ -6796,24 +6936,7 @@ def main() -> None:
                 soma_indices_wp = wp.array(soma_reconstructor.faces, dtype=wp.int32)
                 soma_triangle_count = int(soma_reconstructor.faces.size // 3)
                 soma_mesh_status = f"SOMA faces from local skin: {soma_triangle_count} tris"
-            t3_live_root_tx, t3_bounds = _apply_t3_row(
-                wp,
-                newton,
-                model,
-                state,
-                default_q,
-                joint_q_start,
-                t3_row_payload,
-                t3_offset_tx,
-                floor_z,
-                t3_shape_count,
-                pick_object_position,
-                pick_object_size,
-                pick_object_visible,
-                pick_object_pushable,
-                t3_fk_body_filter if actuated_t3_demo and row_frame_idx > 0 else None,
-                background_obstacle_bounds,
-                False,
+            pose_gripper_override = (
                 {
                     "left": manual_gripper_left_aperture,
                     "right": manual_gripper_right_aperture,
@@ -6821,11 +6944,48 @@ def main() -> None:
                 if manual_gripper_enabled
                 else table_pick_gripper_override
                 if table_pick_gripper_override
-                else None,
-                demo_gripper_aperture_min,
-                control if actuated_t3_demo else None,
-                actuated_t3_demo and row_frame_idx > 0,
+                else None
             )
+            t3_pose_key = (
+                id(t3_row_payload),
+                row_frame_idx,
+                tuple(np.asarray(_tx_to_numpy(t3_offset_tx), dtype=np.float64).tolist()),
+                float(floor_z),
+                bool(manual_gripper_enabled),
+                float(manual_gripper_left_aperture),
+                float(manual_gripper_right_aperture),
+                tuple(sorted((pose_gripper_override or {}).items())),
+            )
+            update_t3_pose = physics_scene_active or t3_pose_key != last_t3_pose_key
+            if update_t3_pose:
+                t3_live_root_tx, t3_bounds = _apply_t3_row(
+                    wp,
+                    newton,
+                    model,
+                    state,
+                    default_q,
+                    joint_q_start,
+                    t3_row_payload,
+                    t3_offset_tx,
+                    floor_z,
+                    t3_shape_count,
+                    pick_object_position,
+                    pick_object_size,
+                    pick_object_visible,
+                    pick_object_pushable,
+                    t3_fk_body_filter if actuated_t3_demo and row_frame_idx > 0 else None,
+                    background_obstacle_bounds,
+                    False,
+                    pose_gripper_override,
+                    demo_gripper_aperture_min,
+                    control if actuated_t3_demo else None,
+                    actuated_t3_demo and row_frame_idx > 0,
+                    calculate_bounds=bool(recorder.enabled or pick_object_visible),
+                    preserve_body_indices=bottle_body_indices,
+                )
+                last_t3_pose_key = t3_pose_key
+            else:
+                t3_bounds = None
             if (
                 auto_gripper_enabled
                 and not manual_gripper_enabled
@@ -6885,7 +7045,7 @@ def main() -> None:
                     newton,
                     model,
                     state,
-                    joint_q_start,
+                    scene_joint_q_start,
                     hidden_robot_joint_name,
                     (float(t3_root_pos[0]), float(t3_root_pos[1]), float(t3_root_pos[2]) + 0.85),
                 )
@@ -6899,7 +7059,7 @@ def main() -> None:
                         newton,
                         model,
                         state,
-                        joint_q_start,
+                        scene_joint_q_start,
                         hidden_soma_joint_name,
                         (
                             float((mins[0] + maxs[0]) * 0.5),
@@ -6915,36 +7075,37 @@ def main() -> None:
                 pick_object_pushable,
                 floor_z,
             )
-            hidden_t3_poses = {}
-            for suffix, joint_name in hidden_t3_bottle_joint_names.items():
-                pose = _body_pose_by_suffix(model, state, suffix)
-                if pose is None:
-                    continue
-                center, quat = pose
-                # Keep contact geometry aligned with the rendered robot, including
-                # open fingers. Lagging proxies can support objects in empty space.
-                hidden_t3_poses[joint_name] = (center, quat)
-            _set_kinematic_free_joint_poses(wp, newton, model, state, joint_q_start, hidden_t3_poses)
-            hidden_t3_dt = 1.0 / max(
-                float(latest_frame.get("fps", current_source_fps or 60.0)) if latest_frame is not None else 60.0,
-                1.0e-3,
-            )
-            _set_kinematic_body_velocities_for_poses(
-                wp,
-                model,
-                state,
-                hidden_t3_poses,
-                hidden_t3_previous_poses,
-                hidden_t3_dt,
-            )
-            _set_kinematic_body_velocities_for_suffixes(
-                wp,
-                model,
-                state,
-                tuple(T3_PICK_CONTACT_BODY_SUFFIXES),
-                visible_t3_gripper_previous_poses,
-                hidden_t3_dt,
-            )
+            if physics_scene_active:
+                hidden_t3_poses = {}
+                for suffix, joint_name in hidden_t3_bottle_joint_names.items():
+                    pose = _body_pose_by_suffix(model, state, suffix)
+                    if pose is None:
+                        continue
+                    center, quat = pose
+                    # Keep contact geometry aligned with the rendered robot, including
+                    # open fingers. Lagging proxies can support objects in empty space.
+                    hidden_t3_poses[joint_name] = (center, quat)
+                _set_kinematic_free_joint_poses(wp, newton, model, state, scene_joint_q_start, hidden_t3_poses)
+                hidden_t3_dt = 1.0 / max(
+                    float(latest_frame.get("fps", current_source_fps or 60.0)) if latest_frame is not None else 60.0,
+                    1.0e-3,
+                )
+                _set_kinematic_body_velocities_for_poses(
+                    wp,
+                    model,
+                    state,
+                    hidden_t3_poses,
+                    hidden_t3_previous_poses,
+                    hidden_t3_dt,
+                )
+                _set_kinematic_body_velocities_for_suffixes(
+                    wp,
+                    model,
+                    state,
+                    tuple(T3_PICK_CONTACT_BODY_SUFFIXES),
+                    visible_t3_gripper_previous_poses,
+                    hidden_t3_dt,
+                )
             if t3_bounds is not None:
                 mins, maxs = t3_bounds
                 recorder_target = np.array(
@@ -7000,7 +7161,7 @@ def main() -> None:
                     model, contacts, bottle_body_indices, contact_bottle_index
                 )
             perf_physics_s += time.perf_counter() - physics_t0
-        if latest_frame is not None and t3_row_payload is not None and not actuated_t3_demo:
+        if run_physics_step and latest_frame is not None and t3_row_payload is not None and not actuated_t3_demo:
             # Physics advances bottle/table contacts, but the demo robot is
             # kinematic. Re-apply the current T3 row after the solver so the
             # rendered robot matches the playing frame instead of a stale/home
@@ -7032,6 +7193,8 @@ def main() -> None:
                 if table_pick_gripper_override
                 else None,
                 demo_gripper_aperture_min,
+                calculate_bounds=bool(recorder.enabled or pick_object_visible),
+                preserve_body_indices=bottle_body_indices,
             )
             _apply_t3_row(
                 wp,
@@ -7060,6 +7223,8 @@ def main() -> None:
                 if table_pick_gripper_override
                 else None,
                 demo_gripper_aperture_min,
+                calculate_bounds=False,
+                preserve_body_indices=bottle_body_indices,
             )
         _update_interactive_bottles(
             wp,
@@ -7172,7 +7337,7 @@ def main() -> None:
                 if pick_object_visible
                 else (pick_object_position[0], pick_object_position[1], -100.0)
             )
-            _set_pick_object_pose(wp, newton, model, state, joint_q_start, pick_joint_name, pick_position)
+            _set_pick_object_pose(wp, newton, model, state, scene_joint_q_start, pick_joint_name, pick_position)
             if show_contacts:
                 collision_pipeline.collide(state, contacts)
         feedback_row_payload = latest_t3_feedback_row if isinstance(latest_t3_feedback_row, dict) else None
@@ -7243,9 +7408,21 @@ def main() -> None:
                 False,
                 t3_feedback_root_q_start,
                 False,
+                calculate_bounds=False,
+                preserve_body_indices=bottle_body_indices,
             )
+            feedback_ghost_was_active = True
         else:
-            _hide_t3_feedback_ghost(wp, newton, model, state, t3_feedback_root_q_start)
+            if feedback_ghost_was_active is not False:
+                _hide_t3_feedback_ghost(
+                    wp,
+                    newton,
+                    model,
+                    state,
+                    t3_feedback_root_q_start,
+                    bottle_body_indices,
+                )
+            feedback_ghost_was_active = False
         _set_non_ground_instance_visibility(viewer, newton, show_t3_robot)
         _set_shape_range_instance_visibility(
             viewer,
@@ -7262,6 +7439,7 @@ def main() -> None:
         if first_end_frame:
             print("[ARDY Newton Viewer] first end_frame: entering", flush=True)
         render_t0 = time.perf_counter()
+        perf_prepare_s += render_t0 - prepare_t0
         viewer.end_frame()
         perf_render_s += time.perf_counter() - render_t0
         stream_t0 = time.perf_counter()
@@ -7299,6 +7477,7 @@ def main() -> None:
                 f"ws_frames={ws_receiver.frames_received} ws_last={ws_receiver.last_frame_idx} "
                 f"ws_bytes={ws_receiver.last_payload_bytes} "
                 f"physics_backend={physics_backend_status} substeps={perf_last_substeps}/{physics_substeps} "
+                f"prepare_ms={perf_prepare_s * 1000.0 / max(rendered_frames, 1):.1f} "
                 f"physics_ms={perf_physics_s * 1000.0 / max(rendered_frames, 1):.1f} "
                 f"grip_contacts={perf_bottle_gripper_contacts} "
                 f"render_ms={perf_render_s * 1000.0 / max(rendered_frames, 1):.1f} "
@@ -7311,6 +7490,7 @@ def main() -> None:
                 flush=True,
             )
             rendered_frames = 0
+            perf_prepare_s = 0.0
             perf_physics_s = 0.0
             perf_render_s = 0.0
             perf_stream_s = 0.0
