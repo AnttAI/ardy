@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "camera_serial": "243122301874",
+  "camera_mount": "fixed_external",
+  "mount_confirmed_by_user": true,
+  "camera_image_left_to_right": [
+    {
+      "image_position": "left",
+      "simulation_bottle_number": 1,
+      "confirmed_by_user": true
+    },
+    {
+      "image_position": "middle",
+      "simulation_bottle_number": null,
+      "confirmed_by_user": false
+    },
+    {
+      "image_position": "right",
+      "simulation_bottle_number": 3,
+      "confirmed_by_user": true
+    }
+  ],
+  "queued_motion": {
+    "simulation_bottle_number": 3,
+    "controller": "Jetson IK simulator",
+    "frames": 1238,
+    "fps": 60,
+    "table_height_m": 0.78,
+    "planned_lift_m": 0.1,
+    "physical_dimensions_verified": false,
+    "verification_basis": "User confirmed existing bottle 1 and 3 motions are correct and instructed their use for calibration",
+    "known_motion_confirmed_by_user": true
+  },
+  "reference_pairs": [],
+  "read_only_driver_check": {
+    "right_arm_speed_percent": 20,
+    "left_arm_speed_percent": 20,
+    "right_effector_type": "agx_gripper",
+    "left_effector_type": "agx_gripper",
+    "right_tcp_offset": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "left_tcp_offset": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "tcp_is_verified_grasp_center": false,
+    "lift_height_feedback_received": false,
+    "lift_status_feedback_received": false
+  },
+  "calibration_valid": false,
+  "automatic_picking_enabled": false,
+  "controller_viewer_host": "192.168.31.126",
+  "latest_trial": {
+    "trial": "bottle3",
+    "result": "aborted_by_controller_before_successful_pick",
+    "reason": "Viewer did not acknowledge rendering frame 0 within 30 seconds; controller disconnected ROS and stopped stream",
+    "viewer_host": "192.168.31.126",
+    "calibration_reference_accepted": false,
+    "feedback": {
+      "right": {
+        "joint_messages_after_request": 5672,
+        "max_joint_range_rad": 0.0009599310885968822
+      },
+      "left": {
+        "joint_messages_after_request": 5679,
+        "max_joint_range_rad": 0.00024434609527923534
+      }
+    }
+  }
+}

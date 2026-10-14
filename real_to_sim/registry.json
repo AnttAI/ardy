@@ -1,0 +1,12 @@
+{
+  "bottle": {
+    "kind": "bottle",
+    "capacity": 2,
+    "radius": 0.04,
+    "half_height": 0.145,
+    "neck_radius": 0.03,
+    "neck_half_height": 0.035,
+    "origin_height": 0.145,
+    "color": [0.2, 0.65, 0.85]
+  }
+}

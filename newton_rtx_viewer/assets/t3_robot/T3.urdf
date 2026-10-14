@@ -24,27 +24,13 @@
     <visual name="base_shell">
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="meshes/wheel_base/base_shell.ply" />
+        <mesh filename="meshes/wheel_base/base.stl" />
         </geometry>
-      </visual>
-    <visual name="left_wheel_fender">
-      <origin xyz="0 0.155 0.10" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="meshes/wheel_base/wheel_fender.stl" />
-        </geometry>
-      <material name="bumper_black" />
-      </visual>
-    <visual name="right_wheel_fender">
-      <origin xyz="0 -0.155 0.10" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="meshes/wheel_base/wheel_fender.stl" />
-        </geometry>
-      <material name="bumper_black" />
       </visual>
     <collision>
-      <origin xyz="0 0 0.13" rpy="0 0 0" />
+      <origin xyz="0 0 0.1403" rpy="0 0 0" />
       <geometry>
-        <box size="0.48 0.30 0.13" />
+        <box size="0.5464 0.23 0.1806" />
         </geometry>
       </collision>
     </link>
@@ -52,33 +38,19 @@
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <mass value="0.75" />
-      <inertia ixx="0.00203" ixy="0" ixz="0" iyy="0.00375" iyz="0" izz="0.00203" />
+      <inertia ixx="0.00256144" ixy="0" ixz="0" iyy="0.00375" iyz="0" izz="0.00256144" />
       </inertial>
     <visual name="left_tire">
-      <origin xyz="0 0 0" rpy="0 0 0" />
+      <origin xyz="0 0 0" rpy="0 0 3.141592653589793" />
       <geometry>
-        <mesh filename="meshes/wheel_base/wheel_tire.stl" />
+        <mesh filename="meshes/wheel_base/wheels.stl" />
         </geometry>
       <material name="tire_black" />
-      </visual>
-    <visual name="left_treads">
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="meshes/wheel_base/wheel_treads.stl" />
-        </geometry>
-      <material name="bumper_black" />
-      </visual>
-    <visual name="left_rim">
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="meshes/wheel_base/wheel_rim.stl" />
-        </geometry>
-      <material name="rim_metal" />
       </visual>
     <collision>
       <origin xyz="0 0 0" rpy="1.57079632679 0 0" />
       <geometry>
-        <cylinder radius="0.10" length="0.05" />
+        <cylinder radius="0.10" length="0.1048" />
         </geometry>
       </collision>
     </link>
@@ -86,46 +58,32 @@
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <mass value="0.75" />
-      <inertia ixx="0.00203" ixy="0" ixz="0" iyy="0.00375" iyz="0" izz="0.00203" />
+      <inertia ixx="0.00256144" ixy="0" ixz="0" iyy="0.00375" iyz="0" izz="0.00256144" />
       </inertial>
     <visual name="right_tire">
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="meshes/wheel_base/wheel_tire.stl" />
+        <mesh filename="meshes/wheel_base/wheels.stl" />
         </geometry>
       <material name="tire_black" />
-      </visual>
-    <visual name="right_treads">
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="meshes/wheel_base/wheel_treads.stl" />
-        </geometry>
-      <material name="bumper_black" />
-      </visual>
-    <visual name="right_rim">
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="meshes/wheel_base/wheel_rim.stl" />
-        </geometry>
-      <material name="rim_metal" />
       </visual>
     <collision>
       <origin xyz="0 0 0" rpy="1.57079632679 0 0" />
       <geometry>
-        <cylinder radius="0.10" length="0.05" />
+        <cylinder radius="0.10" length="0.1048" />
         </geometry>
       </collision>
     </link>
   <joint name="left_wheel_joint" type="continuous">
     <parent link="base_link" />
     <child link="left_wheel_link" />
-    <origin xyz="0 0.19 0.10" rpy="0 0 0" />
+    <origin xyz="0 0.1678 0.09999" rpy="0 0 0" />
     <axis xyz="0 1 0" />
     </joint>
   <joint name="right_wheel_joint" type="continuous">
     <parent link="base_link" />
     <child link="right_wheel_link" />
-    <origin xyz="0 -0.19 0.10" rpy="0 0 0" />
+    <origin xyz="0 -0.1678 0.09999" rpy="0 0 0" />
     <axis xyz="0 1 0" />
     </joint>
   <material name="dark">
@@ -190,7 +148,7 @@
       </collision>
     </link>
   <joint name="waist_pitch_joint" type="revolute">
-    <origin xyz="0 0 0" rpy="0 0 0" />
+    <origin xyz="0.005236 0 0" rpy="0 0 0" />
     <parent link="waist_roll_link" />
     <child link="torso_link" />
     <axis xyz="0 1 0" />
@@ -211,7 +169,7 @@
       </visual>
     </link>
   <joint name="head_pitch_joint" type="revolute">
-    <origin xyz="-0.00011475 0.020709 0.42181" rpy="0 0 0" />
+    <origin xyz="-0.00011475 0 0.395710" rpy="0 0 0" />
     <parent link="torso_link" />
     <child link="head_pitch_link" />
     <axis xyz="0 1 0" />
@@ -238,7 +196,7 @@
       </collision>
     </link>
   <joint name="head_yaw_joint" type="revolute">
-    <origin xyz="0 -0.0189 0.1325" rpy="0 0 0" />
+    <origin xyz="0 0 0.033976" rpy="0 0 0" />
     <parent link="head_pitch_link" />
     <child link="head_yaw_link" />
     <axis xyz="0 0 1" />
@@ -873,12 +831,12 @@
   <joint name="torso_to_right_nero_base" type="fixed">
     <parent link="torso_link" />
     <child link="right_base_link" />
-    <origin xyz="0.00197060 -0.07316000 0.35789000" rpy="1.5707963267948966 -1.5707963267948966 0" />
+    <origin xyz="0.00197060 -0.07316000 0.32038000" rpy="1.5707963267948966 -1.5707963267948966 0" />
     </joint>
   <joint name="torso_to_left_nero_base" type="fixed">
     <parent link="torso_link" />
     <child link="left_base_link" />
-    <origin xyz="0.00197790 0.07684000 0.35792000" rpy="1.5707963267948966 -1.5707963267948966 3.141592653589793" />
+    <origin xyz="0.00197790 0.07684000 0.32038000" rpy="1.5707963267948966 -1.5707963267948966 3.141592653589793" />
     </joint>
   <link name="telescopic_lift_base_link">
     <visual name="telescopic_lift_outer_square_sleeve">

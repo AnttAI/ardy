@@ -191,7 +191,8 @@ T3_DEMO_PICK_CACHE_JSON = Path(__file__).resolve().parent / "assets" / "t3_demo_
 T3_DEMO_PICK_REFERENCE_CSV_ENV = "ARDY_T3_DEMO_PICK_REFERENCE_CSV"
 T3_DEMO_PICK_REFERENCE_STRENGTH_ENV = "ARDY_T3_DEMO_PICK_REFERENCE_STRENGTH"
 T3_GRIPPER_OPEN_APERTURE_M = 0.095
-T3_GRIPPER_BOTTLE_GRASP_APERTURE_M = max(0.0, INTERACTIVE_BOTTLE_RADIUS * 2.0 - 0.002)
+T3_GRIPPER_BOTTLE_GRASP_APERTURE_M = 0.045  # Jetson default: 59 mm configured diameter - 14 mm closing offset.
+T3_GRIPPER_BOTTLE_MIN_APERTURE_M = T3_GRIPPER_BOTTLE_GRASP_APERTURE_M
 T3_GRIPPER_CLOSED_APERTURE_M = T3_GRIPPER_BOTTLE_GRASP_APERTURE_M
 T3_GRIPPER_SIDES = ("left", "right")
 T3_TABLE_GUARD_BODY_SUFFIXES = (
@@ -348,7 +349,7 @@ def _setup_paths() -> None:
 
 
 def _queue_frame(frame_queue: queue.Queue, playback_mode: str, frame: dict) -> None:
-    if playback_mode == "exact":
+    if playback_mode == "exact" or frame.get("reliable_delivery"):
         frame_queue.put(frame)
         return
     while True:
@@ -469,6 +470,10 @@ class NativeWebSocketReceiver:
                         scene["age_s"] = time.monotonic() - self.pick_scene_time
                         self._send_text_frame(client, json.dumps(scene).encode("utf-8"))
                         continue
+                    if frame.get("reliable_delivery"):
+                        # Local-only handle used to acknowledge this frame
+                        # after end_frame(), never serialized to a sender.
+                        frame["_ws_ack_client"] = client
                     self.frames_received += 1
                     self.last_frame_idx = int(frame.get("frame_idx", -1))
                     self.last_payload_bytes = len(payload)
@@ -576,9 +581,12 @@ def _get_next_frame(frame_queue: queue.Queue, playback_mode: str):
     latest_frame = None
     while True:
         try:
-            latest_frame = frame_queue.get_nowait()
+            candidate = frame_queue.get_nowait()
         except queue.Empty:
             return latest_frame
+        if candidate.get("reliable_delivery"):
+            return candidate
+        latest_frame = candidate
 
 
 def _as_float(value, default: float = 0.0) -> float:
@@ -1638,11 +1646,38 @@ def _format_t3_csv_value(column: str, value) -> str:
         numeric = float(np.clip(numeric, -0.05, 0.05))
         return f"{numeric:.6f}"
     if column == "telescopic_lift_joint_dof":
-        numeric = float(np.clip(numeric, T3_LIFT_MIN_M, T3_LIFT_MAX_M))
-        return f"{numeric:.6f}"
+        return f"{numeric:.3f}"
     if column in {"fps", "root_x_m", "root_y_m", "root_yaw_rad", "time_s"}:
         return f"{numeric:.9f}".rstrip("0").rstrip(".")
     return f"{numeric:.9f}".rstrip("0").rstrip(".")
+
+
+def _capture_latest_t3_motion_frame(frames: list[dict], frame: dict) -> bool:
+    """Retain received T3 frames for CSV export without WebSocket internals."""
+    if not isinstance(frame, dict) or not isinstance(frame.get("t3_row"), dict):
+        return False
+    captured = {key: value for key, value in frame.items() if not str(key).startswith("_ws_")}
+    captured["t3_row"] = dict(frame["t3_row"])
+    frame_idx = int(captured["t3_row"].get("frame_idx", captured.get("frame_idx", len(frames))))
+    captured["frame_idx"] = frame_idx
+
+    last_idx = -1
+    if frames:
+        last = frames[-1]
+        last_row = last.get("t3_row") if isinstance(last, dict) else None
+        last_idx = int(
+            last_row.get("frame_idx", last.get("frame_idx", -1))
+            if isinstance(last_row, dict)
+            else last.get("frame_idx", -1)
+        )
+    if frame_idx == 0 or (frames and frame_idx < last_idx):
+        frames.clear()
+        last_idx = -1
+    if frames and frame_idx == last_idx:
+        frames[-1] = captured
+    else:
+        frames.append(captured)
+    return True
 
 
 def _export_latest_t3_motion_csv(frames: list[dict], output_path: str | Path | None = None) -> Path:
@@ -1695,6 +1730,8 @@ def _export_latest_t3_motion_csv(frames: list[dict], output_path: str | Path | N
                 j2 *= scale
             out[c1] = round(j1, 6)
             out[c2] = round(j2, 6)
+        lift_extension_m = _lift_csv_value_to_extension_m(out["telescopic_lift_joint_dof"])
+        out["telescopic_lift_joint_dof"] = T3_LIFT_DISPLAY_BASE_CM + 100.0 * lift_extension_m
         rows.append(out)
     if not rows:
         raise ValueError("latest frames did not contain T3 rows")
@@ -3760,7 +3797,9 @@ def _gripper_aperture_min_for_bottles(
             _bottle_inside_gripper(np.asarray(position, dtype=np.float64), gripper)
             for position in bottle_positions
         ):
-            aperture_min[side] = T3_GRIPPER_BOTTLE_GRASP_APERTURE_M
+            # Match the 45 mm target commanded by the Jetson instead of
+            # visually reopening the jaws at the bottle contact.
+            aperture_min[side] = T3_GRIPPER_BOTTLE_MIN_APERTURE_M
     return aperture_min
 
 
@@ -4026,6 +4065,7 @@ def _apply_t3_row(
     apply_stiff_posture: bool = True,
     calculate_bounds: bool = True,
     preserve_body_indices: list[int] | tuple[int, ...] | None = None,
+    root_q_override: np.ndarray | None = None,
 ):
     # Start from the live model coordinates so dynamic/free bodies such as
     # moved bottles keep their current poses. The T3 row then overwrites only
@@ -4155,6 +4195,10 @@ def _apply_t3_row(
     root_q_start = int(root_q_start)
     q[root_q_start : root_q_start + 7] = _tx_to_numpy(root_tx)
     q[root_q_start + 2] = float(floor_z)
+    if root_q_override is not None:
+        # The feedback overlay shares the simulated robot's actual base pose.
+        # Its arm joints still come from the ROS feedback row above.
+        q[root_q_start : root_q_start + 7] = np.asarray(root_q_override, dtype=np.float32)
     if control is not None:
         _copy_t3_joint_targets_from_q(model, control, q)
     if target_only:
@@ -4214,7 +4258,11 @@ def _t3_initial_joints_from_feedback(row: dict | None) -> dict[str, float]:
     }
 
 
-def _feedback_row_on_fixed_loaded_t3(feedback_row: dict) -> dict:
+def _feedback_row_on_fixed_loaded_t3(
+    feedback_row: dict,
+    simulated_q: np.ndarray | None = None,
+    simulated_joint_q_start: dict[str, int] | None = None,
+) -> dict:
     row = _make_t3_loaded_pose_row(
         frame_idx=int(feedback_row.get("frame_idx", 0) or 0),
         fps=float(feedback_row.get("fps", 60.0) or 60.0),
@@ -4224,6 +4272,14 @@ def _feedback_row_on_fixed_loaded_t3(feedback_row: dict) -> dict:
         name = str(name)
         if name.startswith(("left_joint", "right_joint", "left_gripper_joint", "right_gripper_joint")):
             joint_values[name] = float(value)
+
+    if simulated_q is not None and simulated_joint_q_start is not None:
+        # There is no lift/torso feedback on the two arm JointState topics.
+        # Match these shared joints to the white simulation, not the loaded pose.
+        for name in ("telescopic_lift_joint", *sorted(T3_STIFF_POSTURE_JOINTS)):
+            coord = simulated_joint_q_start.get(name)
+            if coord is not None:
+                joint_values[name] = float(simulated_q[coord])
 
     row["joint_names"] = list(joint_values.keys())
     row["joint_cfg"] = [float(value) for value in joint_values.values()]
@@ -5670,6 +5726,7 @@ def main() -> None:
     file_csv_path = str(getattr(args, "file_csv", "") or "").strip() or _latest_t3_csv_path()
     file_bvh_path = str(getattr(args, "file_bvh", "") or "").strip() or _latest_soma_bvh_path()
     file_playback_frames: list[dict] = []
+    latest_t3_motion_frames: list[dict] = []
     file_playback_index = 0
     file_playback_next_time = time.monotonic()
     file_playback_active = False
@@ -6005,6 +6062,7 @@ def main() -> None:
         nonlocal floor_z
         nonlocal show_contacts, pick_object_visible, pick_object_pushable, pick_object_position
         nonlocal file_csv_path, file_bvh_path, file_playback_frames, file_playback_index
+        nonlocal latest_t3_motion_frames
         nonlocal file_playback_next_time, file_playback_active, file_playback_status
         nonlocal websocket_enabled
         nonlocal render_source
@@ -6513,7 +6571,8 @@ def main() -> None:
                 start_t3_demo_pick_playback(source="ui_all_auto", hand_side="auto", pick_all=True)
             if ui.button("Export Latest Motion CSV"):
                 try:
-                    export_path = _export_latest_t3_motion_csv(file_playback_frames)
+                    export_frames = latest_t3_motion_frames or file_playback_frames
+                    export_path = _export_latest_t3_motion_csv(export_frames)
                     file_playback_status = f"exported CSV: {export_path.name}"
                     print(f"[ARDY Newton Viewer] exported latest T3 motion CSV: {export_path}", flush=True)
                 except Exception as exc:
@@ -6706,6 +6765,7 @@ def main() -> None:
     visible_t3_gripper_previous_poses: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     default_q = model.joint_q.numpy().copy()
     joint_q_start = _joint_q_start_map_for_range(model, t3_joint_start, t3_joint_end)
+    t3_root_q_start = int(model.joint_q_start.numpy()[t3_joint_start])
     scene_joint_q_start = _joint_q_start_map_for_range(model, 0, len(model.joint_label))
     t3_feedback_joint_q_start = _joint_q_start_map_for_range(
         model,
@@ -6849,6 +6909,7 @@ def main() -> None:
             incoming_frame = _get_next_frame(frame_queue, args.playback_mode)
         if incoming_frame is not None:
             latest_frame = incoming_frame
+            _capture_latest_t3_motion_frame(latest_t3_motion_frames, latest_frame)
             command = str(latest_frame.get("command") or latest_frame.get("type") or "").strip().lower()
             if t3_ros_route.handle_command(latest_frame):
                 continue
@@ -6888,12 +6949,15 @@ def main() -> None:
             else:
                 latest_status = f"live Newton frame {int(latest_frame.get('frame_idx', 0))}"
             incoming_t3_row = latest_frame.get("t3_row") if isinstance(latest_frame.get("t3_row"), dict) else None
-            send_t3_row_to_ros(
-                incoming_t3_row,
-                frame_idx=current_frame_idx,
-                fps=float(latest_frame.get("fps", current_source_fps or 60.0)),
-                source="incoming_frame",
-            )
+            # A sender that owns its direct ROS route marks frames this way to
+            # prevent the viewer from publishing the same command a second time.
+            if not bool(latest_frame.get("skip_viewer_ros", False)):
+                send_t3_row_to_ros(
+                    incoming_t3_row,
+                    frame_idx=current_frame_idx,
+                    fps=float(latest_frame.get("fps", current_source_fps or 60.0)),
+                    source="incoming_frame",
+                )
 
         t3_row_payload = None
         debug_demo_pick = False
@@ -7365,7 +7429,12 @@ def main() -> None:
             and feedback_fresh
         )
         if feedback_ghost_active:
-            feedback_overlay_row = _feedback_row_on_fixed_loaded_t3(feedback_row_payload)
+            simulated_q = model.joint_q.numpy().copy()
+            feedback_overlay_row = _feedback_row_on_fixed_loaded_t3(
+                feedback_row_payload,
+                simulated_q,
+                joint_q_start,
+            )
             feedback_brightness = float(np.clip(t3_feedback_ghost_brightness, 0.05, 1.0))
             feedback_color = tuple(float(channel) * feedback_brightness for channel in T3_FEEDBACK_GHOST_COLOR)
             if feedback_color != last_feedback_ghost_color:
@@ -7410,6 +7479,7 @@ def main() -> None:
                 False,
                 calculate_bounds=False,
                 preserve_body_indices=bottle_body_indices,
+                root_q_override=simulated_q[t3_root_q_start : t3_root_q_start + 7],
             )
             feedback_ghost_was_active = True
         else:
@@ -7442,6 +7512,19 @@ def main() -> None:
         perf_prepare_s += render_t0 - prepare_t0
         viewer.end_frame()
         perf_render_s += time.perf_counter() - render_t0
+        if incoming_frame is not None and incoming_frame.get("reliable_delivery"):
+            ack_client = incoming_frame.get("_ws_ack_client")
+            if ack_client is not None:
+                try:
+                    ws_receiver._send_text_frame(
+                        ack_client,
+                        json.dumps({
+                            "type": "frame_rendered",
+                            "frame_idx": int(incoming_frame.get("frame_idx", -1)),
+                        }).encode("utf-8"),
+                    )
+                except OSError:
+                    pass
         stream_t0 = time.perf_counter()
         for ovstream_bridge in ovstream_bridges:
             ovstream_bridge.stream_latest()
